@@ -1,0 +1,30 @@
+# Candidate judge backends (OpenAI-compatible chat endpoints).
+# API keys are read from the environment variable named by api_key_env —
+# never put keys in this file.
+#
+# eval_only = true marks backends whose terms allow testing/evaluation only
+# (e.g. NVIDIA build.nvidia.com free tier). They must not serve production.
+
+[[backends]]
+name = "nvidia-llama31-8b"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "meta/llama-3.1-8b-instruct"
+rpm = 40
+eval_only = true
+api_key_env = "NVIDIA_API_KEY"
+
+[[backends]]
+name = "nvidia-llama31-70b"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "meta/llama-3.1-70b-instruct"
+rpm = 40
+eval_only = true
+api_key_env = "NVIDIA_API_KEY"
+
+[[backends]]
+name = "nvidia-qwen25-72b"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "qwen/qwen2.5-72b-instruct"
+rpm = 40
+eval_only = true
+api_key_env = "NVIDIA_API_KEY"
