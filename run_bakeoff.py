@@ -20,19 +20,39 @@ import json
 import sys
 from pathlib import Path
 
-from judge.client import Backend, JudgeClient, RateLimiter, load_backends
+from judge.client import TEMPERATURE, Backend, JudgeClient, RateLimiter, load_backends
+from judge.prompts import PROMPT_VERSION
 from judge.schema import Pair, pair_from_dict, verdict_from_json_line, verdict_to_json_line
 
 
-def already_judged_ids(results_path: Path) -> set[str]:
-    """Pair ids already present in a backend's results file (empty if absent)."""
+def already_judged_ids(
+    results_path: Path, *, model_id: str, prompt_version: str, temperature: float
+) -> set[str]:
+    """Pair ids already judged under the SAME run config (empty if file absent).
+
+    Raises ValueError if the file holds verdicts from a different model_id,
+    prompt_version, or temperature — silently resuming over those would mix
+    stale verdicts into the results. Use a fresh --out directory instead.
+    """
     if not results_path.exists():
         return set()
-    return {
-        verdict_from_json_line(line).pair_id
-        for line in results_path.read_text().splitlines()
-        if line.strip()
-    }
+    expected = (model_id, prompt_version, temperature)
+    ids = set()
+    for line in results_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        v = verdict_from_json_line(line)
+        found = (v.model_id, v.prompt_version, v.temperature)
+        if found != expected:
+            raise ValueError(
+                f"{results_path} contains verdicts from a different run config: "
+                f"found (model_id={v.model_id!r}, prompt_version={v.prompt_version!r}, "
+                f"temperature={v.temperature!r}), expected (model_id={model_id!r}, "
+                f"prompt_version={prompt_version!r}, temperature={temperature!r}). "
+                f"Use a fresh --out directory for a new run config."
+            )
+        ids.add(v.pair_id)
+    return ids
 
 
 def pending_pairs(pairs: list[Pair], judged: set[str]) -> list[Pair]:
@@ -45,7 +65,13 @@ def load_pairs(path: Path) -> list[Pair]:
 
 def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path) -> None:
     results_path = out_dir / f"{backend.name}.jsonl"
-    todo = pending_pairs(pairs, already_judged_ids(results_path))
+    judged = already_judged_ids(
+        results_path,
+        model_id=backend.model_id,
+        prompt_version=PROMPT_VERSION,
+        temperature=TEMPERATURE,
+    )
+    todo = pending_pairs(pairs, judged)
     label = " (eval-only backend)" if backend.eval_only else ""
     print(f"[{backend.name}]{label} {len(todo)} pending of {len(pairs)} pairs")
     if not todo:
