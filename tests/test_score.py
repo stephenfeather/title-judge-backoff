@@ -68,6 +68,30 @@ def test_score_model_ignores_verdicts_for_unknown_pairs():
     assert result.n == 1
 
 
+def test_score_model_reports_coverage():
+    verdicts = [make_verdict("p1", "approve", "ok")]
+    result = score_model(PAIRS, verdicts)
+    assert result.coverage == 0.25
+
+
+def test_partial_coverage_backend_is_excluded_from_ranking():
+    # Judged only the one pair it gets right: perfect kappa on 25% coverage.
+    partial = [make_verdict("p1", "approve", "ok", model_id="model-partial")]
+    # Judged everything, one mistake.
+    full = [
+        make_verdict("p1", "approve", "ok", model_id="model-full"),
+        make_verdict("p2", "approve", "ok", model_id="model-full"),
+        make_verdict("p3", "reject", "meaning_change", model_id="model-full"),
+        make_verdict("p4", "approve", "ok", model_id="model-full"),
+    ]
+    md = render_leaderboard([score_model(PAIRS, partial), score_model(PAIRS, full)])
+    ranked_table = md.split("## ")[0]
+    assert "model-full" in ranked_table
+    assert "model-partial" not in ranked_table
+    assert "model-partial" in md  # still visible, marked as excluded
+    assert "coverage" in md.lower()
+
+
 def test_render_leaderboard_sorted_by_kappa():
     perfect = [make_verdict(p.id, p.ground_truth, p.reason.value, model_id="model-good") for p in PAIRS]
     inverted = [

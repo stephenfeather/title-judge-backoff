@@ -23,6 +23,7 @@ from judge.schema import Pair, Verdict, pair_from_dict, verdict_from_json_line
 class ModelScore:
     model_id: str
     n: int
+    coverage: float  # fraction of ground-truth pairs this model actually judged
     accuracy: float
     kappa: float
     false_approve_rate: float
@@ -65,6 +66,7 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     return ModelScore(
         model_id=matched[0][1].model_id,
         n=n,
+        coverage=n / len(pairs),
         accuracy=sum(t == pr for t, pr in zip(truth, predicted)) / n,
         kappa=cohens_kappa(truth, predicted),
         false_approve_rate=false_approves / len(rejects) if rejects else 0.0,
@@ -73,18 +75,34 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
 
 
 def render_leaderboard(scores: list[ModelScore]) -> str:
-    """Markdown leaderboard sorted by Cohen's kappa, best first."""
+    """Markdown leaderboard sorted by Cohen's kappa, best first.
+
+    Only models with 100% coverage are ranked: metrics computed on a subset of
+    pairs are not comparable (a backend that errored on most pairs could post
+    perfect kappa on the few it answered). Incomplete models are listed
+    separately — re-run the bake-off to fill their gaps.
+    """
+    ranked = [s for s in scores if s.coverage == 1.0]
+    excluded = [s for s in scores if s.coverage < 1.0]
     lines = [
         "# Judge bake-off leaderboard",
         "",
-        "| Model | n | Accuracy | Kappa | False-approve rate |",
-        "|---|---|---|---|---|",
+        "| Model | n | Coverage | Accuracy | Kappa | False-approve rate |",
+        "|---|---|---|---|---|---|",
     ]
-    for s in sorted(scores, key=lambda s: s.kappa, reverse=True):
+    for s in sorted(ranked, key=lambda s: s.kappa, reverse=True):
         lines.append(
-            f"| {s.model_id} | {s.n} | {s.accuracy:.3f} | {s.kappa:.3f} | {s.false_approve_rate:.3f} |"
+            f"| {s.model_id} | {s.n} | {s.coverage:.0%} | {s.accuracy:.3f} | {s.kappa:.3f} | {s.false_approve_rate:.3f} |"
         )
     lines.append("")
+    if excluded:
+        lines.append("## Excluded from ranking (incomplete coverage)")
+        lines.append("")
+        lines.append("Metrics on partial coverage are not comparable; re-run to fill gaps.")
+        lines.append("")
+        for s in sorted(excluded, key=lambda s: s.coverage, reverse=True):
+            lines.append(f"- {s.model_id}: coverage {s.coverage:.0%} ({s.n} pairs judged)")
+        lines.append("")
     for s in sorted(scores, key=lambda s: s.kappa, reverse=True):
         lines.append(f"## Reason confusion: {s.model_id}")
         lines.append("")
