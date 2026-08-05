@@ -1,1 +1,25 @@
+# Tool metadata
 .codegraph/
+.claude/
+.tldr/
+.tldrignore
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.egg-info/
+
+# Secrets — keys are env-only, never committed
+.env
+.env.*
+
+# Data & outputs — calibration pairs contain vendor-derived titles and are
+# supplied via --data; verdicts/leaderboards are run artifacts
+data/*.jsonl
+*.jsonl
+results/
+leaderboard.md
