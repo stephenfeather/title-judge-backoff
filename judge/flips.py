@@ -10,6 +10,14 @@ is split evenly. It reads "how often does this pair flip a judge's answer".
 All of this is optional context. No results directory, a sweep still in flight,
 a file of something other than verdicts — every path degrades to "no data", and
 the TUI simply omits the pane. The ruling pass never depends on a sweep.
+
+It does not depend on the sweep's *record shape* either. This module reads four
+fields — pair_id, verdict, reason, model_id — ignores every other key, and
+deliberately imports nothing from `judge.schema`. The verdict record is the
+sweep's to evolve (run index, vote index, effort, whatever follows); a pane that
+constructed the full schema record would start dropping every line the moment
+that record grew a required field, and would go quietly blank instead of failing
+loudly. Quiet is the wrong failure mode for context the operator is trusting.
 """
 
 from __future__ import annotations
@@ -18,9 +26,26 @@ import json
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Protocol, Sequence
 
-from judge.schema import ReasonCode, Verdict
+
+@dataclass(frozen=True)
+class JudgeVerdict:
+    """The four fields this pane reads, and nothing else.
+
+    Deliberately not `judge.schema.Verdict`. The sweep's verdict record is the
+    sweep's to evolve — run index, vote index, effort, whatever comes next — and
+    if loading constructed the full schema record, one new required field there
+    would make every line raise and be dropped. The pane would go quietly blank
+    rather than fail loudly, which is the worst way for context to disappear.
+    `reason` stays a raw string for the same reason: an unrecognized code must
+    not erase a verdict, because the flip rate is about approve/reject.
+    """
+
+    pair_id: str
+    verdict: str
+    reason: str
+    model_id: str
 
 
 @dataclass(frozen=True)
@@ -36,16 +61,42 @@ class FlipStats:
     flip_rate: float
 
 
-def flip_stats(verdicts: Iterable[Verdict]) -> dict[str, FlipStats]:
-    """Group verdicts by pair and measure how much the judges disagreed."""
-    grouped: dict[str, list[Verdict]] = {}
+class VerdictLike(Protocol):
+    """Anything carrying the fields this pane reads — `JudgeVerdict`,
+    `schema.Verdict`, or whatever richer record the sweep grows next."""
+
+    @property
+    def pair_id(self) -> str: ...
+
+    @property
+    def verdict(self) -> str: ...
+
+    @property
+    def model_id(self) -> str: ...
+
+
+def _reason_of(verdict: VerdictLike) -> str:
+    """The reason as text, whether it arrived as a ReasonCode or a raw string."""
+    reason = getattr(verdict, "reason", "")
+    return getattr(reason, "value", reason)
+
+
+def flip_stats(verdicts: Iterable[VerdictLike]) -> dict[str, FlipStats]:
+    """Group verdicts by pair and measure how much the judges disagreed.
+
+    Grouped by `pair_id` alone. Repeat votes from one model (majority-of-N) are
+    exactly that — repeats — and each one counts, because the question the pane
+    answers is "how often did this pair flip an answer", not "how many distinct
+    models were asked".
+    """
+    grouped: dict[str, list[VerdictLike]] = {}
     for verdict in verdicts:
         grouped.setdefault(verdict.pair_id, []).append(verdict)
 
     return {pair_id: _stats_for(pair_id, group) for pair_id, group in grouped.items()}
 
 
-def _stats_for(pair_id: str, group: Sequence[Verdict]) -> FlipStats:
+def _stats_for(pair_id: str, group: Sequence[VerdictLike]) -> FlipStats:
     counts = Counter(v.verdict for v in group)
     majority, modal_count = counts.most_common(1)[0]
     n = len(group)
@@ -53,7 +104,7 @@ def _stats_for(pair_id: str, group: Sequence[Verdict]) -> FlipStats:
         pair_id=pair_id,
         n=n,
         verdicts=dict(counts),
-        reasons=dict(Counter(v.reason.value for v in group)),
+        reasons=dict(Counter(_reason_of(v) for v in group)),
         models=sorted({v.model_id for v in group}),
         majority=majority,
         flip_rate=1.0 - modal_count / n,
@@ -65,24 +116,22 @@ def _stats_for(pair_id: str, group: Sequence[Verdict]) -> FlipStats:
 _REQUIRED = ("pair_id", "verdict", "reason", "model_id")
 
 
-def _verdict_from_record(record: dict) -> Verdict | None:
-    """Build a Verdict, or None if the line is anything else."""
+def _verdict_from_record(record: dict) -> JudgeVerdict | None:
+    """Pull the four fields out of a line, or None if they aren't all there.
+
+    Every other key is ignored, whatever it is.
+    """
     if not isinstance(record, dict) or any(key not in record for key in _REQUIRED):
         return None
-    try:
-        return Verdict(
-            pair_id=record["pair_id"],
-            verdict=record["verdict"],
-            reason=ReasonCode(record["reason"]),
-            model_id=record["model_id"],
-            prompt_version=record.get("prompt_version", ""),
-            temperature=float(record.get("temperature", 0.0)),
-        )
-    except (ValueError, TypeError):
-        return None
+    return JudgeVerdict(
+        pair_id=str(record["pair_id"]),
+        verdict=str(record["verdict"]),
+        reason=str(record["reason"]),
+        model_id=str(record["model_id"]),
+    )
 
 
-def load_results(results_dir: Path | str | None) -> list[Verdict]:
+def load_results(results_dir: Path | str | None) -> list[JudgeVerdict]:
     """Every verdict under `results_dir`, flat or nested one dir per scenario.
 
     Unreadable files, non-verdict lines and torn tails are skipped rather than
@@ -94,7 +143,7 @@ def load_results(results_dir: Path | str | None) -> list[Verdict]:
     if not root.is_dir():
         return []
 
-    found: list[Verdict] = []
+    found: list[JudgeVerdict] = []
     for path in sorted(root.rglob("*.jsonl")):
         try:
             text = path.read_text(encoding="utf-8")
@@ -128,7 +177,9 @@ def render_flip_pane(stats: FlipStats | None) -> str:
         return ""
     split = "  ".join(f"{verdict} {count}" for verdict, count in sorted(stats.verdicts.items()))
     reasons = "  ".join(f"{reason} {count}" for reason, count in sorted(stats.reasons.items()))
+    models = len(stats.models)
     return (
-        f"  sweep: flip {stats.flip_rate:.0%} of {stats.n} judge(s)   {split}\n"
+        f"  sweep: flip {stats.flip_rate:.0%} over {stats.n} votes "
+        f"from {models} model{'' if models == 1 else 's'}   {split}\n"
         f"         reasons: {reasons}"
     )

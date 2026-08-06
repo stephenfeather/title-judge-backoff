@@ -90,9 +90,14 @@ are dropped, skipped rows come back. An `undo` is itself journaled and replayed
 away — nothing is ever rewritten.
 
 `--results results/<dir>` adds a context pane per row: how a sweep's judges
-split on that pair (`flip 50% of 6 judge(s)`) and which reason codes they gave.
-It reads flat and per-scenario layouts, and without it the pane is simply
-absent — the ruling pass never depends on a sweep having run.
+split on that pair (`flip 50% over 6 votes from 2 models`) and which reason
+codes they gave. It reads flat and per-scenario layouts, and without it the pane
+is simply absent — the ruling pass never depends on a sweep having run.
+
+Votes are counted, not models: under majority-of-N the same model votes several
+times, and each vote counts toward the flip rate. The pane reads four fields
+(`pair_id`, `verdict`, `reason`, `model_id`) and ignores every other key, so the
+sweep's verdict record can keep growing without touching this.
 
 `--notes` enables free-text rubric annotations, exported to a sidecar with
 `--notes-out` and deliberately kept out of the merge input.

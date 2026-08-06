@@ -7,6 +7,7 @@ work, so every loader here degrades to "no data" rather than raising.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from judge import flips
 from judge.schema import ReasonCode, Verdict
@@ -105,6 +106,33 @@ def test_no_verdicts_yields_no_stats():
     assert flips.flip_stats([]) == {}
 
 
+def test_repeat_verdicts_from_one_model_count_as_repeats():
+    """Majority-of-N runs the same model several times; each vote is a vote."""
+    stats = flips.flip_stats(
+        [
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "reject", ReasonCode.CASING_ERROR, "m1"),
+        ]
+    )
+    assert stats["a"].n == 3
+    assert stats["a"].verdicts == {"approve": 2, "reject": 1}
+    assert stats["a"].models == ["m1"]
+
+
+def test_grouping_is_by_pair_id_alone():
+    """Never by (pair, model, run) — the pane answers "did this pair flip"."""
+    stats = flips.flip_stats(
+        [
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "reject", ReasonCode.CASING_ERROR, "m2"),
+            verdict("a", "reject", ReasonCode.CASING_ERROR, "m2"),
+        ]
+    )
+    assert set(stats) == {"a"}
+    assert stats["a"].n == 3
+
+
 # --- loading (tolerant I/O) ---------------------------------------------------
 
 
@@ -140,6 +168,120 @@ def test_load_results_skips_unparseable_lines(tmp_path):
     assert len(flips.load_results(results)) == 1
 
 
+def test_load_results_ignores_fields_it_does_not_know(tmp_path):
+    """The sweep's verdict record grows (run index, vote index, effort). Extra
+    keys are the sweep's business, not this pane's — never a reason to drop a
+    line, and never a reason to widen the grouping key."""
+    results = tmp_path / "2026-08-06"
+    results.mkdir(parents=True)
+    (results / "m1.jsonl").write_text(
+        json.dumps(
+            {
+                "pair_id": "a",
+                "verdict": "approve",
+                "reason": "ok",
+                "model_id": "m1",
+                "prompt_version": "v1",
+                "temperature": 0.0,
+                "run_index": 2,
+                "vote_index": 1,
+                "effort": "high",
+                "something_invented_next_week": {"nested": True},
+            }
+        )
+        + "\n"
+    )
+    loaded = flips.load_results(results)
+    assert len(loaded) == 1
+    assert loaded[0].pair_id == "a"
+    assert flips.flip_stats(loaded)["a"].flip_rate == 0.0
+
+
+def test_load_results_needs_only_the_four_fields_it_reads(tmp_path):
+    """Loading must not depend on the rest of the Verdict schema holding still."""
+    results = tmp_path / "2026-08-06"
+    results.mkdir(parents=True)
+    (results / "m1.jsonl").write_text(
+        json.dumps({"pair_id": "a", "verdict": "reject", "reason": "casing_error",
+                    "model_id": "m1"}) + "\n"
+    )
+    assert len(flips.load_results(results)) == 1
+
+
+def test_load_results_keeps_repeat_votes_from_the_same_model(tmp_path):
+    """Majority-of-N writes several lines per (pair, model). None may be lost."""
+    results = tmp_path / "2026-08-06"
+    write_results(
+        results,
+        "m1.jsonl",
+        [
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "reject", ReasonCode.CASING_ERROR, "m1"),
+        ],
+    )
+    assert flips.flip_stats(flips.load_results(results))["a"].n == 3
+
+
+def test_loading_does_not_construct_the_schema_verdict(tmp_path):
+    """Decoupled on purpose.
+
+    If this built `schema.Verdict` and that record gained a required field, every
+    line would raise and be dropped — the pane would silently go blank instead of
+    failing loudly. So loading yields its own four-field record.
+    """
+    from judge.schema import Verdict as SchemaVerdict
+
+    results = tmp_path / "2026-08-06"
+    write_results(results, "m1.jsonl", [verdict("a", "approve", ReasonCode.OK, "m1")])
+    loaded = flips.load_results(results)[0]
+    assert not isinstance(loaded, SchemaVerdict)
+    assert (loaded.pair_id, loaded.verdict, loaded.model_id) == ("a", "approve", "m1")
+
+
+def test_stats_accept_any_record_carrying_the_four_fields():
+    """Structural, not nominal — a richer sweep record works unchanged."""
+
+    @dataclass(frozen=True)
+    class RicherVerdict:
+        pair_id: str
+        verdict: str
+        reason: ReasonCode
+        model_id: str
+        run_index: int
+        effort: str
+
+    stats = flips.flip_stats(
+        [
+            RicherVerdict("a", "approve", ReasonCode.OK, "m1", 0, "high"),
+            RicherVerdict("a", "reject", ReasonCode.CASING_ERROR, "m1", 1, "high"),
+        ]
+    )
+    assert stats["a"].flip_rate == 0.5
+
+
+def test_an_unknown_reason_code_still_counts_toward_the_flip_rate(tmp_path):
+    """A reason vocabulary this branch hasn't seen must not erase the verdict —
+    the flip rate is about approve/reject, not about the reason enum."""
+    results = tmp_path / "2026-08-06"
+    results.mkdir(parents=True)
+    (results / "m1.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"pair_id": "a", "verdict": "approve", "reason": "ok",
+                            "model_id": "m1"}),
+                json.dumps({"pair_id": "a", "verdict": "reject",
+                            "reason": "invented_next_week", "model_id": "m2"}),
+            ]
+        )
+        + "\n"
+    )
+    stats = flips.flip_stats(flips.load_results(results))
+    assert stats["a"].n == 2
+    assert stats["a"].flip_rate == 0.5
+    assert stats["a"].reasons["invented_next_week"] == 1
+
+
 def test_load_results_skips_files_that_are_not_verdicts(tmp_path):
     results = tmp_path / "2026-08-06"
     results.mkdir(parents=True)
@@ -168,6 +310,20 @@ def test_render_flip_pane_reports_split_and_reasons():
     assert "50%" in pane
     assert "approve 1" in pane and "reject 1" in pane
     assert "casing_error" in pane
+
+
+def test_render_flip_pane_counts_votes_and_models_separately():
+    """With majority-of-N, votes outnumber models — saying "judges" would lie."""
+    stats = flips.flip_stats(
+        [
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "reject", ReasonCode.CASING_ERROR, "m2"),
+        ]
+    )
+    pane = flips.render_flip_pane(stats["a"])
+    assert "3 votes" in pane
+    assert "2 models" in pane
 
 
 def test_render_flip_pane_without_stats_is_empty():
