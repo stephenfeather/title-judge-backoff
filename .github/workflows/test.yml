@@ -32,6 +32,12 @@ jobs:
       # readable in review.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # By default checkout leaves the job's token in .git/config, where
+          # any later step — or anything they shell out to — can use it. This
+          # job only reads the tree, so it never needs the credential to
+          # persist past the clone.
+          persist-credentials: false
 
       # Conflict markers checked into the tree break pytest collection
       # repo-wide. This repo resolves upstream conflicts by hand on agent
