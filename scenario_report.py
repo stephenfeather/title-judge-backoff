@@ -28,7 +28,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from judge.agreement import agreement_matrix, reason_distribution
+from judge.agreement import agreement_matrix, reason_cross_tab, reason_distribution
 from judge.schema import Verdict, verdict_from_json_line
 from judge.vote import tally_votes
 
@@ -114,12 +114,47 @@ def _stability_table(by_model: dict[str, list[Verdict]]) -> list[str]:
     for model, verdicts in sorted(by_model.items()):
         voted = tally_votes(verdicts)
         n = len(voted)
+        if n == 0:
+            # A backend whose every call errored judged nothing. Dividing by n
+            # here took the WHOLE report down, so one dead backend destroyed the
+            # output for every healthy one. Report it as errored instead — its
+            # absence is itself a finding worth seeing.
+            lines.append(f"| {model} | 0 | 0 | — | — | no verdicts (all calls failed) |")
+            continue
         unstable = sum(1 for r in voted if r.verdict_flip_rate or r.reason_flip_rate)
         lines.append(
             f"| {model} | {n} | {max((r.n_votes for r in voted), default=0)} | "
             f"{sum(r.verdict_flip_rate for r in voted) / n:.3f} | "
             f"{sum(r.reason_flip_rate for r in voted) / n:.3f} | {unstable} |"
         )
+    return lines
+
+
+def _reason_cross_tab_sections(by_model: dict[str, list[Verdict]]) -> list[str]:
+    """Reason-code cross-tabs for each pair of backends.
+
+    The per-backend distribution shows WHAT each model reaches for; this shows
+    WHERE two models diverge on the same item. Off-diagonal mass is the case the
+    binary verdict hides — both said reject, for different reasons — which is
+    exactly the shape reasoning effort was measured to produce.
+    """
+    models = sorted(by_model)
+    if len(models) < 2:
+        return []  # nothing to cross-tabulate against
+    lines: list[str] = []
+    for i, left in enumerate(models):
+        for right in models[i + 1 :]:
+            tab = reason_cross_tab(by_model[left], by_model[right])
+            if not tab:
+                continue
+            lines.append(f"**{left}** (rows) vs **{right}** (columns)")
+            lines.append("")
+            lines.append(f"| {left} \\ {right} | Reason | Count |")
+            lines.append("|---|---|---|")
+            for (lreason, rreason), count in sorted(tab.items(), key=lambda kv: -kv[1]):
+                marker = "" if lreason == rreason else " ⟵ divergence"
+                lines.append(f"| {lreason} | {rreason} | {count}{marker} |")
+            lines.append("")
     return lines
 
 
@@ -138,8 +173,9 @@ def _agreement_table(by_model: dict[str, list[Verdict]]) -> list[str]:
 
 def _health_table(manifests: dict[str, dict]) -> list[str]:
     lines = [
-        "| Backend | Effort | Temp | OK | Failed | Latency min/median/max (s) | Errors | Snapshots |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Backend | Effort | Temp | OK | Failed | Latency min/median/max (s) | "
+        "Failed latency median/max (s) | Errors | Snapshots |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for name, m in sorted(manifests.items()):
         h = m.get("health", {})
@@ -153,6 +189,9 @@ def _health_table(manifests: dict[str, dict]) -> list[str]:
             f"{'omitted' if m.get('temperature') is None else m['temperature']} | "
             f"{h.get('calls_ok', 0)} | {h.get('calls_failed', 0)} | "
             f"{fmt('latency_min')} / {fmt('latency_median')} / {fmt('latency_max')} | "
+            # Failures are timed separately — a backend that times out on every
+            # call would otherwise show no latency at all.
+            f"{fmt('failed_latency_median')} / {fmt('failed_latency_max')} | "
             f"{error_text} | {', '.join(m.get('observed_models') or []) or '-'} |"
         )
     return lines
@@ -197,6 +236,20 @@ def render_scenario_report(
         dist = reason_distribution(verdicts)
         rendered = ", ".join(f"{k}={v}" for k, v in sorted(dist.items(), key=lambda kv: -kv[1]))
         lines.append(f"| {model} | {rendered} |")
+
+    cross_tabs = _reason_cross_tab_sections(by_model)
+    if cross_tabs:
+        lines += [
+            "",
+            "## Reason-code cross-tab (per backend pair)",
+            "",
+            "The distribution above shows what each backend reaches for; this shows",
+            "where two backends diverge on the same item. Rows marked *divergence*",
+            "are pairs both models judged but labelled differently — the disagreement",
+            "the binary verdict hides.",
+            "",
+            *cross_tabs,
+        ]
 
     lines += [
         "",

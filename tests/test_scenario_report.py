@@ -5,6 +5,7 @@ import pytest
 from judge.schema import ReasonCode, Verdict, verdict_to_json_line
 from scenario_report import (
     ContentionRow,
+    _stability_table,
     contention_ranking,
     load_results,
     render_scenario_report,
@@ -137,6 +138,42 @@ def test_render_scenario_report_has_every_required_section():
     assert "ruling queue" in md.lower()
     # Health must surface the failing backend, not silently average it away.
     assert "ReadTimeout" in md
+
+
+def test_stability_table_survives_a_backend_that_judged_nothing():
+    # A backend whose every call errored leaves an empty verdict list. Dividing
+    # by n crashed the WHOLE report render — so one dead backend destroyed the
+    # output for every healthy one.
+    lines = _stability_table({"dead": [], "alive": votes("alive", "p1", [("approve", "ok")])})
+    rendered = "\n".join(lines)
+    assert "dead" in rendered
+    assert "alive" in rendered
+
+
+def test_report_renders_with_an_all_errors_backend_present():
+    md = render_scenario_report({"dead": [], "alive": votes("alive", "p1", [("approve", "ok")])}, {})
+    assert "dead" in md
+    assert "alive" in md
+
+
+def test_report_includes_a_reason_cross_tab_between_models():
+    # The PR promised inter-model reason cross-tabs and the report only rendered
+    # per-backend distributions. The cross-tab is the part that shows WHERE two
+    # models diverge — both call it reject, for different reasons.
+    by_model = {
+        "a": votes("a", "p1", [("reject", "casing_error")]),
+        "b": votes("b", "p1", [("reject", "truncation_worse")]),
+    }
+    md = render_scenario_report(by_model, {})
+    assert "cross-tab" in md.lower()
+    # The off-diagonal cell is the finding: same verdict, different reason.
+    assert "casing_error" in md and "truncation_worse" in md
+
+
+def test_cross_tab_section_is_skipped_for_a_single_backend():
+    # Nothing to cross-tabulate against; an empty section would be noise.
+    md = render_scenario_report({"only": votes("only", "p1", [("approve", "ok")])}, {})
+    assert "cross-tab" not in md.lower()
 
 
 def test_render_scenario_report_states_that_kappa_is_not_computable():

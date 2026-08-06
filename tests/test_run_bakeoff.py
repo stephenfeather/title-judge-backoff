@@ -215,6 +215,60 @@ def test_skip_warning_names_the_backends_and_the_env_prefix():
     assert health["error_kinds"] == {"timeout": 2, "500": 1}
 
 
+def test_health_reports_failure_latencies_separately_from_success():
+    # Failed calls are typically the SLOWEST — a 180s timeout is the whole
+    # reason we care. Recording elapsed only on success made the worst latencies
+    # vanish from the health block, so a backend that timed out on every call
+    # looked instantaneous. They are kept separate so a slow failure cannot be
+    # mistaken for a slow success.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=1,
+        prompt_version="v1",
+        n_pairs=3,
+        sample_payload={},
+        observed_models=set(),
+        latencies=[1.0, 2.0],
+        errors=["ReadTimeout", "ReadTimeout"],
+        failed_latencies=[180.0, 180.0],
+    )
+    health = manifest["health"]
+    assert health["latency_max"] == 2.0, "success latencies must not absorb failures"
+    assert health["failed_latency_median"] == 180.0
+    assert health["failed_latency_max"] == 180.0
+
+
+def test_health_failure_latencies_are_none_when_nothing_failed():
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    health = run_manifest(
+        backend,
+        votes=1,
+        prompt_version="v1",
+        n_pairs=1,
+        sample_payload={},
+        observed_models=set(),
+        latencies=[1.0],
+        errors=[],
+    )["health"]
+    assert health["failed_latency_median"] is None
+    assert health["failed_latency_max"] is None
+
+
 def test_run_manifest_handles_a_backend_that_never_succeeded():
     backend = Backend(
         name="nv",
