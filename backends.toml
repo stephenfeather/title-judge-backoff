@@ -46,6 +46,15 @@ eval_only = true
 role = "contender"
 api_key_env = "NVIDIA_API_KEY"
 
+[[backends]]
+name = "nvidia-nemotron-3-ultra"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "nvidia/nemotron-3-ultra-550b-a55b"
+rpm = 40
+eval_only = true
+role = "contender"
+api_key_env = "NVIDIA_API_KEY"
+
 # Degenerate-judge floor: proved kappa catches a constant-reject predictor
 # (5/5 rejects, accuracy 0.800, kappa 0.000 on the smoke set). Not a contender.
 [[backends]]
