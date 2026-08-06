@@ -288,8 +288,9 @@ def run_session(
     stats = stats or {}
     session = session or uuid.uuid4().hex[:8]
     result = SessionResult(total=len(rows))
-    #: (row index, action) for session-local undo
-    history: list[tuple[int, str]] = []
+    #: (row index, journaled record) for session-local undo — the record is kept
+    #: whole so undo can reverse the exact tallies that decision added
+    history: list[tuple[int, dict]] = []
     started = now()
 
     index = 0
@@ -312,10 +313,10 @@ def run_session(
             _handle_note(row, journal_path, session, out, result, read_line, notes_enabled)
             continue
 
-        action = _handle_decision(key, row, journal_path, session, read_key, out, result)
-        if action is None:
+        record = _handle_decision(key, row, journal_path, session, read_key, out, result)
+        if record is None:
             continue  # unrecognized key, or an aborted rejection — re-present
-        history.append((index, action))
+        history.append((index, record))
         index += 1
 
     result.elapsed_s = max(0.0, now() - started)
@@ -331,8 +332,8 @@ def _handle_decision(
     read_key: Callable[[], str],
     out: TextIO,
     result: SessionResult,
-) -> str | None:
-    """Journal one verdict. Returns the action taken, or None to re-present."""
+) -> dict | None:
+    """Journal one decision. Returns the record written, or None to re-present."""
     if key == KEY_APPROVE:
         record = rulings.rule_record(row["id"], "approve", rulings.ReasonCode.OK)
     elif key in KEYS_ENTER and rulings.is_unchanged(row):
@@ -344,21 +345,38 @@ def _handle_decision(
             return None
         record = rulings.rule_record(row["id"], "reject", reason)
     elif key == KEY_SKIP:
-        rulings.append(journal_path, rulings.skip_record(row["id"]), session=session)
-        result.skipped += 1
-        return rulings.ACTION_SKIP
+        record = rulings.skip_record(row["id"])
     else:
         return None
 
     rulings.append(journal_path, record, session=session)
-    result.ruled += 1
+    _tally(result, record, +1)
+    return record
+
+
+def _tally(result: SessionResult, record: dict, sign: int) -> None:
+    """Apply (`+1`) or reverse (`-1`) one decision's contribution to the tallies.
+
+    Every counter a decision touches is moved here, in one place, so undo cannot
+    reverse some of them and leave others — a summary where `ruled` disagrees
+    with approved+rejected is a summary that lies about the pass.
+    """
+    if record["action"] == rulings.ACTION_SKIP:
+        result.skipped = max(0, result.skipped + sign)
+        return
+
+    result.ruled = max(0, result.ruled + sign)
     if record["ground_truth"] == "approve":
-        result.approved += 1
+        result.approved = max(0, result.approved + sign)
     else:
-        result.rejected += 1
-    reason_value = record["reason"]
-    result.reasons[reason_value] = result.reasons.get(reason_value, 0) + 1
-    return rulings.ACTION_RULE
+        result.rejected = max(0, result.rejected + sign)
+
+    reason = record["reason"]
+    count = result.reasons.get(reason, 0) + sign
+    if count > 0:
+        result.reasons[reason] = count
+    else:
+        result.reasons.pop(reason, None)
 
 
 def _read_reason(out: TextIO, read_key: Callable[[], str]):
@@ -388,7 +406,7 @@ def _handle_note(
 
 
 def _handle_undo(
-    history: list[tuple[int, str]],
+    history: list[tuple[int, dict]],
     journal_path: Path | str,
     session: str,
     out: TextIO,
@@ -398,18 +416,18 @@ def _handle_undo(
     """Step back one row, retracting a ruling if that is what was last done.
 
     A skip left no ruling to retract, so undoing one only rewinds the cursor —
-    journaling an undo there would pop whatever ruling came before it.
+    journaling an undo there would pop whatever ruling came before it. Either
+    way the decision's tallies are reversed from the record itself, so the
+    summary keeps matching what is actually in the journal.
     """
     if not history:
         out.write("  (nothing to undo)\n")
         return index
 
-    previous_index, action = history.pop()
-    if action == rulings.ACTION_RULE:
+    previous_index, record = history.pop()
+    if record["action"] == rulings.ACTION_RULE:
         rulings.append(journal_path, rulings.undo_record(), session=session)
-        result.ruled = max(0, result.ruled - 1)
-    else:
-        result.skipped = max(0, result.skipped - 1)
+    _tally(result, record, -1)
     result.undos += 1
     return previous_index
 

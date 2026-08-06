@@ -137,6 +137,16 @@ def test_reject_then_reason_key_journals_that_code(tmp_path):
     assert state.rulings["a"]["reason"] == code.value
 
 
+def test_no_reason_key_collides_with_a_verdict_action_key():
+    """`judge/rulings.py` reserves these letters; this is what keeps it honest."""
+    action_keys = {
+        rule.KEY_APPROVE, rule.KEY_REJECT, rule.KEY_SKIP,
+        rule.KEY_UNDO, rule.KEY_NOTE, rule.KEY_QUIT,
+    }
+    assert not action_keys & set(rulings.reason_keymap())
+    assert not action_keys & set(rulings.KEY_POOL)
+
+
 def test_reject_shows_the_reason_menu(tmp_path):
     key = next(iter(rulings.reject_reason_keymap()))
     _, output = drive(f"r{key}", [row("a")], tmp_path / "j.jsonl")
@@ -184,6 +194,46 @@ def test_undo_after_a_skip_does_not_retract_an_earlier_ruling(tmp_path):
     drive("asu", [row("a"), row("b"), row("c")], journal)
     state = rulings.replay(rulings.read_records(journal))
     assert state.rulings["a"]["ground_truth"] == "approve"
+
+
+def test_undo_reverses_the_approve_tally(tmp_path):
+    result, _ = drive("au", [row("a"), row("b")], tmp_path / "j.jsonl")
+    assert (result.ruled, result.approved) == (0, 0)
+    assert result.reasons == {}
+
+
+def test_undo_reverses_the_reject_tally_and_its_reason(tmp_path):
+    key, code = next(iter(rulings.reject_reason_keymap().items()))
+    result, _ = drive(f"r{key}u", [row("a"), row("b")], tmp_path / "j.jsonl")
+    assert (result.ruled, result.rejected) == (0, 0)
+    assert code.value not in result.reasons
+
+
+def test_tallies_stay_consistent_with_the_ruled_count_after_undo(tmp_path):
+    """`ruled` and approved+rejected are the same decisions counted twice —
+    they must never disagree, or the summary lies about the pass."""
+    key = next(iter(rulings.reject_reason_keymap()))
+    result, _ = drive(f"ar{key}ua", [row("a"), row("b"), row("c")], tmp_path / "j.jsonl")
+    assert result.ruled == result.approved + result.rejected
+    assert sum(result.reasons.values()) == result.ruled
+
+
+def test_undo_then_reruling_tallies_only_the_final_verdict(tmp_path):
+    key, code = next(iter(rulings.reject_reason_keymap().items()))
+    result, _ = drive(f"au r{key}".replace(" ", ""), [row("a"), row("b")],
+                      tmp_path / "j.jsonl")
+    assert (result.approved, result.rejected) == (0, 1)
+    assert result.reasons == {code.value: 1}
+
+
+def test_repeated_undo_unwinds_each_ruling_in_turn(tmp_path):
+    result, _ = drive("aauu", [row("a"), row("b"), row("c")], tmp_path / "j.jsonl")
+    assert (result.ruled, result.approved, result.undos) == (0, 0, 2)
+
+
+def test_undoing_a_skip_does_not_touch_the_verdict_tallies(tmp_path):
+    result, _ = drive("asu", [row("a"), row("b"), row("c")], tmp_path / "j.jsonl")
+    assert (result.approved, result.skipped) == (1, 0)
 
 
 def test_undo_at_the_start_of_a_session_is_a_noop(tmp_path):
