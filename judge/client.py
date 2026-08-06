@@ -22,9 +22,11 @@ TEMPERATURE = 0.0
 MAX_TOKENS = 256  # a verdict object is tiny; Anthropic requires the field
 ANTHROPIC_VERSION = "2023-06-01"
 
-# Large reasoning models are genuinely slow: thinkingmachines/inkling answered
-# in 79s. A timeout below that reports a slow model as unreachable, which is a
-# wrong diagnosis rather than a slow one. Override per backend via timeout_s.
+# Backends can take a long time to come back even when they never answer:
+# thinkingmachines/inkling took 79s to return an HTTP 500 (it did NOT answer in
+# 79s). A timeout below that turns "slow" and "slow then failed" into the same
+# unreachable verdict, hiding which one we actually hit — and the response body
+# is where the difference shows up. Override per backend via timeout_s.
 REQUEST_TIMEOUT_S = 180.0
 
 
