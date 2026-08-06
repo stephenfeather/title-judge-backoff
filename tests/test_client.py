@@ -21,6 +21,16 @@ base_url = "https://api.deepinfra.com/v1/openai"
 model_id = "Qwen/Qwen2.5-72B-Instruct"
 rpm = 120
 eval_only = false
+
+[[backends]]
+name = "anthropic-haiku"
+base_url = "https://api.anthropic.com/v1"
+model_id = "claude-haiku-4-5"
+rpm = 50
+eval_only = false
+api = "anthropic"
+role = "contender"
+api_key_env = "ANTHROPIC_API_KEY"
 """
 
 PAIR = Pair(
@@ -45,7 +55,24 @@ def test_load_backends_parses_all_fields(tmp_path):
         rpm=40,
         eval_only=True,
         api_key_env="NVIDIA_API_KEY",
+        api="openai",
+        role="contender",
     )
+
+
+def test_load_backends_reads_api_and_role(tmp_path):
+    path = tmp_path / "backends.toml"
+    path.write_text(BACKENDS_TOML)
+    anthropic = load_backends(path)[2]
+    assert anthropic.api == "anthropic"
+    assert anthropic.role == "contender"
+
+
+def test_load_backends_rejects_unknown_api(tmp_path):
+    path = tmp_path / "backends.toml"
+    path.write_text(BACKENDS_TOML.replace('api = "anthropic"', 'api = "telepathy"'))
+    with pytest.raises(ValueError, match="api"):
+        load_backends(path)
 
 
 def test_load_backends_defaults_api_key_env_from_name(tmp_path):
@@ -102,6 +129,45 @@ def test_judge_client_parses_chat_completion(monkeypatch):
     assert verdict.model_id == "meta/llama-3.1-8b-instruct"
     assert verdict.prompt_version == "v1"
     assert verdict.temperature == 0.0
+
+
+def test_judge_client_speaks_anthropic_messages_api(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    backend = Backend(
+        name="anthropic-haiku",
+        base_url="https://example.test/v1",
+        model_id="claude-haiku-4-5",
+        rpm=50,
+        eval_only=False,
+        api_key_env="ANTHROPIC_API_KEY",
+        api="anthropic",
+    )
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["headers"] = request.headers
+        captured["body"] = json.loads(request.read().decode())
+        return httpx.Response(
+            200,
+            json={"content": [{"type": "text", "text": '{"verdict": "approve", "reason": "ok"}'}]},
+        )
+
+    client = JudgeClient(backend, transport=httpx.MockTransport(handler))
+    verdict = client.judge(PAIR)
+
+    assert captured["url"] == "https://example.test/v1/messages"
+    assert captured["headers"]["x-api-key"] == "sk-ant-test"
+    assert captured["headers"]["anthropic-version"] == "2023-06-01"
+    assert "authorization" not in captured["headers"]
+    body = captured["body"]
+    assert body["temperature"] == 0.0
+    # Anthropic takes the system prompt as a top-level field, not a message.
+    assert body["system"].startswith("You are a strict")
+    assert [m["role"] for m in body["messages"]] == ["user"]
+    assert verdict.verdict == "approve"
+    assert verdict.reason == ReasonCode.OK
+    assert verdict.model_id == "claude-haiku-4-5"
 
 
 def test_judge_client_requires_api_key(monkeypatch):

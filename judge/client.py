@@ -19,6 +19,12 @@ from judge.prompts import PROMPT_VERSION, build_messages, parse_judge_response
 from judge.schema import Pair, Verdict
 
 TEMPERATURE = 0.0
+MAX_TOKENS = 256  # a verdict object is tiny; Anthropic requires the field
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+VALID_APIS = ("openai", "anthropic")
+VALID_ROLES = ("contender", "floor")
 
 
 @dataclass(frozen=True)
@@ -29,6 +35,14 @@ class Backend:
     rpm: int
     eval_only: bool
     api_key_env: str
+    api: str = "openai"  # wire protocol: OpenAI-compatible chat, or Anthropic messages
+    role: str = "contender"  # "floor" backends are baselines, not contenders
+
+    def __post_init__(self) -> None:
+        if self.api not in VALID_APIS:
+            raise ValueError(f"backend {self.name!r}: api must be one of {VALID_APIS}, got {self.api!r}")
+        if self.role not in VALID_ROLES:
+            raise ValueError(f"backend {self.name!r}: role must be one of {VALID_ROLES}, got {self.role!r}")
 
 
 def load_backends(path: str | Path) -> list[Backend]:
@@ -45,6 +59,8 @@ def load_backends(path: str | Path) -> list[Backend]:
                 rpm=entry["rpm"],
                 eval_only=entry["eval_only"],
                 api_key_env=entry.get("api_key_env", default_env),
+                api=entry.get("api", "openai"),
+                role=entry.get("role", "contender"),
             )
         )
     return backends
@@ -72,6 +88,45 @@ class RateLimiter:
         self._last = self._now()
 
 
+def _openai_request(backend: Backend, pair: Pair) -> tuple[str, dict]:
+    """Path and body for an OpenAI-compatible chat completion."""
+    return "/chat/completions", {
+        "model": backend.model_id,
+        "messages": build_messages(pair),
+        "temperature": TEMPERATURE,
+    }
+
+
+def _openai_content(payload: dict) -> str:
+    return payload["choices"][0]["message"]["content"]
+
+
+def _anthropic_request(backend: Backend, pair: Pair) -> tuple[str, dict]:
+    """Path and body for the Anthropic messages API.
+
+    Anthropic takes the system prompt as a top-level field rather than a
+    message, so the shared prompt is split rather than rewritten.
+    """
+    system, user = build_messages(pair)
+    return "/messages", {
+        "model": backend.model_id,
+        "system": system["content"],
+        "messages": [user],
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+    }
+
+
+def _anthropic_content(payload: dict) -> str:
+    return "".join(block["text"] for block in payload["content"] if block["type"] == "text")
+
+
+def _auth_headers(api: str, api_key: str) -> dict[str, str]:
+    if api == "anthropic":
+        return {"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
 class JudgeClient:
     def __init__(self, backend: Backend, transport: httpx.BaseTransport | None = None) -> None:
         api_key = os.environ.get(backend.api_key_env)
@@ -82,23 +137,20 @@ class JudgeClient:
         self.backend = backend
         self._http = httpx.Client(
             base_url=backend.base_url,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=_auth_headers(backend.api, api_key),
             timeout=60.0,
             transport=transport,
         )
 
     def judge(self, pair: Pair) -> Verdict:
-        response = self._http.post(
-            "/chat/completions",
-            json={
-                "model": self.backend.model_id,
-                "messages": build_messages(pair),
-                "temperature": TEMPERATURE,
-            },
-        )
+        is_anthropic = self.backend.api == "anthropic"
+        build = _anthropic_request if is_anthropic else _openai_request
+        extract = _anthropic_content if is_anthropic else _openai_content
+
+        path, body = build(self.backend, pair)
+        response = self._http.post(path, json=body)
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        verdict, reason = parse_judge_response(content)
+        verdict, reason = parse_judge_response(extract(response.json()))
         return Verdict(
             pair_id=pair.id,
             verdict=verdict,
