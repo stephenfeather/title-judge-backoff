@@ -63,18 +63,21 @@ def cohens_kappa(truth: list[str], predicted: list[str]) -> float:
     return (observed - expected) / (1 - expected)
 
 
-def _per_run_kappas(pairs_by_id: dict[str, Pair], verdicts: list[Verdict]) -> list[float]:
+def _per_run_kappas(truth_by_id: dict[str, str], verdicts: list[Verdict]) -> list[float]:
     """Kappa computed independently for each vote index.
 
     Their spread IS the judge-stochasticity term: it answers "if we ran this
     again, how different would the number be?", which a single kappa cannot.
+
+    Takes a plain id -> ground_truth map rather than Pairs so that unruled
+    pairs cannot reach this function at all.
     """
     by_run: dict[int, list[Verdict]] = {}
     for v in verdicts:
         by_run.setdefault(v.run_index, []).append(v)
     return [
         cohens_kappa(
-            [pairs_by_id[v.pair_id].ground_truth for v in run_verdicts],
+            [truth_by_id[v.pair_id] for v in run_verdicts],
             [v.verdict for v in run_verdicts],
         )
         for _, run_verdicts in sorted(by_run.items())
@@ -88,6 +91,15 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     `n` counts pairs rather than API calls. With a single vote per pair this
     reduces to the original single-run behavior.
     """
+    unruled = [p.id for p in pairs if not p.is_ruled]
+    if unruled:
+        raise ValueError(
+            f"{len(unruled)} of {len(pairs)} pairs are unruled (first few: "
+            f"{', '.join(unruled[:3])}). Kappa needs operator ground truth — None is "
+            f"not a label. Use scenario_report.py for metrics that do not need "
+            f"rulings (flip rates, cross-model agreement, reason distribution)."
+        )
+
     by_id = {p.id: p for p in pairs}
     known = [v for v in verdicts if v.pair_id in by_id]
     if not known:
@@ -96,16 +108,21 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     voted = tally_votes(known)
     matched = [(by_id[r.pair_id], r) for r in voted]
 
-    truth = [p.ground_truth for p, _ in matched]
+    # Narrowed once, here: the unruled guard above means every pair carries a
+    # ruling, so the rest of this function works with plain strings.
+    truth_by_id = {p.id: p.ground_truth for p in pairs if p.ground_truth is not None}
+    reason_by_id = {p.id: p.reason.value for p in pairs if p.reason is not None}
+
+    truth = [truth_by_id[p.id] for p, _ in matched]
     predicted = [r.verdict for _, r in matched]
     n = len(matched)
 
-    rejects = [(p, r) for p, r in matched if p.ground_truth == "reject"]
+    rejects = [(p, r) for p, r in matched if truth_by_id[p.id] == "reject"]
     false_approves = sum(r.verdict == "approve" for _, r in rejects)
 
-    confusion = Counter((p.reason.value, r.reason.value) for p, r in matched)
+    confusion = Counter((reason_by_id[p.id], r.reason.value) for p, r in matched)
 
-    run_kappas = _per_run_kappas(by_id, known)
+    run_kappas = _per_run_kappas(truth_by_id, known)
     kappa_mean, kappa_sd = mean_sd(run_kappas)
 
     # Resample whole items, matching how the metrics aggregate.

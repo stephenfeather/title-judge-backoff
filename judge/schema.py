@@ -25,20 +25,39 @@ def _check_verdict(value: str) -> str:
 
 @dataclass(frozen=True)
 class Pair:
-    """One calibration pair: a before/after title change with operator ruling."""
+    """One calibration pair: a before/after title change, optionally ruled.
+
+    `ground_truth`/`reason` are None for an UNRULED row. The E10 pack ships 200
+    rows with no operator verdicts, and plenty is measurable before rulings
+    exist — flip rates, cross-model agreement, reason distribution — so judging
+    an unruled row is a first-class case, not an error. Anything that compares
+    against ground truth must check `is_ruled` first; see score.py, which
+    refuses to compute kappa on unruled data rather than treating None as a
+    label.
+    """
 
     id: str
     original: str
     enriched: str
     # brand/mpn are absent from some sources (e.g. the E10 QA pack), in which
     # case the judge prompt simply omits those lines.
-    brand: str | None
-    mpn: str | None
-    ground_truth: str
-    reason: ReasonCode
+    brand: str | None = None
+    mpn: str | None = None
+    ground_truth: str | None = None
+    reason: ReasonCode | None = None
 
     def __post_init__(self) -> None:
-        _check_verdict(self.ground_truth)
+        if (self.ground_truth is None) != (self.reason is None):
+            raise ValueError(
+                f"pair {self.id!r}: ground_truth and reason must both be set or both be "
+                f"absent, got ground_truth={self.ground_truth!r}, reason={self.reason!r}"
+            )
+        if self.ground_truth is not None:
+            _check_verdict(self.ground_truth)
+
+    @property
+    def is_ruled(self) -> bool:
+        return self.ground_truth is not None
 
 
 @dataclass(frozen=True)
@@ -68,14 +87,20 @@ class Verdict:
 
 
 def pair_from_dict(record: dict) -> Pair:
+    """Build a Pair; a missing or null ruling yields an unruled pair.
+
+    The ruling-template rows produced by adapt_qa_pack carry explicit nulls,
+    and the pack itself carries no verdicts at all — both must load.
+    """
+    reason = record.get("reason")
     return Pair(
         id=record["id"],
         original=record["original"],
         enriched=record["enriched"],
         brand=record.get("brand"),
         mpn=record.get("mpn"),
-        ground_truth=record["ground_truth"],
-        reason=ReasonCode(record["reason"]),
+        ground_truth=record.get("ground_truth"),
+        reason=ReasonCode(reason) if reason is not None else None,
     )
 
 

@@ -145,6 +145,61 @@ def test_run_manifest_records_payload_effort_and_snapshots():
     assert manifest["observed_models"] == ["m-2026-06-30"]
 
 
+def test_run_manifest_summarizes_latency_and_errors():
+    # S4 operational health: which backends are slow, which are flaky. A ping
+    # gives one sample; a 600-call run gives a distribution, and that is what
+    # decides whether a backend is usable at full-pack scale.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=3,
+        prompt_version="v1",
+        n_pairs=200,
+        sample_payload={},
+        observed_models=set(),
+        latencies=[1.0, 2.0, 3.0, 100.0],
+        errors=["timeout", "timeout", "500"],
+    )
+    health = manifest["health"]
+    assert health["calls_ok"] == 4
+    assert health["calls_failed"] == 3
+    assert health["latency_min"] == 1.0
+    assert health["latency_max"] == 100.0
+    assert health["latency_median"] == pytest.approx(2.5)
+    assert health["error_kinds"] == {"timeout": 2, "500": 1}
+
+
+def test_run_manifest_handles_a_backend_that_never_succeeded():
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=1,
+        prompt_version="v1",
+        n_pairs=5,
+        sample_payload={},
+        observed_models=set(),
+        latencies=[],
+        errors=["timeout"],
+    )
+    health = manifest["health"]
+    assert health["calls_ok"] == 0
+    assert health["latency_median"] is None
+
+
 def test_run_manifest_omits_nothing_when_temperature_is_set():
     backend = Backend(
         name="nv",

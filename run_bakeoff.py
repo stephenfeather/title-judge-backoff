@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
+import time
+from collections import Counter
 from pathlib import Path
 
 from judge.check import check_key_presence, ping_backend, render_check_report
@@ -93,6 +96,24 @@ def pending_votes(
     ]
 
 
+def _health_summary(latencies: list[float], errors: list[str]) -> dict:
+    """Per-backend operational health for the scenario report.
+
+    A ping gives one latency sample; a full run gives a distribution, and that
+    is what decides whether a backend is usable at pack scale. Median rather
+    than mean because one 180s timeout would otherwise swamp 599 fast calls.
+    """
+    ordered = sorted(latencies)
+    return {
+        "calls_ok": len(latencies),
+        "calls_failed": len(errors),
+        "latency_min": ordered[0] if ordered else None,
+        "latency_median": statistics.median(ordered) if ordered else None,
+        "latency_max": ordered[-1] if ordered else None,
+        "error_kinds": dict(Counter(errors)),
+    }
+
+
 def run_manifest(
     backend: Backend,
     *,
@@ -101,6 +122,8 @@ def run_manifest(
     n_pairs: int,
     sample_payload: dict,
     observed_models: set[str],
+    latencies: list[float] | None = None,
+    errors: list[str] | None = None,
 ) -> dict:
     """Everything needed to reconstruct what this run actually sent.
 
@@ -121,6 +144,7 @@ def run_manifest(
         "n_pairs": n_pairs,
         "request_payload": sample_payload,
         "observed_models": sorted(observed_models),
+        "health": _health_summary(latencies or [], errors or []),
     }
 
 
@@ -147,18 +171,23 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: in
 
     client = JudgeClient(backend)
     limiter = RateLimiter(rpm=backend.rpm)
+    latencies: list[float] = []
+    errors: list[str] = []
     try:
         with open(results_path, "a") as fh:
             for i, (pair, run_index) in enumerate(todo, 1):
                 limiter.wait()
+                started = time.monotonic()
                 try:
                     verdict = client.judge(pair, run_index=run_index)
                 except Exception as exc:  # noqa: BLE001 - keep going, resume covers gaps
+                    errors.append(type(exc).__name__)
                     print(
                         f"[{backend.name}] {pair.id} vote {run_index}: ERROR {exc}",
                         file=sys.stderr,
                     )
                     continue
+                latencies.append(time.monotonic() - started)
                 fh.write(verdict_to_json_line(verdict) + "\n")
                 fh.flush()
                 if i % 20 == 0 or i == len(todo):
@@ -175,6 +204,8 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: in
                     n_pairs=len(pairs),
                     sample_payload=client.request_body(pairs[0]),
                     observed_models=client.observed_models,
+                    latencies=latencies,
+                    errors=errors,
                 ),
                 indent=2,
             )

@@ -115,6 +115,52 @@ def test_pair_from_dict():
     )
 
 
+def test_pair_accepts_an_unruled_row():
+    # The E10 pack ships 200 rows with NO operator verdicts. Judging them is
+    # useful before rulings exist (flip rates, cross-model agreement), so an
+    # unruled pair must load rather than raise.
+    pair = pair_from_dict(
+        {
+            "id": "e10-abc",
+            "original": "acme widget 3000 blk",
+            "enriched": "Acme Widget 3000, Black",
+            "ground_truth": None,
+            "reason": None,
+        }
+    )
+    assert pair.ground_truth is None
+    assert pair.reason is None
+    assert pair.is_ruled is False
+
+
+def test_pair_from_dict_treats_missing_ruling_fields_as_unruled():
+    pair = pair_from_dict({"id": "e10-abc", "original": "a", "enriched": "b"})
+    assert pair.is_ruled is False
+
+
+def test_ruled_pair_reports_itself_as_ruled():
+    pair = pair_from_dict(
+        {
+            "id": "p1",
+            "original": "a",
+            "enriched": "b",
+            "ground_truth": "approve",
+            "reason": "ok",
+        }
+    )
+    assert pair.is_ruled is True
+
+
+def test_pair_rejects_a_half_ruling():
+    # A verdict with no reason (or vice versa) is a data-entry slip, not a
+    # deliberate "unruled" — silently accepting it would produce a pair that
+    # scores but has no reason code for the confusion matrix.
+    with pytest.raises(ValueError, match="both"):
+        pair_from_dict({"id": "p1", "original": "a", "enriched": "b", "ground_truth": "approve"})
+    with pytest.raises(ValueError, match="both"):
+        pair_from_dict({"id": "p1", "original": "a", "enriched": "b", "reason": "ok"})
+
+
 def test_pair_from_dict_rejects_bad_ground_truth():
     with pytest.raises(ValueError):
         pair_from_dict(
