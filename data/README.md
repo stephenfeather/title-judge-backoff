@@ -46,11 +46,18 @@ there is a human step in the middle:
 # 1. Parse the pack into a ruling template (verdicts left blank)
 uv run adapt_qa_pack.py template --pack /path/to/title-qa-pack.md --out rulings-template.jsonl
 
-# 2. Operator fills in ground_truth (approve|reject) and reason on all 200 rows
+# 2. Rule the template — one keystroke per row, resumable
+uv run rule.py run --template rulings-template.jsonl --journal rulings.journal.jsonl
 
-# 3. Build the calibration set
-uv run adapt_qa_pack.py merge --template rulings-template.jsonl --out pairs.jsonl
+# 3. Export the rulings and build the calibration set
+uv run rule.py export --journal rulings.journal.jsonl --out rulings.jsonl
+uv run adapt_qa_pack.py merge --template rulings-template.jsonl \
+    --rulings rulings.jsonl --out pairs.jsonl
 ```
+
+Step 2 can also be done by hand — filling `ground_truth` and `reason` into the
+template and running `merge --template` alone still works. `rule.py` just makes
+200 rows survivable; see [the ruling pass](#the-ruling-pass) below.
 
 `merge` refuses to emit a partial calibration set: it fails if any row is
 unruled, or if a ruling references an id no row has.
@@ -61,6 +68,72 @@ previously collected rulings still apply.
 
 `--attributes` optionally joins a `{id, brand, mpn}` JSONL if those fields
 become available from another source; without it they are omitted entirely.
+
+## The ruling pass
+
+`rule.py` shows one change per screen and takes a single keystroke for the
+verdict:
+
+| Key | Action |
+|---|---|
+| `a` | approve (reason `ok`) |
+| `r` | reject → one-key reason submenu, generated from `judge/schema.py` |
+| ⏎ | on an `unchanged` row only: accept the pre-offered approve |
+| `s` | skip — stays pending, re-presented on the next run |
+| `u` | undo the last action of this session |
+| `n` | annotate this row (with `--notes`) |
+| `q` | quit and save |
+
+Every keystroke appends one line to the journal and fsyncs, so a crash loses at
+most the decision in flight. Re-running the same command resumes: ruled rows
+are dropped, skipped rows come back. An `undo` is itself journaled and replayed
+away — nothing is ever rewritten.
+
+### Unchanged rows
+
+The no-op rows (see [the cohort note](#note-on-the-unchanged-cohort) below for
+what they are and why their base rate matters) are flagged on the card and
+pre-offer approve/`ok` on ⏎, so the sanity stratum costs one keystroke. The pass
+never rules one on the operator's behalf: `a`/`r` still override, and an
+accepted offer is journaled with `"auto": true` — so those rows stay
+identifiable afterwards and can still be scored separately, rather than that
+call having been made silently during the pass.
+
+Whether a row counts as unchanged is decided by comparing the titles, not by
+reading the cohort label. The two agree in this pack; the titles are the fact
+and the label is the pack's claim about it, so a regenerated pack that drifts
+cannot mis-flag a row.
+
+`--results results/<dir>` adds a context pane per row: how a sweep's judges
+split on that pair (`flip 50% over 6 votes from 2 models`) and which reason
+codes they gave. It reads flat and per-scenario layouts, and without it the pane
+is simply absent — the ruling pass never depends on a sweep having run.
+
+Votes are counted, not models: under majority-of-N the same model votes several
+times, and each vote counts toward the flip rate. The pane reads four fields
+(`pair_id`, `verdict`, `reason`, `model_id`) and ignores every other key, so the
+sweep's verdict record can keep growing without touching this.
+
+### Row order
+
+With `--results`, rows are presented **most contested first** — attention is the
+scarce resource in a 200-row pass, and the rows the judges split on are where an
+operator ruling moves the calibration set most. Ties keep pack order, so a
+re-run presents rows the same way.
+
+Rows the sweep never judged sort *last*, not first: no verdicts is not the same
+as no disagreement, and ranking them as calm would bury unexamined rows behind
+rows everyone agreed on.
+
+`--order pack` restores the template's own order. Without `--results` there is
+nothing to rank by and pack order is what you get either way. The header says
+which order is in effect, so it is never a guess why row 1 is row 1.
+
+`--notes` enables free-text rubric annotations, exported to a sidecar with
+`--notes-out` and deliberately kept out of the merge input.
+
+**The journal is operator-local.** It carries vendor-derived title ids and the
+operator's reasoning; `*.jsonl` is gitignored and none of it belongs in the repo.
 
 ### Note on the `unchanged` cohort
 
