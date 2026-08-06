@@ -64,9 +64,10 @@ jobs:
           echo "No API keys in the environment, as intended."
 
       - name: Install uv
-        # v5/v4 still target Node 20, which GitHub deprecated and now force-runs
-        # on Node 24; these majors run on Node 24 natively.
-        uses: astral-sh/setup-uv@v9
+        # v5 still targets Node 20, which GitHub deprecated and now force-runs
+        # on Node 24. Pinned to an exact patch tag because setup-uv stopped
+        # publishing moving major tags after v7 — `@v9` does not resolve.
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           # Dependencies live both in pyproject.toml and in PEP-723 inline
