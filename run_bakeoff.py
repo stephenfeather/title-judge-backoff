@@ -20,6 +20,7 @@ import json
 import sys
 from pathlib import Path
 
+from judge.check import check_key_presence, ping_backend, render_check_report
 from judge.client import TEMPERATURE, Backend, JudgeClient, RateLimiter, load_backends
 from judge.prompts import PROMPT_VERSION
 from judge.schema import Pair, pair_from_dict, verdict_from_json_line, verdict_to_json_line
@@ -99,13 +100,36 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backends", type=Path, default=Path("backends.toml"))
-    parser.add_argument("--data", type=Path, required=True, help="calibration pairs.jsonl (never committed)")
-    parser.add_argument("--out", type=Path, required=True, help="output directory, e.g. results/2026-08-05/")
+    parser.add_argument("--data", type=Path, help="calibration pairs.jsonl (never committed)")
+    parser.add_argument("--out", type=Path, help="output directory, e.g. results/2026-08-05/")
+    parser.add_argument(
+        "--check-backends",
+        action="store_true",
+        help="validate the slate (key presence per backend) and exit without judging",
+    )
+    parser.add_argument(
+        "--ping",
+        action="store_true",
+        help="with --check-backends, also send ONE real request per backend (spends tokens)",
+    )
     args = parser.parse_args()
+
+    backends = load_backends(args.backends)
+
+    if args.check_backends:
+        check = ping_backend if args.ping else check_key_presence
+        print(render_check_report([check(b) for b in backends]))
+        return
+
+    if args.data is None or args.out is None:
+        parser.error("--data and --out are required unless --check-backends is given")
 
     pairs = load_pairs(args.data)
     args.out.mkdir(parents=True, exist_ok=True)
-    for backend in load_backends(args.backends):
+    for backend in backends:
+        if check_key_presence(backend).status == "skipped":
+            print(f"[{backend.name}] SKIPPED: ${backend.api_key_env} is not set", file=sys.stderr)
+            continue
         run_backend(backend, pairs, args.out)
 
 

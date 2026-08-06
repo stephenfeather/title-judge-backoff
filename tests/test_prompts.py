@@ -34,6 +34,23 @@ def test_build_messages_system_prompt_names_all_reason_codes():
         assert code.value in system
 
 
+def test_build_messages_omits_brand_and_mpn_lines_when_absent():
+    pair = Pair(
+        id="p2",
+        original="acme widget 3000 blk",
+        enriched="Acme Widget 3000, Black",
+        brand=None,
+        mpn=None,
+        ground_truth="approve",
+        reason=ReasonCode.OK,
+    )
+    user = build_messages(pair)[1]["content"]
+    assert "BRAND:" not in user
+    assert "MPN:" not in user
+    assert "ORIGINAL: acme widget 3000 blk" in user
+    assert "ENRICHED: Acme Widget 3000, Black" in user
+
+
 def test_parse_judge_response_plain_json():
     verdict, reason = parse_judge_response('{"verdict": "approve", "reason": "ok"}')
     assert verdict == "approve"

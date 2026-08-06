@@ -30,8 +30,10 @@ class Pair:
     id: str
     original: str
     enriched: str
-    brand: str
-    mpn: str
+    # brand/mpn are absent from some sources (e.g. the E10 QA pack), in which
+    # case the judge prompt simply omits those lines.
+    brand: str | None
+    mpn: str | None
     ground_truth: str
     reason: ReasonCode
 
@@ -59,8 +61,8 @@ def pair_from_dict(record: dict) -> Pair:
         id=record["id"],
         original=record["original"],
         enriched=record["enriched"],
-        brand=record["brand"],
-        mpn=record["mpn"],
+        brand=record.get("brand"),
+        mpn=record.get("mpn"),
         ground_truth=record["ground_truth"],
         reason=ReasonCode(record["reason"]),
     )

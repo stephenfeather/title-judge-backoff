@@ -1,30 +1,99 @@
-# Candidate judge backends (OpenAI-compatible chat endpoints).
-# API keys are read from the environment variable named by api_key_env —
-# never put keys in this file.
+# Candidate judge backends.
 #
-# eval_only = true marks backends whose terms allow testing/evaluation only
-# (e.g. NVIDIA build.nvidia.com free tier). They must not serve production.
+# API keys are read from the environment variable named by api_key_env —
+# NEVER put keys in this file. Backends whose key is absent are skipped at
+# run time (see `uv run run_bakeoff.py --check-backends`).
+#
+# Fields:
+#   api        "openai" (OpenAI-compatible chat completions) or "anthropic"
+#   eval_only  true = terms permit evaluation/testing only, never production
+#   role       "contender" = eligible to win; "floor" = baseline reference only
+#   rpm        client-side rate limit
+
+# ---------------------------------------------------------------------------
+# NVIDIA build.nvidia.com — free tier, EVALUATION ONLY per ToS.
+# One NVIDIA_API_KEY covers every model on this endpoint.
+# ---------------------------------------------------------------------------
 
 [[backends]]
-name = "nvidia-llama31-8b"
+name = "nvidia-deepseek-v4-flash"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "deepseek-ai/deepseek-v4-flash"
+rpm = 40
+eval_only = true
+role = "contender"
+api_key_env = "NVIDIA_API_KEY"
+
+[[backends]]
+name = "nvidia-deepseek-v4-pro"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "deepseek-ai/deepseek-v4-pro"
+rpm = 40
+eval_only = true
+role = "contender"
+api_key_env = "NVIDIA_API_KEY"
+
+# NOTE (2026-08-05): this id is exactly what GET /v1/models advertises, but a
+# chat/completions request against it returns 404 — listed in the catalog, not
+# servable on this endpoint. Left in place so a later --ping re-tests it; treat
+# its results as absent until a ping reports [reachable].
+[[backends]]
+name = "nvidia-kimi-k2.6"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "moonshotai/kimi-k2.6"
+rpm = 40
+eval_only = true
+role = "contender"
+api_key_env = "NVIDIA_API_KEY"
+
+# Degenerate-judge floor: proved kappa catches a constant-reject predictor
+# (5/5 rejects, accuracy 0.800, kappa 0.000 on the smoke set). Not a contender.
+[[backends]]
+name = "nvidia-llama31-8b-floor"
 base_url = "https://integrate.api.nvidia.com/v1"
 model_id = "meta/llama-3.1-8b-instruct"
 rpm = 40
 eval_only = true
+role = "floor"
 api_key_env = "NVIDIA_API_KEY"
 
-[[backends]]
-name = "nvidia-llama31-70b"
-base_url = "https://integrate.api.nvidia.com/v1"
-model_id = "meta/llama-3.1-70b-instruct"
-rpm = 40
-eval_only = true
-api_key_env = "NVIDIA_API_KEY"
+# ---------------------------------------------------------------------------
+# Paid provider APIs. Each is skipped unless its key is present in the env.
+# ---------------------------------------------------------------------------
 
 [[backends]]
-name = "nvidia-qwen25-72b"
-base_url = "https://integrate.api.nvidia.com/v1"
-model_id = "qwen/qwen2.5-72b-instruct"
-rpm = 40
-eval_only = true
-api_key_env = "NVIDIA_API_KEY"
+name = "gemini-2.5-pro"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+model_id = "gemini-2.5-pro"
+rpm = 60
+eval_only = false
+role = "contender"
+api_key_env = "GEMINI_API_KEY"
+
+[[backends]]
+name = "xai-grok-4.1-fast"
+base_url = "https://api.x.ai/v1"
+model_id = "grok-4.1-fast"
+rpm = 60
+eval_only = false
+role = "contender"
+api_key_env = "XAI_API_KEY"
+
+[[backends]]
+name = "anthropic-haiku-4.5"
+base_url = "https://api.anthropic.com/v1"
+model_id = "claude-haiku-4-5"
+rpm = 50
+eval_only = false
+role = "contender"
+api = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[backends]]
+name = "openai-gpt-5.6-luna"
+base_url = "https://api.openai.com/v1"
+model_id = "gpt-5.6-luna"
+rpm = 60
+eval_only = false
+role = "contender"
+api_key_env = "OPENAI_API_KEY"
