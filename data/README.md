@@ -89,6 +89,21 @@ most the decision in flight. Re-running the same command resumes: ruled rows
 are dropped, skipped rows come back. An `undo` is itself journaled and replayed
 away — nothing is ever rewritten.
 
+### Unchanged rows
+
+The no-op rows (see [the cohort note](#note-on-the-unchanged-cohort) below for
+what they are and why their base rate matters) are flagged on the card and
+pre-offer approve/`ok` on ⏎, so the sanity stratum costs one keystroke. The pass
+never rules one on the operator's behalf: `a`/`r` still override, and an
+accepted offer is journaled with `"auto": true` — so those rows stay
+identifiable afterwards and can still be scored separately, rather than that
+call having been made silently during the pass.
+
+Whether a row counts as unchanged is decided by comparing the titles, not by
+reading the cohort label. The two agree in this pack; the titles are the fact
+and the label is the pack's claim about it, so a regenerated pack that drifts
+cannot mis-flag a row.
+
 `--results results/<dir>` adds a context pane per row: how a sweep's judges
 split on that pair (`flip 50% over 6 votes from 2 models`) and which reason
 codes they gave. It reads flat and per-scenario layouts, and without it the pane
@@ -123,13 +138,15 @@ operator's reasoning; `*.jsonl` is gitignored and none of it belongs in the repo
 ### Note on the `unchanged` cohort
 
 20 of the 200 rows are no-ops — `original` and `enriched` are byte-identical
-(the pipeline skipped titles already containing a lowercase character). Asking
-a judge to approve or reject a change that was never made is a degenerate
-case; decide deliberately whether those rows belong in the calibration set or
-should be scored separately.
+(the pipeline skips titles already containing a lowercase character). These
+are a **designed stratum**, not stray data: the no-op set coincides exactly
+with the pack's `unchanged` cohort (all 20 no-ops carry that cohort, and no
+`unchanged` row actually changed), and the pack describes it as "what the
+pipeline does NOT fix".
 
-`rule.py` flags such a row and pre-offers approve/`ok` on ⏎ so the sanity cohort
-costs one keystroke, but it never rules one on the operator's behalf: `a`/`r`
-still override, and an accepted offer is journaled with `"auto": true` so those
-rows can be found and scored separately later. Whether a row is "unchanged" is
-decided by comparing the titles, not by trusting the cohort label.
+The open question is therefore what a verdict *means* on an unchanged row —
+plausibly a sanity check where `approve` is the correct answer. Note that
+ruling all 20 as `approve` raises the approve base rate across the 200-row
+set, which shifts Cohen's kappa's chance-agreement term for every model.
+That should be a deliberate choice rather than a side effect; scoring the
+cohort separately is the alternative.
