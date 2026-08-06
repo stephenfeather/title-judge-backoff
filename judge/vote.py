@@ -61,6 +61,12 @@ def flip_rate(values: list) -> float:
     Same arithmetic, different populations. If these ever disagreed, the
     leaderboard and the operator card would describe the same pair differently.
     """
+    if not values:
+        # Named for this function, not for `majority` below: a caller of a
+        # public function should never be sent to read a helper they did not
+        # call. There is also no sensible flip rate for no votes — 0.0 would
+        # claim unanimity where nothing was measured.
+        raise ValueError("flip_rate() needs at least one value")
     winner = majority(values)
     return sum(v != winner for v in values) / len(values)
 

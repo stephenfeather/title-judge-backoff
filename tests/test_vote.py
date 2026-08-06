@@ -40,6 +40,16 @@ def test_flip_rate_counts_against_the_modal_value():
     assert flip_rate(["a", "a", "b", "c"]) == 0.5
 
 
+def test_flip_rate_rejects_empty_naming_itself():
+    """A public function must not report a failure under a helper's name.
+
+    Before this, `flip_rate([])` raised "majority() needs at least one value",
+    sending a caller to read a function they never called.
+    """
+    with pytest.raises(ValueError, match="flip_rate"):
+        flip_rate([])
+
+
 def test_majority_rejects_empty():
     with pytest.raises(ValueError):
         majority([])
