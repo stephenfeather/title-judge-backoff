@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
+import time
+from collections import Counter
 from pathlib import Path
 
 from judge.check import check_key_presence, ping_backend, render_check_report
@@ -93,6 +96,82 @@ def pending_votes(
     ]
 
 
+# Keys are fetched from the macOS Keychain by get_secret(), which is defined in
+# 002_functions and consumed by 042_env_ai_tokens. Sourcing the tokens file
+# ALONE sets every key to empty, which is worse than not sourcing it — so both
+# must be sourced, in this order, in the same shell as the run.
+ENV_PREFIX = (
+    "zsh -c 'source ~/.zsh/zshrc.d/002_functions && "
+    "source ~/.zsh/zshrc.d/042_env_ai_tokens && <command>'"
+)
+
+
+def skipped_backend_names(backends: list[Backend]) -> list[str]:
+    """Backends whose API key is absent, in slate order."""
+    return [b.name for b in backends if check_key_presence(b).status == "skipped"]
+
+
+def render_skip_warning(names: list[str]) -> str:
+    """Loud, actionable warning about backends that would silently vanish.
+
+    A missing key is not an error anywhere in this harness — the backend is
+    simply skipped. On a multi-hour unattended sweep that is only discovered
+    when the report comes back short, so this says what to do about it.
+    """
+    return "\n".join(
+        [
+            "",
+            "=" * 72,
+            f"REFUSING TO START: {len(names)} backend(s) would be SILENTLY SKIPPED",
+            "=" * 72,
+            *(f"  - {name}" for name in names),
+            "",
+            "A missing key does not fail the run — the backend just vanishes from",
+            "the results, which on a long sweep is only noticed at the report.",
+            "",
+            "Most likely cause: keys come from the macOS Keychain and were not",
+            "loaded into this shell. Launch with BOTH files sourced, in order:",
+            "",
+            f"  {ENV_PREFIX}",
+            "",
+            "Sourcing 042_env_ai_tokens alone sets every key to EMPTY, because",
+            "get_secret() is defined in 002_functions.",
+            "",
+            "If the omission is deliberate, re-run with --allow-skipped.",
+            "=" * 72,
+            "",
+        ]
+    )
+
+
+def _health_summary(
+    latencies: list[float], errors: list[str], failed_latencies: list[float] | None = None
+) -> dict:
+    """Per-backend operational health for the scenario report.
+
+    A ping gives one latency sample; a full run gives a distribution, and that
+    is what decides whether a backend is usable at pack scale. Median rather
+    than mean because one 180s timeout would otherwise swamp 599 fast calls.
+
+    FAILED calls are timed too, and reported separately. They are typically the
+    slowest — a 180s timeout is the whole reason latency matters — so recording
+    only successes made a backend that timed out on every call look instant.
+    Kept in their own fields so a slow failure is never read as a slow success.
+    """
+    ordered = sorted(latencies)
+    failed = sorted(failed_latencies or [])
+    return {
+        "calls_ok": len(latencies),
+        "calls_failed": len(errors),
+        "latency_min": ordered[0] if ordered else None,
+        "latency_median": statistics.median(ordered) if ordered else None,
+        "latency_max": ordered[-1] if ordered else None,
+        "failed_latency_median": statistics.median(failed) if failed else None,
+        "failed_latency_max": failed[-1] if failed else None,
+        "error_kinds": dict(Counter(errors)),
+    }
+
+
 def run_manifest(
     backend: Backend,
     *,
@@ -101,6 +180,9 @@ def run_manifest(
     n_pairs: int,
     sample_payload: dict,
     observed_models: set[str],
+    latencies: list[float] | None = None,
+    errors: list[str] | None = None,
+    failed_latencies: list[float] | None = None,
 ) -> dict:
     """Everything needed to reconstruct what this run actually sent.
 
@@ -121,6 +203,7 @@ def run_manifest(
         "n_pairs": n_pairs,
         "request_payload": sample_payload,
         "observed_models": sorted(observed_models),
+        "health": _health_summary(latencies or [], errors or [], failed_latencies or []),
     }
 
 
@@ -147,18 +230,27 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: in
 
     client = JudgeClient(backend)
     limiter = RateLimiter(rpm=backend.rpm)
+    latencies: list[float] = []
+    failed_latencies: list[float] = []
+    errors: list[str] = []
     try:
         with open(results_path, "a") as fh:
             for i, (pair, run_index) in enumerate(todo, 1):
                 limiter.wait()
+                started = time.monotonic()
                 try:
                     verdict = client.judge(pair, run_index=run_index)
                 except Exception as exc:  # noqa: BLE001 - keep going, resume covers gaps
+                    # Time failures too — a timeout is the slowest call a
+                    # backend makes, and the one worth knowing about.
+                    failed_latencies.append(time.monotonic() - started)
+                    errors.append(type(exc).__name__)
                     print(
                         f"[{backend.name}] {pair.id} vote {run_index}: ERROR {exc}",
                         file=sys.stderr,
                     )
                     continue
+                latencies.append(time.monotonic() - started)
                 fh.write(verdict_to_json_line(verdict) + "\n")
                 fh.flush()
                 if i % 20 == 0 or i == len(todo):
@@ -175,6 +267,9 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: in
                     n_pairs=len(pairs),
                     sample_payload=client.request_body(pairs[0]),
                     observed_models=client.observed_models,
+                    latencies=latencies,
+                    errors=errors,
+                    failed_latencies=failed_latencies,
                 ),
                 indent=2,
             )
@@ -208,6 +303,11 @@ def main() -> None:
             f"(default {DEFAULT_VOTES}; N=1 disables voting and costs 1x)"
         ),
     )
+    parser.add_argument(
+        "--allow-skipped",
+        action="store_true",
+        help="proceed even when some backends have no API key (default: refuse)",
+    )
     args = parser.parse_args()
     if args.votes < 1:
         parser.error("--votes must be at least 1")
@@ -221,6 +321,13 @@ def main() -> None:
 
     if args.data is None or args.out is None:
         parser.error("--data and --out are required unless --check-backends is given")
+
+    # Fail fast, before hours of work: a backend with no key is skipped, not
+    # failed, so an unnoticed env problem quietly produces a short report.
+    skipped = skipped_backend_names(backends)
+    if skipped and not args.allow_skipped:
+        print(render_skip_warning(skipped), file=sys.stderr)
+        raise SystemExit(2)
 
     pairs = load_pairs(args.data)
     args.out.mkdir(parents=True, exist_ok=True)

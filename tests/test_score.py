@@ -209,6 +209,28 @@ def test_leaderboard_refuses_to_rank_models_with_overlapping_intervals():
     assert "not separable" in md.lower()
 
 
+def test_score_model_refuses_to_score_unruled_pairs():
+    # The whole point of the guard: None is not a label. Scoring it would
+    # produce a kappa built on "None vs approve" comparisons and report a
+    # confident number derived from data nobody has ruled.
+    unruled = [
+        Pair(id="u1", original="a", enriched="b"),
+        Pair(id="u2", original="c", enriched="d"),
+    ]
+    verdicts = [make_verdict("u1", "approve", "ok"), make_verdict("u2", "reject", "ok")]
+    with pytest.raises(ValueError, match="unruled"):
+        score_model(unruled, verdicts)
+
+
+def test_score_model_refuses_a_partially_ruled_set():
+    # Scoring only the ruled subset would silently change the denominator and
+    # report coverage against a set that is not the one requested.
+    mixed = [make_pair("p1", "approve", "ok"), Pair(id="u1", original="a", enriched="b")]
+    verdicts = [make_verdict("p1", "approve", "ok"), make_verdict("u1", "approve", "ok")]
+    with pytest.raises(ValueError, match="unruled"):
+        score_model(mixed, verdicts)
+
+
 def make_score(model_id, kappa, ci):
     """A ModelScore with only the fields separability_tiers reads."""
     return ModelScore(
