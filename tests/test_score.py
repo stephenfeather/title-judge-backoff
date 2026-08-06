@@ -1,7 +1,8 @@
 import pytest
 
 from judge.schema import Pair, ReasonCode, Verdict
-from score import cohens_kappa, render_leaderboard, score_model
+from judge.stats import intervals_overlap
+from score import ModelScore, cohens_kappa, render_leaderboard, score_model, separability_tiers
 
 
 def make_pair(pair_id, ground_truth, reason):
@@ -228,6 +229,85 @@ def test_score_model_refuses_a_partially_ruled_set():
     verdicts = [make_verdict("p1", "approve", "ok"), make_verdict("u1", "approve", "ok")]
     with pytest.raises(ValueError, match="unruled"):
         score_model(mixed, verdicts)
+
+
+def make_score(model_id, kappa, ci):
+    """A ModelScore with only the fields separability_tiers reads."""
+    return ModelScore(
+        model_id=model_id,
+        n=4,
+        coverage=1.0,
+        accuracy=1.0,
+        kappa=kappa,
+        false_approve_rate=0.0,
+        reason_confusion={},
+        n_votes=1,
+        kappa_run_mean=kappa,
+        kappa_sd=0.0,
+        kappa_ci=ci,
+        verdict_flip_rate=0.0,
+        reason_flip_rate=0.0,
+        unstable_pair_ids=[],
+    )
+
+
+def test_tiers_never_separate_two_models_whose_intervals_overlap():
+    # THE invariant. Walking down by kappa and comparing only against the most
+    # recent tier misses chained overlap: A does not overlap B, so B opens a new
+    # tier; C overlaps B and joins it — leaving A and C in different tiers and
+    # implying A > C, even though A and C DO overlap and are not separable.
+    a = make_score("A", 0.85, (0.80, 0.90))
+    b = make_score("B", 0.65, (0.60, 0.70))
+    c = make_score("C", 0.60, (0.50, 0.85))  # overlaps A and B, but not vice versa
+    assert intervals_overlap(a.kappa_ci, c.kappa_ci)
+    assert not intervals_overlap(a.kappa_ci, b.kappa_ci)
+
+    tiers = separability_tiers([a, b, c])
+    tier_of = {s.model_id: i for i, tier in enumerate(tiers) for s in tier}
+    assert tier_of["A"] == tier_of["C"], "A and C overlap — they cannot be in different tiers"
+
+    # Stated as the general invariant: any two models in DIFFERENT tiers must
+    # have non-overlapping intervals.
+    for i, left_tier in enumerate(tiers):
+        for j, right_tier in enumerate(tiers):
+            if i == j:
+                continue
+            for left in left_tier:
+                for right in right_tier:
+                    assert not intervals_overlap(left.kappa_ci, right.kappa_ci), (
+                        f"{left.model_id} and {right.model_id} overlap but are in different tiers"
+                    )
+
+
+def test_tiers_still_separate_genuinely_disjoint_models():
+    # The fix must not collapse everything into one tier.
+    high = make_score("high", 0.90, (0.85, 0.95))
+    low = make_score("low", 0.20, (0.10, 0.30))
+    tiers = separability_tiers([high, low])
+    assert [[s.model_id for s in t] for t in tiers] == [["high"], ["low"]]
+
+
+def test_tiers_are_ordered_best_first():
+    a = make_score("a", 0.90, (0.85, 0.95))
+    b = make_score("b", 0.50, (0.45, 0.55))
+    c = make_score("c", 0.20, (0.10, 0.30))
+    tiers = separability_tiers([c, a, b])
+    assert [s.model_id for t in tiers for s in t] == ["a", "b", "c"]
+
+
+def test_n_votes_reflects_the_runs_the_spread_was_computed_over():
+    # n_votes sits beside kappa_sd, and sd is the spread of PER-RUN kappas — so
+    # n_votes must be the number of runs, not the max votes any single pair got.
+    # p1 has 2 votes and p2 has 1, but three distinct run indices exist.
+    verdicts = [
+        make_verdict("p1", "approve", "ok", run_index=0),
+        make_verdict("p1", "approve", "ok", run_index=1),
+        make_verdict("p2", "approve", "ok", run_index=2),
+        make_verdict("p3", "reject", "meaning_change", run_index=0),
+        make_verdict("p4", "reject", "casing_error", run_index=0),
+    ]
+    result = score_model(PAIRS, verdicts)
+    assert result.n_votes == 3
 
 
 def test_leaderboard_shows_spread_and_flip_columns():

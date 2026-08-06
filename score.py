@@ -141,7 +141,11 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
         kappa=cohens_kappa(truth, predicted),
         false_approve_rate=false_approves / len(rejects) if rejects else 0.0,
         reason_confusion=dict(confusion),
-        n_votes=max(r.n_votes for _, r in matched),
+        # The number of RUNS, not the max votes any one pair received. This sits
+        # beside kappa_sd, which is the spread of the per-run kappas, so the two
+        # must describe the same set — and a pair that lost a vote to an error
+        # must not make the whole column under-report the runs that happened.
+        n_votes=len(run_kappas),
         kappa_run_mean=kappa_mean,
         kappa_sd=kappa_sd,
         kappa_ci=(lo, hi),
@@ -156,17 +160,36 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
 def separability_tiers(scores: list[ModelScore]) -> list[list[ModelScore]]:
     """Group models whose kappa intervals overlap into joint, unranked tiers.
 
-    Walking down by kappa, a model joins the current tier if its interval
-    overlaps ANY member's. Two models in one tier are not distinguishable at
-    this sample size, so the report must not imply an order between them.
+    Tiers are the CONNECTED COMPONENTS of the overlap graph, which guarantees
+    the invariant the report depends on: any two models in different tiers have
+    non-overlapping intervals, so the ordering between tiers is real.
+
+    Comparing each model only against the most recently opened tier is not
+    enough — overlap chains. With A=[0.80,0.90], B=[0.60,0.70], C=[0.50,0.85]:
+    A and B are disjoint so B opens a new tier, C overlaps B and joins it, and
+    A and C land in different tiers while actually overlapping. The report would
+    then claim A beats C on evidence that does not separate them.
     """
-    tiers: list[list[ModelScore]] = []
-    for s in sorted(scores, key=lambda s: s.kappa, reverse=True):
-        if tiers and any(intervals_overlap(s.kappa_ci, other.kappa_ci) for other in tiers[-1]):
-            tiers[-1].append(s)
-        else:
-            tiers.append([s])
-    return tiers
+    ordered = sorted(scores, key=lambda s: s.kappa, reverse=True)
+    # Union-find over "intervals overlap", then read components out in kappa order.
+    parent = list(range(len(ordered)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(ordered)):
+        for j in range(i + 1, len(ordered)):
+            if intervals_overlap(ordered[i].kappa_ci, ordered[j].kappa_ci):
+                parent[find(j)] = find(i)
+
+    tiers: dict[int, list[ModelScore]] = {}
+    for index, score in enumerate(ordered):
+        tiers.setdefault(find(index), []).append(score)
+    # dict preserves insertion order, which follows `ordered` — best tier first.
+    return list(tiers.values())
 
 
 def render_leaderboard(scores: list[ModelScore]) -> str:
