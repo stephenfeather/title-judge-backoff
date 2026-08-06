@@ -1,5 +1,7 @@
+import httpx
+
 from judge.client import Backend
-from judge.check import BackendCheck, check_key_presence, render_check_report
+from judge.check import BackendCheck, check_key_presence, ping_backend, render_check_report
 
 
 def make_backend(name, api_key_env, role="contender", eval_only=False):
@@ -32,6 +34,44 @@ def test_check_key_presence_marks_skipped_when_key_missing(monkeypatch):
 def test_check_key_presence_treats_blank_key_as_missing(monkeypatch):
     monkeypatch.setenv("BLANK_KEY", "   ")
     assert check_key_presence(make_backend("blank", "BLANK_KEY")).status == "skipped"
+
+
+def test_failed_ping_reports_the_response_body(monkeypatch):
+    # A bare "400 Bad Request" read as a bad API key for long enough to matter:
+    # the body said the model rejected temperature=0. The provider's explanation
+    # is the whole diagnostic value of a ping, so it must survive into the report.
+    monkeypatch.setenv("PING_KEY", "x")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Unsupported value: 'temperature' does not support 0 with this model.",
+                    "code": "unsupported_value",
+                }
+            },
+        )
+
+    check = ping_backend(
+        make_backend("bad-request", "PING_KEY"), transport=httpx.MockTransport(handler)
+    )
+    assert check.reachable is False
+    assert "temperature" in check.detail
+    assert "unsupported_value" in check.detail
+
+
+def test_successful_ping_is_marked_reachable(monkeypatch):
+    monkeypatch.setenv("PING_KEY", "x")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"verdict": "approve", "reason": "ok"}'}}]},
+        )
+
+    check = ping_backend(make_backend("ok", "PING_KEY"), transport=httpx.MockTransport(handler))
+    assert check.reachable is True
 
 
 def test_render_check_report_lists_both_groups():

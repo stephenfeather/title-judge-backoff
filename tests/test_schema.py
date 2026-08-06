@@ -18,6 +18,48 @@ def make_verdict(**overrides):
     return Verdict(**base)
 
 
+def test_verdict_records_omitted_temperature_as_none():
+    # gpt-5.6 rejects temperature at any reasoning effort above `none`, so the
+    # harness omits the field. Recording 0.0 in that case would label a sampled
+    # verdict as deterministic.
+    v = make_verdict(temperature=None)
+    assert v.temperature is None
+    assert json.loads(verdict_to_json_line(v))["temperature"] is None
+    assert verdict_from_json_line(verdict_to_json_line(v)) == v
+
+
+def test_verdict_carries_run_index_and_reasoning_effort():
+    v = make_verdict(run_index=2, reasoning_effort="medium")
+    assert v.run_index == 2
+    assert v.reasoning_effort == "medium"
+    assert verdict_from_json_line(verdict_to_json_line(v)) == v
+
+
+def test_verdict_defaults_run_index_to_zero_and_effort_to_none():
+    v = make_verdict()
+    assert v.run_index == 0
+    assert v.reasoning_effort is None
+
+
+def test_verdict_from_json_line_tolerates_pre_voting_records():
+    # Results written before majority voting existed have no run_index or
+    # reasoning_effort; they read back as run 0 with unrecorded effort rather
+    # than exploding, so old result dirs stay inspectable.
+    legacy = json.dumps(
+        {
+            "pair_id": "p1",
+            "verdict": "approve",
+            "reason": "ok",
+            "model_id": "m",
+            "prompt_version": "v1",
+            "temperature": 0.0,
+        }
+    )
+    v = verdict_from_json_line(legacy)
+    assert v.run_index == 0
+    assert v.reasoning_effort is None
+
+
 def test_verdict_roundtrips_through_jsonl():
     v = make_verdict()
     line = verdict_to_json_line(v)
