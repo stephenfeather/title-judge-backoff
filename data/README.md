@@ -46,11 +46,18 @@ there is a human step in the middle:
 # 1. Parse the pack into a ruling template (verdicts left blank)
 uv run adapt_qa_pack.py template --pack /path/to/title-qa-pack.md --out rulings-template.jsonl
 
-# 2. Operator fills in ground_truth (approve|reject) and reason on all 200 rows
+# 2. Rule the template — one keystroke per row, resumable
+uv run rule.py run --template rulings-template.jsonl --journal rulings.journal.jsonl
 
-# 3. Build the calibration set
-uv run adapt_qa_pack.py merge --template rulings-template.jsonl --out pairs.jsonl
+# 3. Export the rulings and build the calibration set
+uv run rule.py export --journal rulings.journal.jsonl --out rulings.jsonl
+uv run adapt_qa_pack.py merge --template rulings-template.jsonl \
+    --rulings rulings.jsonl --out pairs.jsonl
 ```
+
+Step 2 can also be done by hand — filling `ground_truth` and `reason` into the
+template and running `merge --template` alone still works. `rule.py` just makes
+200 rows survivable; see [the ruling pass](#the-ruling-pass) below.
 
 `merge` refuses to emit a partial calibration set: it fails if any row is
 unruled, or if a ruling references an id no row has.
@@ -62,6 +69,37 @@ previously collected rulings still apply.
 `--attributes` optionally joins a `{id, brand, mpn}` JSONL if those fields
 become available from another source; without it they are omitted entirely.
 
+## The ruling pass
+
+`rule.py` shows one change per screen and takes a single keystroke for the
+verdict:
+
+| Key | Action |
+|---|---|
+| `a` | approve (reason `ok`) |
+| `r` | reject → one-key reason submenu, generated from `judge/schema.py` |
+| ⏎ | on an `unchanged` row only: accept the pre-offered approve |
+| `s` | skip — stays pending, re-presented on the next run |
+| `u` | undo the last action of this session |
+| `n` | annotate this row (with `--notes`) |
+| `q` | quit and save |
+
+Every keystroke appends one line to the journal and fsyncs, so a crash loses at
+most the decision in flight. Re-running the same command resumes: ruled rows
+are dropped, skipped rows come back. An `undo` is itself journaled and replayed
+away — nothing is ever rewritten.
+
+`--results results/<dir>` adds a context pane per row: how a sweep's judges
+split on that pair (`flip 50% of 6 judge(s)`) and which reason codes they gave.
+It reads flat and per-scenario layouts, and without it the pane is simply
+absent — the ruling pass never depends on a sweep having run.
+
+`--notes` enables free-text rubric annotations, exported to a sidecar with
+`--notes-out` and deliberately kept out of the merge input.
+
+**The journal is operator-local.** It carries vendor-derived title ids and the
+operator's reasoning; `*.jsonl` is gitignored and none of it belongs in the repo.
+
 ### Note on the `unchanged` cohort
 
 20 of the 200 rows are no-ops — `original` and `enriched` are byte-identical
@@ -69,3 +107,9 @@ become available from another source; without it they are omitted entirely.
 a judge to approve or reject a change that was never made is a degenerate
 case; decide deliberately whether those rows belong in the calibration set or
 should be scored separately.
+
+`rule.py` flags such a row and pre-offers approve/`ok` on ⏎ so the sanity cohort
+costs one keystroke, but it never rules one on the operator's behalf: `a`/`r`
+still override, and an accepted offer is journaled with `"auto": true` so those
+rows can be found and scored separately later. Whether a row is "unchanged" is
+decided by comparing the titles, not by trusting the cohort label.

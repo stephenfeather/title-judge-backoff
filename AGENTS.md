@@ -39,5 +39,8 @@ uv run pytest -x -q                         # stop on first failure, quiet
 | `judge/schema.py` | `tests/test_schema.py` |
 | `judge/prompts.py` | `tests/test_prompts.py` |
 | `judge/client.py` | `tests/test_client.py` |
+| `judge/rulings.py` | `tests/test_rulings.py` |
+| `judge/flips.py` | `tests/test_flips.py` |
+| `rule.py` (ruling TUI) | `tests/test_rule.py` |
 | `run_bakeoff.py` (pure helpers) | `tests/test_run_bakeoff.py` |
 | `score.py` (metrics, leaderboard) | `tests/test_score.py` |
