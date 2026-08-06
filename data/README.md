@@ -99,6 +99,21 @@ times, and each vote counts toward the flip rate. The pane reads four fields
 (`pair_id`, `verdict`, `reason`, `model_id`) and ignores every other key, so the
 sweep's verdict record can keep growing without touching this.
 
+### Row order
+
+With `--results`, rows are presented **most contested first** — attention is the
+scarce resource in a 200-row pass, and the rows the judges split on are where an
+operator ruling moves the calibration set most. Ties keep pack order, so a
+re-run presents rows the same way.
+
+Rows the sweep never judged sort *last*, not first: no verdicts is not the same
+as no disagreement, and ranking them as calm would bury unexamined rows behind
+rows everyone agreed on.
+
+`--order pack` restores the template's own order. Without `--results` there is
+nothing to rank by and pack order is what you get either way. The header says
+which order is in effect, so it is never a guess why row 1 is row 1.
+
 `--notes` enables free-text rubric annotations, exported to a sidecar with
 `--notes-out` and deliberately kept out of the merge input.
 

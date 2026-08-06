@@ -30,8 +30,10 @@ Keys
     q    quit and save
 
 With `--results <dir>` each card also shows how a sweep's judges split on that
-pair. Without it, the pane is simply absent — the ruling pass never depends on
-a sweep having run.
+pair, and rows are presented most-contested-first — attention is the scarce
+resource in a 200-row pass. `--order pack` keeps the template's own order.
+Without `--results` the pane is absent and the order is the pack's: the ruling
+pass never depends on a sweep having run.
 
 Neither the journal nor the exported rulings belong in this repo: they carry
 vendor-derived titles and ids, and `*.jsonl` is gitignored.
@@ -219,6 +221,48 @@ def render_stats(result: SessionResult) -> str:
     return "\n".join(lines)
 
 
+# --- ordering (pure) ----------------------------------------------------------
+
+ORDER_FLIP = "flip"
+ORDER_PACK = "pack"
+
+
+def order_rows(
+    rows: Sequence[dict],
+    stats: dict[str, FlipStats],
+    order: str = ORDER_FLIP,
+) -> list[dict]:
+    """Rows in the order the operator should see them.
+
+    Default is most-contested-first: attention is the scarce resource in a
+    200-row pass, and the rows the judges split on are where an operator ruling
+    changes the calibration set most. Ties keep pack order, so the sequence is
+    deterministic and a re-run presents rows the same way.
+
+    Rows the sweep never judged sort last rather than first: no verdicts is not
+    the same as no disagreement, and ranking them as calm would bury rows nobody
+    has looked at yet behind rows everyone agreed on. With no sweep data at all,
+    this is exactly pack order.
+    """
+    if order == ORDER_PACK or not stats:
+        return list(rows)
+
+    def rank(indexed: tuple[int, dict]) -> tuple[int, float, int]:
+        index, row = indexed
+        stat = stats.get(row["id"])
+        if stat is None:
+            return (1, 0.0, index)  # unjudged: last, pack order among themselves
+        return (0, -stat.flip_rate, index)
+
+    return [row for _, row in sorted(enumerate(rows), key=rank)]
+
+
+def describe_order(order: str, stats: dict[str, FlipStats]) -> str:
+    if order == ORDER_PACK or not stats:
+        return "pack order"
+    return "most contested first"
+
+
 # --- the loop -----------------------------------------------------------------
 
 
@@ -398,14 +442,19 @@ def cmd_run(
         out.write(f"nothing left to rule — all {len(rows)} rows are ruled\n")
         return
 
-    out.write(f"{len(pending)} of {len(rows)} rows pending  (journal: {args.journal})\n")
+    stats = flips.load_flip_stats(args.results)
+    pending = order_rows(pending, stats, args.order)
+    out.write(
+        f"{len(pending)} of {len(rows)} rows pending  "
+        f"({describe_order(args.order, stats)}; journal: {args.journal})\n"
+    )
     result = run_session(
         pending,
         args.journal,
         read_key=read_key or make_key_reader(sys.stdin, sys.stdin.isatty()),
         read_line=read_line or (lambda: sys.stdin.readline()),
         out=out,
-        stats=flips.load_flip_stats(args.results),
+        stats=stats,
         notes_enabled=args.notes,
     )
     remaining = len(rows) - len(rulings.ruled_ids(args.journal))
@@ -436,6 +485,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--journal", type=Path, required=True, help="append-only rulings journal")
     run.add_argument("--results", type=Path, help="sweep results dir, for flip-rate context")
     run.add_argument("--notes", action="store_true", help="enable per-row rubric annotations")
+    run.add_argument(
+        "--order",
+        choices=(ORDER_FLIP, ORDER_PACK),
+        default=ORDER_FLIP,
+        help="row order: 'flip' (default) puts the most contested rows first when "
+        "--results is supplied; 'pack' keeps the template's own order",
+    )
 
     export = sub.add_parser("export", help="project the journal into merge-ready rulings")
     export.add_argument("--journal", type=Path, required=True)

@@ -295,6 +295,66 @@ def test_rate_is_reported_once_there_is_enough_elapsed_time():
     assert "2.0 decisions/min" in rendered
 
 
+# --- ordering -----------------------------------------------------------------
+
+
+def stats_for(**by_id) -> dict:
+    """Flip stats hand-built from {id: flip_rate}, via real verdict records."""
+    verdicts = []
+    for pair_id, rate in by_id.items():
+        # rate is achieved as (1 - modal share) over four votes
+        minority = round(rate * 4)
+        for index in range(4):
+            value = "reject" if index < minority else "approve"
+            reason = ReasonCode.CASING_ERROR if value == "reject" else ReasonCode.OK
+            verdicts.append(Verdict(pair_id, value, reason, f"m{index}", "v1", 0.0))
+    return flips.flip_stats(verdicts)
+
+
+def test_contested_rows_come_first_by_default():
+    rows = [row("calm"), row("split"), row("mild")]
+    stats = stats_for(calm=0.0, split=0.5, mild=0.25)
+    ordered = rule.order_rows(rows, stats)
+    assert [r["id"] for r in ordered] == ["split", "mild", "calm"]
+
+
+def test_ties_keep_pack_order():
+    rows = [row("a"), row("b"), row("c")]
+    ordered = rule.order_rows(rows, stats_for(a=0.5, b=0.5, c=0.5))
+    assert [r["id"] for r in ordered] == ["a", "b", "c"]
+
+
+def test_rows_the_sweep_never_judged_go_last_in_pack_order():
+    """No verdicts is not the same as no disagreement — don't rank it as calm."""
+    rows = [row("unjudged1"), row("calm"), row("unjudged2"), row("split")]
+    ordered = rule.order_rows(rows, stats_for(calm=0.0, split=0.5))
+    assert [r["id"] for r in ordered] == ["split", "calm", "unjudged1", "unjudged2"]
+
+
+def test_without_sweep_data_pack_order_is_preserved():
+    rows = [row("a"), row("b"), row("c")]
+    assert [r["id"] for r in rule.order_rows(rows, {})] == ["a", "b", "c"]
+
+
+def test_pack_order_can_be_asked_for_explicitly():
+    rows = [row("calm"), row("split")]
+    stats = stats_for(calm=0.0, split=0.5)
+    ordered = rule.order_rows(rows, stats, order=rule.ORDER_PACK)
+    assert [r["id"] for r in ordered] == ["calm", "split"]
+
+
+def test_ordering_does_not_mutate_the_caller_s_list():
+    rows = [row("calm"), row("split")]
+    rule.order_rows(rows, stats_for(calm=0.0, split=0.5))
+    assert [r["id"] for r in rows] == ["calm", "split"]
+
+
+def test_ordering_drops_no_rows():
+    rows = [row(str(n)) for n in range(6)]
+    ordered = rule.order_rows(rows, stats_for(**{"1": 0.5, "4": 0.25}))
+    assert sorted(r["id"] for r in ordered) == sorted(r["id"] for r in rows)
+
+
 # --- CLI ----------------------------------------------------------------------
 
 
@@ -324,6 +384,122 @@ def test_run_command_reports_when_everything_is_ruled(tmp_path):
     rule.main(["run", "--template", str(template), "--journal", str(journal)],
               read_key=rule.keys_from_string(""), out=out)
     assert "nothing left" in out.getvalue().lower()
+
+
+def write_results_dir(directory, verdicts) -> None:
+    from judge.schema import verdict_to_json_line
+
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "m1.jsonl").write_text(
+        "".join(verdict_to_json_line(v) + "\n" for v in verdicts), encoding="utf-8"
+    )
+
+
+def test_run_presents_the_most_contested_row_first(tmp_path):
+    """The default with sweep data present: contested-first, no flag needed."""
+    template = tmp_path / "template.jsonl"
+    rule.write_jsonl(template, [row("calm"), row("split")])
+    results = tmp_path / "results"
+    write_results_dir(
+        results,
+        [
+            Verdict("calm", "approve", ReasonCode.OK, "m1", "v1", 0.0),
+            Verdict("calm", "approve", ReasonCode.OK, "m2", "v1", 0.0),
+            Verdict("split", "approve", ReasonCode.OK, "m1", "v1", 0.0),
+            Verdict("split", "reject", ReasonCode.CASING_ERROR, "m2", "v1", 0.0),
+        ],
+    )
+    journal = tmp_path / "j.jsonl"
+
+    out = io.StringIO()
+    rule.main(
+        ["run", "--template", str(template), "--journal", str(journal),
+         "--results", str(results)],
+        read_key=rule.keys_from_string("a"),
+        out=out,
+    )
+    assert rulings.ruled_ids(journal) == {"split"}
+
+
+def test_order_pack_flag_restores_pack_order(tmp_path):
+    template = tmp_path / "template.jsonl"
+    rule.write_jsonl(template, [row("calm"), row("split")])
+    results = tmp_path / "results"
+    write_results_dir(
+        results,
+        [
+            Verdict("calm", "approve", ReasonCode.OK, "m1", "v1", 0.0),
+            Verdict("split", "approve", ReasonCode.OK, "m1", "v1", 0.0),
+            Verdict("split", "reject", ReasonCode.CASING_ERROR, "m2", "v1", 0.0),
+        ],
+    )
+    journal = tmp_path / "j.jsonl"
+
+    rule.main(
+        ["run", "--template", str(template), "--journal", str(journal),
+         "--results", str(results), "--order", "pack"],
+        read_key=rule.keys_from_string("a"),
+        out=io.StringIO(),
+    )
+    assert rulings.ruled_ids(journal) == {"calm"}
+
+
+def test_run_without_results_keeps_pack_order(tmp_path):
+    template = tmp_path / "template.jsonl"
+    rule.write_jsonl(template, [row("first"), row("second")])
+    journal = tmp_path / "j.jsonl"
+
+    rule.main(
+        ["run", "--template", str(template), "--journal", str(journal)],
+        read_key=rule.keys_from_string("a"),
+        out=io.StringIO(),
+    )
+    assert rulings.ruled_ids(journal) == {"first"}
+
+
+def test_ordering_applies_to_what_resume_left_pending(tmp_path):
+    """Rank the rows still to do — a ruled row must not reclaim the front."""
+    template = tmp_path / "template.jsonl"
+    rule.write_jsonl(template, [row("calm"), row("done"), row("split")])
+    results = tmp_path / "results"
+    write_results_dir(
+        results,
+        [
+            Verdict("calm", "approve", ReasonCode.OK, "m1", "v1", 0.0),
+            Verdict("calm", "approve", ReasonCode.OK, "m2", "v1", 0.0),
+            Verdict("done", "approve", ReasonCode.OK, "m1", "v1", 0.0),
+            Verdict("done", "reject", ReasonCode.CASING_ERROR, "m2", "v1", 0.0),
+            Verdict("split", "approve", ReasonCode.OK, "m1", "v1", 0.0),
+            Verdict("split", "reject", ReasonCode.CASING_ERROR, "m2", "v1", 0.0),
+        ],
+    )
+    journal = tmp_path / "j.jsonl"
+    rulings.append(journal, rulings.rule_record("done", "approve", ReasonCode.OK))
+
+    rule.main(
+        ["run", "--template", str(template), "--journal", str(journal),
+         "--results", str(results)],
+        read_key=rule.keys_from_string("a"),
+        out=io.StringIO(),
+    )
+    assert rulings.ruled_ids(journal) == {"done", "split"}
+
+
+def test_run_says_which_order_it_used(tmp_path):
+    """The operator must know why row 1 is row 1."""
+    template = tmp_path / "template.jsonl"
+    rule.write_jsonl(template, [row("a")])
+    results = tmp_path / "results"
+    write_results_dir(results, [Verdict("a", "approve", ReasonCode.OK, "m1", "v1", 0.0)])
+
+    out = io.StringIO()
+    rule.main(
+        ["run", "--template", str(template), "--journal", str(tmp_path / "j.jsonl"),
+         "--results", str(results)],
+        read_key=rule.keys_from_string("q"),
+        out=out,
+    )
+    assert "most contested first" in out.getvalue().lower()
 
 
 def test_export_command_writes_the_merge_ready_rulings(tmp_path):
