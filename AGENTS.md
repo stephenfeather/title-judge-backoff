@@ -46,6 +46,21 @@ uv run pytest -x -q                         # stop on first failure, quiet
 | `run_bakeoff.py` (pure helpers) | `tests/test_run_bakeoff.py` |
 | `score.py` (metrics, leaderboard) | `tests/test_score.py` |
 
+## Launching anything that hits a backend
+
+Always source both env files in the same shell — see the README section
+"Launching a run". Sourcing `042_env_ai_tokens` alone blanks every key, because
+`get_secret()` is defined in `002_functions`:
+
+```sh
+zsh -c 'source ~/.zsh/zshrc.d/002_functions && source ~/.zsh/zshrc.d/042_env_ai_tokens && <command>'
+```
+
+A missing key skips a backend silently rather than failing, so `run_bakeoff.py`
+refuses to start when any backend lacks one (`--allow-skipped` to override).
+Do not weaken that guard — it exists because a long unattended sweep would
+otherwise produce a quietly incomplete report.
+
 ## Sampling parameters
 
 **Never add a harness-wide temperature constant back.** `temperature` is opt-in

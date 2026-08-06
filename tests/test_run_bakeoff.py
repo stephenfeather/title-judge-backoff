@@ -2,7 +2,13 @@ import pytest
 
 from judge.client import Backend
 from judge.schema import Pair, ReasonCode, Verdict, verdict_to_json_line
-from run_bakeoff import already_judged_ids, pending_votes, run_manifest
+from run_bakeoff import (
+    already_judged_ids,
+    pending_votes,
+    render_skip_warning,
+    run_manifest,
+    skipped_backend_names,
+)
 
 
 def make_pair(pair_id):
@@ -145,7 +151,40 @@ def test_run_manifest_records_payload_effort_and_snapshots():
     assert manifest["observed_models"] == ["m-2026-06-30"]
 
 
-def test_run_manifest_summarizes_latency_and_errors():
+def test_skipped_backend_names_lists_only_those_missing_keys(monkeypatch):
+    monkeypatch.setenv("HAVE_KEY", "x")
+    monkeypatch.delenv("MISSING_KEY", raising=False)
+    backends = [
+        Backend(
+            name="has-key",
+            base_url="https://example.test/v1",
+            model_id="m1",
+            rpm=40,
+            eval_only=True,
+            api_key_env="HAVE_KEY",
+        ),
+        Backend(
+            name="no-key",
+            base_url="https://example.test/v1",
+            model_id="m2",
+            rpm=40,
+            eval_only=True,
+            api_key_env="MISSING_KEY",
+        ),
+    ]
+    assert skipped_backend_names(backends) == ["no-key"]
+
+
+def test_skip_warning_names_the_backends_and_the_env_prefix():
+    # The silent-skip trap: a missing key does not fail, the backend just
+    # vanishes from the run. On a multi-hour unattended sweep that is only
+    # discovered at the report, so the warning has to say what to DO.
+    warning = render_skip_warning(["anthropic-haiku-4.5", "gemini-3.6-flash"])
+    assert "anthropic-haiku-4.5" in warning
+    assert "gemini-3.6-flash" in warning
+    assert "042_env_ai_tokens" in warning
+    assert "002_functions" in warning
+    assert "--allow-skipped" in warning
     # S4 operational health: which backends are slow, which are flaky. A ping
     # gives one sample; a 600-call run gives a distribution, and that is what
     # decides whether a backend is usable at full-pack scale.

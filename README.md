@@ -65,12 +65,37 @@ backend whose key is absent is **skipped**, not fatal.
 | `ANTHROPIC_API_KEY` | `anthropic-haiku-4.5` |
 | `OPENAI_API_KEY` | `openai-gpt-5.6-luna` |
 
+### Launching a run — always source both env files
+
+Keys are fetched from the macOS Keychain by `get_secret()`, which is defined in
+`002_functions` and *consumed* by `042_env_ai_tokens`. **Every command that
+talks to a backend must source both, in this order, in the same shell:**
+
+```sh
+zsh -c 'source ~/.zsh/zshrc.d/002_functions && source ~/.zsh/zshrc.d/042_env_ai_tokens && <command>'
+```
+
+Two traps this avoids:
+
+- **Sourcing `042_env_ai_tokens` alone sets every key to empty**, because the
+  `get_secret` helper lives in the other file. That is worse than not sourcing
+  it at all.
+- **A missing key is not an error.** The backend is silently skipped and simply
+  vanishes from the results — on a multi-hour sweep that is only noticed when
+  the report comes back short. `run_bakeoff.py` therefore **refuses to start**
+  if any backend lacks a key; pass `--allow-skipped` when the omission is
+  deliberate.
+
 Validate the slate before spending anything:
 
 ```sh
 uv run run_bakeoff.py --check-backends          # key presence only, no network
 uv run run_bakeoff.py --check-backends --ping   # also sends ONE real request per backend
 ```
+
+`--check-backends` reports key presence; `--ping` proves reachability. They are
+different questions — a key can be valid while the model id is retired, and a
+model can be listed in a provider's catalogue and still 404 on invoke.
 
 `--ping` spends real tokens on paid backends — use it deliberately.
 

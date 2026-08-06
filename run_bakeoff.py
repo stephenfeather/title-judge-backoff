@@ -96,6 +96,54 @@ def pending_votes(
     ]
 
 
+# Keys are fetched from the macOS Keychain by get_secret(), which is defined in
+# 002_functions and consumed by 042_env_ai_tokens. Sourcing the tokens file
+# ALONE sets every key to empty, which is worse than not sourcing it — so both
+# must be sourced, in this order, in the same shell as the run.
+ENV_PREFIX = (
+    "zsh -c 'source ~/.zsh/zshrc.d/002_functions && "
+    "source ~/.zsh/zshrc.d/042_env_ai_tokens && <command>'"
+)
+
+
+def skipped_backend_names(backends: list[Backend]) -> list[str]:
+    """Backends whose API key is absent, in slate order."""
+    return [b.name for b in backends if check_key_presence(b).status == "skipped"]
+
+
+def render_skip_warning(names: list[str]) -> str:
+    """Loud, actionable warning about backends that would silently vanish.
+
+    A missing key is not an error anywhere in this harness — the backend is
+    simply skipped. On a multi-hour unattended sweep that is only discovered
+    when the report comes back short, so this says what to do about it.
+    """
+    return "\n".join(
+        [
+            "",
+            "=" * 72,
+            f"REFUSING TO START: {len(names)} backend(s) would be SILENTLY SKIPPED",
+            "=" * 72,
+            *(f"  - {name}" for name in names),
+            "",
+            "A missing key does not fail the run — the backend just vanishes from",
+            "the results, which on a long sweep is only noticed at the report.",
+            "",
+            "Most likely cause: keys come from the macOS Keychain and were not",
+            "loaded into this shell. Launch with BOTH files sourced, in order:",
+            "",
+            f"  {ENV_PREFIX}",
+            "",
+            "Sourcing 042_env_ai_tokens alone sets every key to EMPTY, because",
+            "get_secret() is defined in 002_functions.",
+            "",
+            "If the omission is deliberate, re-run with --allow-skipped.",
+            "=" * 72,
+            "",
+        ]
+    )
+
+
 def _health_summary(latencies: list[float], errors: list[str]) -> dict:
     """Per-backend operational health for the scenario report.
 
@@ -239,6 +287,11 @@ def main() -> None:
             f"(default {DEFAULT_VOTES}; N=1 disables voting and costs 1x)"
         ),
     )
+    parser.add_argument(
+        "--allow-skipped",
+        action="store_true",
+        help="proceed even when some backends have no API key (default: refuse)",
+    )
     args = parser.parse_args()
     if args.votes < 1:
         parser.error("--votes must be at least 1")
@@ -252,6 +305,13 @@ def main() -> None:
 
     if args.data is None or args.out is None:
         parser.error("--data and --out are required unless --check-backends is given")
+
+    # Fail fast, before hours of work: a backend with no key is skipped, not
+    # failed, so an unnoticed env problem quietly produces a short report.
+    skipped = skipped_backend_names(backends)
+    if skipped and not args.allow_skipped:
+        print(render_skip_warning(skipped), file=sys.stderr)
+        raise SystemExit(2)
 
     pairs = load_pairs(args.data)
     args.out.mkdir(parents=True, exist_ok=True)
