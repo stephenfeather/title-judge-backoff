@@ -25,8 +25,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # Third-party actions are pinned to commit SHAs, not tags. A tag is
+      # mutable: whoever controls the action can repoint it at new code, and
+      # this workflow runs on every PR with a checkout of the repo. The
+      # trailing comment records which release each SHA is, so bumps stay
+      # readable in review.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Conflict markers checked into the tree break pytest collection
       # repo-wide. This repo resolves upstream conflicts by hand on agent
@@ -65,9 +70,9 @@ jobs:
 
       - name: Install uv
         # v5 still targets Node 20, which GitHub deprecated and now force-runs
-        # on Node 24. Pinned to an exact patch tag because setup-uv stopped
-        # publishing moving major tags after v7 — `@v9` does not resolve.
-        uses: astral-sh/setup-uv@v9.0.0
+        # on Node 24. Note setup-uv stopped publishing moving major tags after
+        # v7, so `@v9` does not resolve even as a tag.
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           # Dependencies live both in pyproject.toml and in PEP-723 inline
