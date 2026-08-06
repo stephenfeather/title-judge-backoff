@@ -49,15 +49,45 @@ def now_iso() -> str:
 # --- reason keys --------------------------------------------------------------
 
 
+#: Keys the TUI binds to verdict actions (`rule.py`). A reason sharing one of
+#: these letters would invite a misfire from muscle memory, so the pool skips
+#: them; `tests/test_rule.py` keeps the two lists honest.
+_ACTION_KEYS = "arsunq"
+
+#: Single-character keys, in allocation order: digits first (the submenu reads
+#: as a numbered list), then the letters not already spoken for. Allocation is
+#: positional, so adding a reason code never re-letters the ones before it.
+KEY_POOL = "123456789" + "".join(
+    letter for letter in "abcdefghijklmnopqrstuvwxyz" if letter not in _ACTION_KEYS
+)
+
+
+def allocate_keys(codes: Sequence) -> dict[str, object]:
+    """Assign one keystroke per code, or refuse.
+
+    The key reader takes exactly one character, so a code allocated a two-key
+    label like "10" would be unreachable — the operator would press `1`, get
+    nothing, and have no way to tell that a reason had gone missing. Outgrowing
+    the pool is therefore an error at construction rather than a UI that quietly
+    drops options.
+    """
+    if len(codes) > len(KEY_POOL):
+        raise ValueError(
+            f"{len(codes)} reason codes exceed the {len(KEY_POOL)} single-keystroke "
+            "keys available; widen KEY_POOL or split the menu before adding more"
+        )
+    return {KEY_POOL[index]: code for index, code in enumerate(codes)}
+
+
 def reason_keymap() -> dict[str, ReasonCode]:
-    """Digit key -> reason code, generated from the schema enum's own order."""
-    return {str(index): code for index, code in enumerate(ReasonCode, start=1)}
+    """Key -> reason code, generated from the schema enum's own order."""
+    return allocate_keys(list(ReasonCode))  # type: ignore[return-value]
 
 
 def reject_reason_keymap() -> dict[str, ReasonCode]:
     """The submenu offered after `r`: every code except the approval one."""
     codes = [code for code in ReasonCode if code is not _APPROVE_REASON]
-    return {str(index): code for index, code in enumerate(codes, start=1)}
+    return allocate_keys(codes)  # type: ignore[return-value]
 
 
 # --- validation (pure) --------------------------------------------------------

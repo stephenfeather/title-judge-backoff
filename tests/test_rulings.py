@@ -38,6 +38,34 @@ def test_reason_keymap_uses_single_keystrokes():
     assert all(len(key) == 1 for key in rulings.reason_keymap())
 
 
+def test_keys_stay_single_characters_as_the_enum_grows():
+    """Ten codes must not produce the two-keystroke key "10" — the reader takes
+    one character, so such a code would be silently unreachable."""
+    codes = [f"code_{n}" for n in range(20)]
+    keymap = rulings.allocate_keys(codes)
+    assert len(keymap) == len(codes)
+    assert all(len(key) == 1 for key in keymap)
+
+
+def test_key_allocation_is_stable_for_the_codes_already_there():
+    """Adding a code must not re-letter the ones an operator has memorized."""
+    before = rulings.allocate_keys(["a", "b", "c"])
+    after = rulings.allocate_keys(["a", "b", "c", "d"])
+    assert all(after[key] == code for key, code in before.items())
+
+
+def test_outgrowing_the_key_pool_fails_loudly():
+    """A silent two-key UI is the bad outcome; a loud error is the good one."""
+    too_many = [f"code_{n}" for n in range(len(rulings.KEY_POOL) + 1)]
+    with pytest.raises(ValueError, match="single-keystroke"):
+        rulings.allocate_keys(too_many)
+
+
+def test_key_pool_avoids_the_verdict_action_keys():
+    """A reason key that shares a letter with `a`/`r`/`s` invites a misfire."""
+    assert not set(rulings.KEY_POOL) & set("arsunq")
+
+
 def test_reject_keymap_excludes_ok():
     """`ok` is not a rejection rationale — it must not be offered on reject."""
     assert ReasonCode.OK not in rulings.reject_reason_keymap().values()
