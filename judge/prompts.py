@@ -40,12 +40,14 @@ _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 def build_messages(pair) -> list[dict[str, str]]:
     """Build the chat messages for one calibration pair."""
-    user = (
-        f"BRAND: {pair.brand}\n"
-        f"MPN: {pair.mpn}\n"
-        f"ORIGINAL: {pair.original}\n"
-        f"ENRICHED: {pair.enriched}"
-    )
+    lines = []
+    if pair.brand:
+        lines.append(f"BRAND: {pair.brand}")
+    if pair.mpn:
+        lines.append(f"MPN: {pair.mpn}")
+    lines.append(f"ORIGINAL: {pair.original}")
+    lines.append(f"ENRICHED: {pair.enriched}")
+    user = "\n".join(lines)
     return [
         {"role": "system", "content": _SYSTEM_PROMPT_V1},
         {"role": "user", "content": user},
