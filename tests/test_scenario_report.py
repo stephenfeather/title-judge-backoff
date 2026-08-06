@@ -4,7 +4,6 @@ import pytest
 
 from judge.schema import ReasonCode, Verdict, verdict_to_json_line
 from scenario_report import (
-    ContentionRow,
     _stability_table,
     contention_ranking,
     load_results,
