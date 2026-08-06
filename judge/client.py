@@ -22,6 +22,11 @@ TEMPERATURE = 0.0
 MAX_TOKENS = 256  # a verdict object is tiny; Anthropic requires the field
 ANTHROPIC_VERSION = "2023-06-01"
 
+# Large reasoning models are genuinely slow: thinkingmachines/inkling answered
+# in 79s. A timeout below that reports a slow model as unreachable, which is a
+# wrong diagnosis rather than a slow one. Override per backend via timeout_s.
+REQUEST_TIMEOUT_S = 180.0
+
 
 VALID_APIS = ("openai", "anthropic")
 VALID_ROLES = ("contender", "floor")
@@ -37,6 +42,7 @@ class Backend:
     api_key_env: str
     api: str = "openai"  # wire protocol: OpenAI-compatible chat, or Anthropic messages
     role: str = "contender"  # "floor" backends are baselines, not contenders
+    timeout_s: float = REQUEST_TIMEOUT_S
 
     def __post_init__(self) -> None:
         if self.api not in VALID_APIS:
@@ -61,6 +67,7 @@ def load_backends(path: str | Path) -> list[Backend]:
                 api_key_env=entry.get("api_key_env", default_env),
                 api=entry.get("api", "openai"),
                 role=entry.get("role", "contender"),
+                timeout_s=float(entry.get("timeout_s", REQUEST_TIMEOUT_S)),
             )
         )
     return backends
@@ -138,7 +145,7 @@ class JudgeClient:
         self._http = httpx.Client(
             base_url=backend.base_url,
             headers=_auth_headers(backend.api, api_key),
-            timeout=60.0,
+            timeout=backend.timeout_s,
             transport=transport,
         )
 

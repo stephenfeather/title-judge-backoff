@@ -60,6 +60,26 @@ def test_load_backends_parses_all_fields(tmp_path):
     )
 
 
+def test_backend_timeout_defaults_above_observed_slow_model_latency():
+    # thinkingmachines/inkling took 79s to answer; a 60s timeout reported that
+    # as "unreachable", which is a wrong diagnosis rather than a slow one.
+    backend = Backend(
+        name="slow",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="K",
+    )
+    assert backend.timeout_s >= 120.0
+
+
+def test_load_backends_reads_per_backend_timeout(tmp_path):
+    path = tmp_path / "backends.toml"
+    path.write_text(BACKENDS_TOML + '\ntimeout_s = 300.0\n')
+    assert load_backends(path)[-1].timeout_s == 300.0
+
+
 def test_load_backends_reads_api_and_role(tmp_path):
     path = tmp_path / "backends.toml"
     path.write_text(BACKENDS_TOML)

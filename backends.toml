@@ -62,6 +62,23 @@ eval_only = true
 role = "contender"
 api_key_env = "NVIDIA_API_KEY"
 
+# NOTE (2026-08-05): in the catalog and routed to a worker (no 404), but
+# inference itself fails — HTTP 500 after ~79s:
+#   {"type":"urn:nvcf-worker-service:problem-details:internal-server-error",
+#    "title":"Internal Server Error","status":500,
+#    "detail":"Internal error while making inference request"}
+# A THIRD failure mode, distinct from Kimi's 404 entitlement gap: entitled and
+# routed, but the backing worker errors. Likely transient/capacity — re-ping
+# periodically. Its 79s latency is why REQUEST_TIMEOUT_S is 180s, not 60s.
+[[backends]]
+name = "nvidia-inkling"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "thinkingmachines/inkling"
+rpm = 40
+eval_only = true
+role = "contender"
+api_key_env = "NVIDIA_API_KEY"
+
 # Degenerate-judge floor: proved kappa catches a constant-reject predictor
 # (5/5 rejects, accuracy 0.800, kappa 0.000 on the smoke set). Not a contender.
 [[backends]]
