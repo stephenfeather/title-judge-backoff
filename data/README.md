@@ -65,7 +65,15 @@ become available from another source; without it they are omitted entirely.
 ### Note on the `unchanged` cohort
 
 20 of the 200 rows are no-ops — `original` and `enriched` are byte-identical
-(the pipeline skipped titles already containing a lowercase character). Asking
-a judge to approve or reject a change that was never made is a degenerate
-case; decide deliberately whether those rows belong in the calibration set or
-should be scored separately.
+(the pipeline skips titles already containing a lowercase character). These
+are a **designed stratum**, not stray data: the no-op set coincides exactly
+with the pack's `unchanged` cohort (all 20 no-ops carry that cohort, and no
+`unchanged` row actually changed), and the pack describes it as "what the
+pipeline does NOT fix".
+
+The open question is therefore what a verdict *means* on an unchanged row —
+plausibly a sanity check where `approve` is the correct answer. Note that
+ruling all 20 as `approve` raises the approve base rate across the 200-row
+set, which shifts Cohen's kappa's chance-agreement term for every model.
+That should be a deliberate choice rather than a side effect; scoring the
+cohort separately is the alternative.
