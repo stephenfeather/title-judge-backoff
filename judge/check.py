@@ -46,7 +46,22 @@ def check_key_presence(backend: Backend) -> BackendCheck:
     )
 
 
-def ping_backend(backend: Backend) -> BackendCheck:
+def _failure_detail(exc: Exception) -> str:
+    """Describe a failed ping, including the provider's own explanation.
+
+    httpx's HTTPStatusError stringifies to just the status line, which is how a
+    400 saying "this model does not accept temperature=0" spent a while looking
+    like an invalid API key. The response body is the entire point of a ping, so
+    it is appended whenever there is one.
+    """
+    detail = f"ping failed: {exc}"
+    response = getattr(exc, "response", None)
+    if response is not None and (body := response.text.strip()):
+        detail = f"{detail} | body: {body[:500]}"
+    return detail
+
+
+def ping_backend(backend: Backend, transport=None) -> BackendCheck:
     """Send ONE judge request to confirm the endpoint and key actually work.
 
     Only called behind an explicit flag — this spends real tokens.
@@ -54,12 +69,17 @@ def ping_backend(backend: Backend) -> BackendCheck:
     check = check_key_presence(backend)
     if check.status == "skipped":
         return check
+    # Closed in `finally`: each client holds a connection pool, and pinging a
+    # ten-backend slate previously leaked one per backend.
+    client = JudgeClient(backend, transport=transport)
     try:
-        JudgeClient(backend).judge(PING_PAIR)
+        client.judge(PING_PAIR)
     except Exception as exc:  # noqa: BLE001 - any failure is a failed ping
         return BackendCheck(
-            name=backend.name, status="ready", detail=f"ping failed: {exc}", reachable=False
+            name=backend.name, status="ready", detail=_failure_detail(exc), reachable=False
         )
+    finally:
+        client.close()
     return BackendCheck(name=backend.name, status="ready", detail=check.detail, reachable=True)
 
 

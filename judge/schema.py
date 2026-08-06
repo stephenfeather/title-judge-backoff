@@ -43,14 +43,25 @@ class Pair:
 
 @dataclass(frozen=True)
 class Verdict:
-    """One judge ruling on one pair, tagged with the model/prompt that produced it."""
+    """One judge ruling on one pair, tagged with the model/prompt that produced it.
+
+    `temperature` is None when the field was omitted from the request rather
+    than set — the GPT-5.x family rejects any explicit value above reasoning
+    effort `none`, and recording 0.0 for a call that never sent it would label
+    a sampled verdict as deterministic.
+
+    `run_index` distinguishes the N votes of a majority-vote run: the same pair
+    judged three times yields three verdicts that differ only in this field.
+    """
 
     pair_id: str
     verdict: str
     reason: ReasonCode
     model_id: str
     prompt_version: str
-    temperature: float
+    temperature: float | None
+    run_index: int = 0
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         _check_verdict(self.verdict)
@@ -77,4 +88,8 @@ def verdict_to_json_line(verdict: Verdict) -> str:
 def verdict_from_json_line(line: str) -> Verdict:
     record = json.loads(line)
     record["reason"] = ReasonCode(record["reason"])
+    # Results written before majority voting carry neither field; default them
+    # so old result directories stay readable instead of raising.
+    record.setdefault("run_index", 0)
+    record.setdefault("reasoning_effort", None)
     return Verdict(**record)

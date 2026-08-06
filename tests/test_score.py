@@ -1,5 +1,8 @@
+import pytest
+
 from judge.schema import Pair, ReasonCode, Verdict
-from score import cohens_kappa, render_leaderboard, score_model
+from judge.stats import intervals_overlap
+from score import ModelScore, cohens_kappa, render_leaderboard, score_model, separability_tiers
 
 
 def make_pair(pair_id, ground_truth, reason):
@@ -14,14 +17,15 @@ def make_pair(pair_id, ground_truth, reason):
     )
 
 
-def make_verdict(pair_id, verdict, reason, model_id="model-a"):
+def make_verdict(pair_id, verdict, reason, model_id="model-a", run_index=0):
     return Verdict(
         pair_id=pair_id,
         verdict=verdict,
         reason=ReasonCode(reason),
         model_id=model_id,
         prompt_version="v1",
-        temperature=0.0,
+        temperature=None,
+        run_index=run_index,
     )
 
 
@@ -102,3 +106,197 @@ def test_render_leaderboard_sorted_by_kappa():
     md = render_leaderboard(scores)
     assert md.index("model-good") < md.index("model-bad")
     assert "kappa" in md.lower()
+
+
+# --- majority voting, spread, and flip rates -------------------------------
+
+
+def votes_for(pair_id, rulings, model_id="model-a"):
+    """One verdict per (verdict, reason) ruling, numbered as successive votes."""
+    return [
+        make_verdict(pair_id, verdict, reason, model_id=model_id, run_index=i)
+        for i, (verdict, reason) in enumerate(rulings)
+    ]
+
+
+def test_score_model_scores_the_majority_verdict_not_each_vote():
+    # p1 is judged reject twice and approve once: the run counts as reject, and
+    # n counts pairs, not calls.
+    verdicts = (
+        votes_for("p1", [("reject", "ok"), ("approve", "ok"), ("reject", "ok")])
+        + votes_for("p2", [("approve", "ok")] * 3)
+        + votes_for("p3", [("reject", "meaning_change")] * 3)
+        + votes_for("p4", [("reject", "casing_error")] * 3)
+    )
+    result = score_model(PAIRS, verdicts)
+    assert result.n == 4
+    assert result.n_votes == 3
+    assert result.accuracy == 0.75  # only p1 wrong (truth approve, majority reject)
+
+
+def test_score_model_reports_flip_rates_and_names_the_unstable_items():
+    # R5: flip rates are a health metric, and the flipping items are the
+    # borderline set worth sharpening the rubric on.
+    verdicts = (
+        votes_for("p1", [("approve", "ok"), ("approve", "ok"), ("reject", "ok")])
+        + votes_for("p2", [("approve", "ok")] * 3)
+        + votes_for("p3", [("reject", "meaning_change")] * 3)
+        + votes_for("p4", [("reject", "casing_error")] * 3)
+    )
+    result = score_model(PAIRS, verdicts)
+    assert result.verdict_flip_rate == pytest.approx((1 / 3) / 4)
+    assert result.unstable_pair_ids == ["p1"]
+
+
+def test_score_model_tracks_reason_flips_even_when_the_verdict_is_stable():
+    # The probe found exactly this shape: reject 9/9, but the reason code moved.
+    # A single flip number would have reported this run as perfectly stable.
+    verdicts = (
+        votes_for("p3", [("reject", "meaning_change"), ("reject", "casing_error"), ("reject", "meaning_change")])
+        + votes_for("p1", [("approve", "ok")] * 3)
+        + votes_for("p2", [("approve", "ok")] * 3)
+        + votes_for("p4", [("reject", "casing_error")] * 3)
+    )
+    result = score_model(PAIRS, verdicts)
+    assert result.verdict_flip_rate == 0.0
+    assert result.reason_flip_rate == pytest.approx((1 / 3) / 4)
+    assert result.unstable_pair_ids == ["p3"]
+
+
+def test_score_model_reports_kappa_spread_across_runs():
+    # Run 0 gets p1 wrong, runs 1 and 2 are perfect: three different per-run
+    # kappas, so sd must be non-zero and the mean must sit between them.
+    verdicts = (
+        votes_for("p1", [("reject", "ok"), ("approve", "ok"), ("approve", "ok")])
+        + votes_for("p2", [("approve", "ok")] * 3)
+        + votes_for("p3", [("reject", "meaning_change")] * 3)
+        + votes_for("p4", [("reject", "casing_error")] * 3)
+    )
+    result = score_model(PAIRS, verdicts)
+    assert result.n_votes == 3
+    assert result.kappa_sd > 0.0
+    assert result.kappa_run_mean < 1.0
+
+
+def test_single_vote_run_reports_unmeasured_spread():
+    # With N=1 there is no run-to-run evidence. sd=0.0 here means "unmeasured",
+    # which is why n_votes is reported next to it.
+    verdicts = [make_verdict(p.id, p.ground_truth, p.reason.value) for p in PAIRS]
+    result = score_model(PAIRS, verdicts)
+    assert result.n_votes == 1
+    assert result.kappa_sd == 0.0
+    assert result.verdict_flip_rate == 0.0
+
+
+def test_score_model_reports_a_bootstrap_interval_around_kappa():
+    verdicts = [make_verdict(p.id, p.ground_truth, p.reason.value) for p in PAIRS]
+    result = score_model(PAIRS, verdicts)
+    lo, hi = result.kappa_ci
+    assert lo <= result.kappa <= hi
+
+
+def test_leaderboard_refuses_to_rank_models_with_overlapping_intervals():
+    # R4: two models whose CIs overlap are not separable at this sample size.
+    # Printing them 1st and 2nd would present noise as a finding.
+    good = [make_verdict(p.id, p.ground_truth, p.reason.value, model_id="model-good") for p in PAIRS]
+    nearly = [
+        make_verdict("p1", "approve", "ok", model_id="model-nearly"),
+        make_verdict("p2", "reject", "ok", model_id="model-nearly"),
+        make_verdict("p3", "reject", "meaning_change", model_id="model-nearly"),
+        make_verdict("p4", "reject", "casing_error", model_id="model-nearly"),
+    ]
+    md = render_leaderboard([score_model(PAIRS, good), score_model(PAIRS, nearly)])
+    assert "not separable" in md.lower()
+
+
+def make_score(model_id, kappa, ci):
+    """A ModelScore with only the fields separability_tiers reads."""
+    return ModelScore(
+        model_id=model_id,
+        n=4,
+        coverage=1.0,
+        accuracy=1.0,
+        kappa=kappa,
+        false_approve_rate=0.0,
+        reason_confusion={},
+        n_votes=1,
+        kappa_run_mean=kappa,
+        kappa_sd=0.0,
+        kappa_ci=ci,
+        verdict_flip_rate=0.0,
+        reason_flip_rate=0.0,
+        unstable_pair_ids=[],
+    )
+
+
+def test_tiers_never_separate_two_models_whose_intervals_overlap():
+    # THE invariant. Walking down by kappa and comparing only against the most
+    # recent tier misses chained overlap: A does not overlap B, so B opens a new
+    # tier; C overlaps B and joins it — leaving A and C in different tiers and
+    # implying A > C, even though A and C DO overlap and are not separable.
+    a = make_score("A", 0.85, (0.80, 0.90))
+    b = make_score("B", 0.65, (0.60, 0.70))
+    c = make_score("C", 0.60, (0.50, 0.85))  # overlaps A and B, but not vice versa
+    assert intervals_overlap(a.kappa_ci, c.kappa_ci)
+    assert not intervals_overlap(a.kappa_ci, b.kappa_ci)
+
+    tiers = separability_tiers([a, b, c])
+    tier_of = {s.model_id: i for i, tier in enumerate(tiers) for s in tier}
+    assert tier_of["A"] == tier_of["C"], "A and C overlap — they cannot be in different tiers"
+
+    # Stated as the general invariant: any two models in DIFFERENT tiers must
+    # have non-overlapping intervals.
+    for i, left_tier in enumerate(tiers):
+        for j, right_tier in enumerate(tiers):
+            if i == j:
+                continue
+            for left in left_tier:
+                for right in right_tier:
+                    assert not intervals_overlap(left.kappa_ci, right.kappa_ci), (
+                        f"{left.model_id} and {right.model_id} overlap but are in different tiers"
+                    )
+
+
+def test_tiers_still_separate_genuinely_disjoint_models():
+    # The fix must not collapse everything into one tier.
+    high = make_score("high", 0.90, (0.85, 0.95))
+    low = make_score("low", 0.20, (0.10, 0.30))
+    tiers = separability_tiers([high, low])
+    assert [[s.model_id for s in t] for t in tiers] == [["high"], ["low"]]
+
+
+def test_tiers_are_ordered_best_first():
+    a = make_score("a", 0.90, (0.85, 0.95))
+    b = make_score("b", 0.50, (0.45, 0.55))
+    c = make_score("c", 0.20, (0.10, 0.30))
+    tiers = separability_tiers([c, a, b])
+    assert [s.model_id for t in tiers for s in t] == ["a", "b", "c"]
+
+
+def test_n_votes_reflects_the_runs_the_spread_was_computed_over():
+    # n_votes sits beside kappa_sd, and sd is the spread of PER-RUN kappas — so
+    # n_votes must be the number of runs, not the max votes any single pair got.
+    # p1 has 2 votes and p2 has 1, but three distinct run indices exist.
+    verdicts = [
+        make_verdict("p1", "approve", "ok", run_index=0),
+        make_verdict("p1", "approve", "ok", run_index=1),
+        make_verdict("p2", "approve", "ok", run_index=2),
+        make_verdict("p3", "reject", "meaning_change", run_index=0),
+        make_verdict("p4", "reject", "casing_error", run_index=0),
+    ]
+    result = score_model(PAIRS, verdicts)
+    assert result.n_votes == 3
+
+
+def test_leaderboard_shows_spread_and_flip_columns():
+    verdicts = (
+        votes_for("p1", [("approve", "ok"), ("approve", "ok"), ("reject", "ok")])
+        + votes_for("p2", [("approve", "ok")] * 3)
+        + votes_for("p3", [("reject", "meaning_change")] * 3)
+        + votes_for("p4", [("reject", "casing_error")] * 3)
+    )
+    md = render_leaderboard([score_model(PAIRS, verdicts)])
+    assert "sd" in md.lower()
+    assert "95% ci" in md.lower()
+    assert "flip" in md.lower()
+    assert "votes" in md.lower()

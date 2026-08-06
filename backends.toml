@@ -5,14 +5,34 @@
 # run time (see `uv run run_bakeoff.py --check-backends`).
 #
 # Fields:
-#   api        "openai" (OpenAI-compatible chat completions) or "anthropic"
-#   eval_only  true = terms permit evaluation/testing only, never production
-#   role       "contender" = eligible to win; "floor" = baseline reference only
-#   rpm        client-side rate limit
+#   api          "openai" (OpenAI-compatible chat completions) or "anthropic"
+#   eval_only    true = terms permit evaluation/testing only, never production
+#   role         "contender" = eligible to win; "floor" = baseline reference only
+#   rpm          client-side rate limit
+#   temperature  OPTIONAL. Omit unless the endpoint is PROVEN to accept a value:
+#                an absent key means the field is never sent, and the verdict
+#                records temperature=null rather than claiming 0.0. The GPT-5.x
+#                family 400s on any explicit temperature unless reasoning effort
+#                is "none" (probed 2026-08-06, both chat/completions and
+#                responses), and Anthropic has deprecated the knob on recent
+#                models. Determinism here comes from --votes, not this field.
+#   reasoning_effort  OPTIONAL. none|low|medium|high|xhigh|max. Not a free knob:
+#                on a borderline pair gpt-5.6-luna returned reason=truncation_worse
+#                at effort "none" (0 reasoning tokens) and casing_error at
+#                "medium" (~120), and score.py scores per-reason confusion.
+#                Pin it where it matters; it is recorded on every verdict.
+#   structured_output  OPTIONAL. Strict json_schema enum for the verdict. Not
+#                every OpenAI-compatible endpoint implements strict mode, so it
+#                is opt-in per backend rather than on by default.
 
 # ---------------------------------------------------------------------------
 # NVIDIA build.nvidia.com — free tier, EVALUATION ONLY per ToS.
 # One NVIDIA_API_KEY covers every model on this endpoint.
+#
+# temperature = 0.0 is declared on these because this endpoint is PROVEN to
+# accept it — the llama-3.1-8b floor completed a 5/5 smoke run at temperature 0.
+# Keeping the value also keeps existing results/ resumable, since the run-config
+# guard treats an omitted temperature as a different config from 0.0.
 # ---------------------------------------------------------------------------
 
 [[backends]]
@@ -23,6 +43,7 @@ rpm = 40
 eval_only = true
 role = "contender"
 api_key_env = "NVIDIA_API_KEY"
+temperature = 0.0
 
 [[backends]]
 name = "nvidia-deepseek-v4-pro"
@@ -32,6 +53,7 @@ rpm = 40
 eval_only = true
 role = "contender"
 api_key_env = "NVIDIA_API_KEY"
+temperature = 0.0
 
 # NOTE (2026-08-05): advertised by GET /v1/models and on the public model page,
 # but chat/completions returns 404 with:
@@ -52,6 +74,7 @@ rpm = 40
 eval_only = true
 role = "contender"
 api_key_env = "NVIDIA_API_KEY"
+temperature = 0.0
 
 [[backends]]
 name = "nvidia-nemotron-3-ultra"
@@ -61,6 +84,7 @@ rpm = 40
 eval_only = true
 role = "contender"
 api_key_env = "NVIDIA_API_KEY"
+temperature = 0.0
 
 # NOTE (2026-08-05): in the catalog and routed to a worker (no 404), but
 # inference itself fails — HTTP 500 after ~79s:
@@ -78,6 +102,7 @@ rpm = 40
 eval_only = true
 role = "contender"
 api_key_env = "NVIDIA_API_KEY"
+temperature = 0.0
 
 # Degenerate-judge floor: proved kappa catches a constant-reject predictor
 # (5/5 rejects, accuracy 0.800, kappa 0.000 on the smoke set). Not a contender.
@@ -89,9 +114,16 @@ rpm = 40
 eval_only = true
 role = "floor"
 api_key_env = "NVIDIA_API_KEY"
+temperature = 0.0
 
 # ---------------------------------------------------------------------------
 # Paid provider APIs. Each is skipped unless its key is present in the env.
+#
+# None of these declare a temperature. They ran at temperature 0 under the old
+# harness-wide constant, but that is not the same as having PROVEN the endpoint
+# accepts it today — Gemini, xAI, and Anthropic have each shipped models that
+# reject or ignore the field. Omitting it is the safe default; re-declare
+# `temperature = 0.0` on any backend once a --ping confirms it is accepted.
 # ---------------------------------------------------------------------------
 
 [[backends]]
@@ -122,6 +154,13 @@ role = "contender"
 api = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
+# Probed 2026-08-06 on gpt-5.6-luna: temperature=0 returns 400 at reasoning
+# effort medium on BOTH chat/completions and responses, and 200 at effort
+# "none". We do NOT buy determinism by setting effort="none" — that disables
+# the reasoning this model is worth using for, and on a borderline pair it
+# changed the reason code (truncation_worse at "none" vs casing_error at
+# "medium"). So: no temperature, no effort override, and stability comes from
+# --votes instead. Verdicts from this backend record temperature=null.
 [[backends]]
 name = "openai-gpt-5.6-luna"
 base_url = "https://api.openai.com/v1"

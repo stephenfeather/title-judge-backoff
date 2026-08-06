@@ -12,13 +12,45 @@ pairs, and models are ranked on a leaderboard.
    (OpenAI-compatible chat endpoints).
 2. **Calibration pairs** — operator-ruled `pairs.jsonl`, supplied via
    `--data` (never committed; see `data/README.md` for the schema).
-3. **Verdicts** — every backend judges every pair at temperature 0 with the
-   versioned prompt in `judge/prompts.py`. Results land in
+3. **Verdicts** — every backend judges every pair **N times** (`--votes`,
+   default 3) with the versioned prompt in `judge/prompts.py`. Results land in
    `results/<date>/<backend>.jsonl`, one verdict per line, tagged with
-   `model_id`, `prompt_version`, and `temperature`.
-4. **Leaderboard** — `score.py` computes accuracy, Cohen's kappa,
-   false-approve rate, and per-reason confusion, then emits `leaderboard.md`
-   sorted by kappa.
+   `model_id`, `prompt_version`, `temperature`, `reasoning_effort`, and
+   `run_index`. Each run also writes `<backend>.manifest.json` recording the
+   exact request payload and every model snapshot that answered.
+4. **Leaderboard** — `score.py` collapses the N votes per pair to a majority
+   ruling, then computes accuracy, Cohen's kappa, false-approve rate, and
+   per-reason confusion. It emits `leaderboard.md` grouped into separability
+   tiers, with per-run kappa spread, a bootstrap CI, and per-item flip rates.
+
+## Why votes instead of temperature 0
+
+The harness used to pin every call to temperature 0. That is no longer
+available, and pretending otherwise would have quietly corrupted the results.
+
+Probing `gpt-5.6-luna` on 2026-08-06 (both `chat/completions` and `responses`):
+`temperature=0` returns **400** at reasoning effort `medium`, and **200** at
+effort `none`. The GPT-5.x family gates sampling parameters on reasoning being
+off, and Anthropic has deprecated the knob outright on recent models. Buying
+temperature 0 by setting `effort="none"` is not free either — on a borderline
+pair that switched the reason code from `truncation_worse` to `casing_error`
+while spending 0 reasoning tokens, and reason codes are exactly what the
+per-reason confusion matrix scores.
+
+So determinism comes from **repetition**, not sampling parameters:
+
+- `temperature` is omitted unless a backend proves the endpoint accepts it, and
+  verdicts record `null` rather than claiming 0.0.
+- Each pair is judged N=3 times and the majority verdict is scored. That cuts
+  the effective flip rate from roughly 13% to 5%, and judge-noise sd(kappa)
+  from ~±0.048 to ~±0.030 — under the ±0.057 sampling floor of a 200-pair set.
+- Every metric is reported with its spread, and **the leaderboard refuses to
+  order models whose kappa intervals overlap**. At n=200 that means kappa
+  differences below roughly 0.15 are not resolvable; they show up as a shared
+  "not separable" tier instead of a fake 1st/2nd.
+- Per-item flip rates are a first-class output. Flipping items are the
+  borderline set worth sharpening the rubric on, and a rising flip rate is the
+  earliest signal a provider changed the model under us.
 
 ## Required environment variables
 
@@ -49,9 +81,15 @@ uv run run_bakeoff.py --backends backends.toml --data /path/to/pairs.jsonl --out
 uv run score.py --data /path/to/pairs.jsonl --results results/2026-08-05/ --out leaderboard.md
 ```
 
-Runs are resumable: re-running `run_bakeoff.py` skips pairs a backend has
-already judged. Calls are rate-limited per backend (`rpm` in
-`backends.toml`).
+`--votes N` sets how many times each pair is judged (default 3). `--votes 1`
+disables voting and costs 1×, at the price of an unmeasurable kappa spread.
+
+Runs are resumable: re-running `run_bakeoff.py` skips the individual
+`(pair, vote)` calls a backend has already made, so a run interrupted after 2
+of 3 votes resumes at the third rather than re-judging or skipping the pair.
+Resuming across a changed `temperature`, `reasoning_effort`, `model_id`, or
+`prompt_version` is refused outright — use a fresh `--out` directory. Calls are
+rate-limited per backend (`rpm` in `backends.toml`).
 
 ## Backend roles and protocols
 
