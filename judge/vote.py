@@ -46,7 +46,21 @@ def majority(values: list):
     return next(value for value in values if counts[value] == best)
 
 
-def _flip_rate(values: list) -> float:
+def flip_rate(values: list) -> float:
+    """Fraction of values differing from the modal one. 0.0 = unanimous.
+
+    Public because two callers need this exact number at two different
+    aggregation levels, and two implementations of one metric would drift:
+
+    - `tally_votes` below applies it within a single pair's N votes from one
+      model in one run — "did repeating the call change the answer".
+    - `judge/flips.py` applies it across every verdict on a pair, spanning
+      models and scenarios, for the operator's ruling card — "did this pair
+      change anyone's answer".
+
+    Same arithmetic, different populations. If these ever disagreed, the
+    leaderboard and the operator card would describe the same pair differently.
+    """
     winner = majority(values)
     return sum(v != winner for v in values) / len(values)
 
@@ -63,8 +77,8 @@ def tally_votes(verdicts: list[Verdict]) -> list[VoteResult]:
             verdict=majority([v.verdict for v in votes]),
             reason=majority([v.reason for v in votes]),
             n_votes=len(votes),
-            verdict_flip_rate=_flip_rate([v.verdict for v in votes]),
-            reason_flip_rate=_flip_rate([v.reason for v in votes]),
+            verdict_flip_rate=flip_rate([v.verdict for v in votes]),
+            reason_flip_rate=flip_rate([v.reason for v in votes]),
         )
         for pair_id, votes in grouped.items()
     ]

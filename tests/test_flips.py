@@ -106,6 +106,36 @@ def test_no_verdicts_yields_no_stats():
     assert flips.flip_stats([]) == {}
 
 
+def test_pane_rate_is_the_same_function_the_vote_tally_uses():
+    """One metric, one implementation.
+
+    The operator card and the leaderboard must never describe the same pair
+    differently, so this asserts agreement with `judge.vote` rather than
+    re-stating the arithmetic.
+    """
+    from judge.vote import flip_rate
+
+    values = ["approve", "approve", "reject", "approve"]
+    stats = flips.flip_stats(
+        [
+            verdict("a", value, ReasonCode.OK if value == "approve" else ReasonCode.CASING_ERROR, f"m{i}")
+            for i, value in enumerate(values)
+        ]
+    )
+    assert stats["a"].flip_rate == flip_rate(values)
+
+
+def test_majority_tie_breaks_by_first_occurrence():
+    """Matches `judge.vote.majority` — a re-run must not relabel a split pair."""
+    stats = flips.flip_stats(
+        [
+            verdict("a", "reject", ReasonCode.CASING_ERROR, "m1"),
+            verdict("a", "approve", ReasonCode.OK, "m2"),
+        ]
+    )
+    assert stats["a"].majority == "reject"
+
+
 def test_repeat_verdicts_from_one_model_count_as_repeats():
     """Majority-of-N runs the same model several times; each vote is a vote."""
     stats = flips.flip_stats(
