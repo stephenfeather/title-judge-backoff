@@ -1,0 +1,106 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same branch cancels the in-flight run — fix commits land
+# in quick succession and stale runs just burn minutes. Never cancel on main.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+# NO SECRETS, DELIBERATELY. Every judge backend needs an API key, and none is
+# provided here: the suite is required to pass with no network and no keys set
+# (see AGENTS.md, "Test rules" — HTTP is exercised through httpx.MockTransport).
+# A test that needs a key is a test that has started making live calls, which
+# would make CI cost money, leak quota, and fail unpredictably on forks. The
+# guard step below turns that from a silent change into a red build.
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Third-party actions are pinned to commit SHAs, not tags. A tag is
+      # mutable: whoever controls the action can repoint it at new code, and
+      # this workflow runs on every PR with a checkout of the repo. The
+      # trailing comment records which release each SHA is, so bumps stay
+      # readable in review.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # By default checkout leaves the job's token in .git/config, where
+          # any later step — or anything they shell out to — can use it. This
+          # job only reads the tree, so it never needs the credential to
+          # persist past the clone.
+          persist-credentials: false
+
+      # Conflict markers checked into the tree break pytest collection
+      # repo-wide. This repo resolves upstream conflicts by hand on agent
+      # branches, so that class of mistake is live here — catch it in seconds
+      # rather than in a confusing collection error.
+      - name: Conflict-marker gate
+        run: |
+          # No extension allowlist: a marker can land in any tracked file, and
+          # git's own markers sometimes ship with no label after the 7-char
+          # run. -I skips binary files so a "Binary file X matches" line never
+          # desyncs the line-number parse below.
+          hits=$(grep -rInE '^(<{7}( |$)|={7}$|>{7}( |$))' \
+              --exclude-dir='.git' \
+              --exclude-dir='.venv' . || true)
+          if [ -n "$hits" ]; then
+            # ::error file=,line=:: pins each finding inline in the PR's
+            # Files-changed view, not just the job log.
+            while IFS=: read -r file line _; do
+              printf '::error file=%s,line=%s::Unresolved git conflict marker checked in\n' "${file#./}" "$line"
+            done <<< "$hits"
+            echo "$hits"
+            exit 1
+          fi
+
+      - name: Assert no judge API keys are present
+        run: |
+          # Fails loudly if a key is ever wired into this workflow. The suite
+          # must pass without them; if it ever needs one, fix the test, don't
+          # add the secret.
+          leaked=$(env | grep -oE '^[A-Z0-9_]+_API_KEY' | sort -u || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::API keys must never reach CI, found: $(echo "$leaked" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "No API keys in the environment, as intended."
+
+      - name: Install uv
+        # v5 still targets Node 20, which GitHub deprecated and now force-runs
+        # on Node 24. Note setup-uv stopped publishing moving major tags after
+        # v7, so `@v9` does not resolve even as a tag.
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          # Dependencies live both in pyproject.toml and in PEP-723 inline
+          # metadata inside the root scripts, so hash the scripts too. The
+          # default glob misses the inline metadata, which freezes the cache
+          # key forever — new wheels are never saved and every run warns.
+          cache-dependency-glob: "**/*.py"
+
+      - name: Run the test suite
+        # The command AGENTS.md documents, so CI and a local run agree.
+        run: uv run pytest -q
+
+      - name: Lint
+        # Pinned deliberately, and pinned to 0.15.x specifically. An unpinned
+        # linter picks up new rules on release and turns unrelated PRs red for
+        # reasons their authors did not write — measured here, not assumed:
+        # the repo is clean under 0.15.0 and reports 22 findings under 0.16.1,
+        # which widened the default rule set (UP035, I001, C408, RUF100, …)
+        # across 15 files, nearly all pre-dating this workflow.
+        #
+        # 0.15.0 is also what a bare `ruff check .` resolves to locally, so CI
+        # and a developer's machine agree. Upgrading is worth doing, but as its
+        # own change with the ~22 fixes in the same commit — not as a surprise
+        # the next unrelated PR inherits.
+        run: uv run --with ruff==0.15.0 ruff check .

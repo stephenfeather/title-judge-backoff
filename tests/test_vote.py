@@ -1,7 +1,7 @@
 import pytest
 
 from judge.schema import ReasonCode, Verdict
-from judge.vote import VoteResult, majority, tally_votes
+from judge.vote import VoteResult, flip_rate, majority, tally_votes
 
 
 def make_verdict(pair_id, verdict, reason, run_index):
@@ -26,6 +26,28 @@ def test_majority_breaks_ties_by_first_occurrence():
     # on each run of score.py.
     assert majority(["reject", "approve"]) == "reject"
     assert majority(["approve", "reject"]) == "approve"
+
+
+def test_flip_rate_is_public_so_one_implementation_serves_both_callers():
+    """`judge/flips.py` reports the same metric at a different aggregation level;
+    it consumes this function rather than carrying a second copy."""
+    assert flip_rate(["approve", "approve", "approve"]) == 0.0
+    assert flip_rate(["approve", "reject"]) == 0.5
+    assert flip_rate(["approve", "approve", "approve", "reject"]) == 0.25
+
+
+def test_flip_rate_counts_against_the_modal_value():
+    assert flip_rate(["a", "a", "b", "c"]) == 0.5
+
+
+def test_flip_rate_rejects_empty_naming_itself():
+    """A public function must not report a failure under a helper's name.
+
+    Before this, `flip_rate([])` raised "majority() needs at least one value",
+    sending a caller to read a function they never called.
+    """
+    with pytest.raises(ValueError, match="flip_rate"):
+        flip_rate([])
 
 
 def test_majority_rejects_empty():

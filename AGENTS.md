@@ -40,6 +40,9 @@ uv run pytest -x -q                         # stop on first failure, quiet
 | `judge/prompts.py` | `tests/test_prompts.py` |
 | `judge/client.py` | `tests/test_client.py` |
 | `judge/vote.py` (majority, flip rates) | `tests/test_vote.py` |
+| `judge/rulings.py` (ruling journal) | `tests/test_rulings.py` |
+| `judge/flips.py` (per-pair flip stats) | `tests/test_flips.py` |
+| `rule.py` (ruling TUI) | `tests/test_rule.py` |
 | `judge/stats.py` (spread, bootstrap) | `tests/test_stats.py` |
 | `judge/check.py` | `tests/test_check_backends.py` |
 | `backends.toml` itself | `tests/test_backends_config.py` |

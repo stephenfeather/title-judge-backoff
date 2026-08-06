@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol, Sequence
 
+from judge import vote
+
 
 @dataclass(frozen=True)
 class JudgeVerdict:
@@ -97,8 +99,8 @@ def flip_stats(verdicts: Iterable[VerdictLike]) -> dict[str, FlipStats]:
 
 
 def _stats_for(pair_id: str, group: Sequence[VerdictLike]) -> FlipStats:
-    counts = Counter(v.verdict for v in group)
-    majority, modal_count = counts.most_common(1)[0]
+    values = [v.verdict for v in group]
+    counts = Counter(values)
     n = len(group)
     return FlipStats(
         pair_id=pair_id,
@@ -106,8 +108,8 @@ def _stats_for(pair_id: str, group: Sequence[VerdictLike]) -> FlipStats:
         verdicts=dict(counts),
         reasons=dict(Counter(_reason_of(v) for v in group)),
         models=sorted({v.model_id for v in group}),
-        majority=majority,
-        flip_rate=1.0 - modal_count / n,
+        majority=vote.majority(values),
+        flip_rate=vote.flip_rate(values),
     )
 
 
