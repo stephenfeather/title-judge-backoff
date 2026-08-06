@@ -33,14 +33,47 @@ eval_only = true
 role = "contender"
 api_key_env = "NVIDIA_API_KEY"
 
-# NOTE (2026-08-05): this id is exactly what GET /v1/models advertises, but a
-# chat/completions request against it returns 404 — listed in the catalog, not
-# servable on this endpoint. Left in place so a later --ping re-tests it; treat
+# NOTE (2026-08-05): advertised by GET /v1/models and on the public model page,
+# but chat/completions returns 404 with:
+#   "Function '23d4f03a-...': Not found for account '<account>'"
+# That is an ACCOUNT ENTITLEMENT gap, not a wrong call shape — the NIM function
+# behind this model is not provisioned for our account. Re-request shape changes
+# nothing; the model needs enabling for the account (some NIMs require explicit
+# access/terms acceptance). Left in place so a later --ping re-tests it; treat
 # its results as absent until a ping reports [reachable].
+#
+# nvidia/llama-3.1-nemotron-ultra-253b-v1 fails the same way — catalog listing
+# does NOT imply the account can invoke it. Ping every new id before trusting it.
 [[backends]]
 name = "nvidia-kimi-k2.6"
 base_url = "https://integrate.api.nvidia.com/v1"
 model_id = "moonshotai/kimi-k2.6"
+rpm = 40
+eval_only = true
+role = "contender"
+api_key_env = "NVIDIA_API_KEY"
+
+[[backends]]
+name = "nvidia-nemotron-3-ultra"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "nvidia/nemotron-3-ultra-550b-a55b"
+rpm = 40
+eval_only = true
+role = "contender"
+api_key_env = "NVIDIA_API_KEY"
+
+# NOTE (2026-08-05): in the catalog and routed to a worker (no 404), but
+# inference itself fails — HTTP 500 after ~79s:
+#   {"type":"urn:nvcf-worker-service:problem-details:internal-server-error",
+#    "title":"Internal Server Error","status":500,
+#    "detail":"Internal error while making inference request"}
+# A THIRD failure mode, distinct from Kimi's 404 entitlement gap: entitled and
+# routed, but the backing worker errors. Likely transient/capacity — re-ping
+# periodically. Its 79s latency is why REQUEST_TIMEOUT_S is 180s, not 60s.
+[[backends]]
+name = "nvidia-inkling"
+base_url = "https://integrate.api.nvidia.com/v1"
+model_id = "thinkingmachines/inkling"
 rpm = 40
 eval_only = true
 role = "contender"
