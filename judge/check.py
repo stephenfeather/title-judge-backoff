@@ -69,12 +69,17 @@ def ping_backend(backend: Backend, transport=None) -> BackendCheck:
     check = check_key_presence(backend)
     if check.status == "skipped":
         return check
+    # Closed in `finally`: each client holds a connection pool, and pinging a
+    # ten-backend slate previously leaked one per backend.
+    client = JudgeClient(backend, transport=transport)
     try:
-        JudgeClient(backend, transport=transport).judge(PING_PAIR)
+        client.judge(PING_PAIR)
     except Exception as exc:  # noqa: BLE001 - any failure is a failed ping
         return BackendCheck(
             name=backend.name, status="ready", detail=_failure_detail(exc), reachable=False
         )
+    finally:
+        client.close()
     return BackendCheck(name=backend.name, status="ready", detail=check.detail, reachable=True)
 
 

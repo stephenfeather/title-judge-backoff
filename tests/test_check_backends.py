@@ -1,6 +1,6 @@
 import httpx
 
-from judge.client import Backend
+from judge.client import Backend, JudgeClient
 from judge.check import BackendCheck, check_key_presence, ping_backend, render_check_report
 
 
@@ -59,6 +59,35 @@ def test_failed_ping_reports_the_response_body(monkeypatch):
     assert check.reachable is False
     assert "temperature" in check.detail
     assert "unsupported_value" in check.detail
+
+
+def test_ping_closes_its_client_on_success_and_failure(monkeypatch):
+    # Pinging a 10-backend slate opened 10 clients and closed none. Each holds a
+    # connection pool, so a --ping across a large slate leaked file descriptors.
+    monkeypatch.setenv("PING_KEY", "x")
+    closed = []
+
+    class TrackingClient(JudgeClient):
+        def close(self):
+            closed.append(self.backend.name)
+            super().close()
+
+    monkeypatch.setattr("judge.check.JudgeClient", TrackingClient)
+
+    ping_backend(
+        make_backend("ok", "PING_KEY"),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"verdict":"approve","reason":"ok"}'}}]},
+            )
+        ),
+    )
+    ping_backend(
+        make_backend("boom", "PING_KEY"),
+        transport=httpx.MockTransport(lambda request: httpx.Response(500, text="nope")),
+    )
+    assert closed == ["ok", "boom"]
 
 
 def test_successful_ping_is_marked_reachable(monkeypatch):

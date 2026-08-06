@@ -308,6 +308,76 @@ def test_structured_output_is_off_by_default(monkeypatch):
     assert "response_format" not in body
 
 
+ANTHROPIC_REPLY = {
+    "model": "claude-haiku-4-5-20251001",
+    "content": [{"type": "text", "text": '{"verdict": "approve", "reason": "ok"}'}],
+}
+
+
+def anthropic_backend(**overrides):
+    base = dict(api="anthropic", api_key_env="ANTHROPIC_API_KEY", model_id="claude-haiku-4-5")
+    base.update(overrides)
+    return openai_backend(**base)
+
+
+def test_anthropic_request_sends_structured_output_in_anthropic_shape(monkeypatch):
+    # The Anthropic Messages API DOES support strict JSON-schema output, but the
+    # shape differs from OpenAI's: output_config.format, and the schema is bare
+    # (no name/strict wrapper). Dropping the field silently — while the verdict
+    # and manifest still recorded structured_output=true — made the metadata lie.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    body, _, _ = capture_body(
+        anthropic_backend(structured_output=True), response_json=ANTHROPIC_REPLY
+    )
+    fmt = body["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    assert fmt["schema"]["properties"]["verdict"]["enum"] == ["approve", "reject"]
+    assert fmt["schema"]["additionalProperties"] is False
+    assert "response_format" not in body  # that is the OpenAI spelling
+    assert "json_schema" not in fmt  # OpenAI's name/strict wrapper does not apply
+
+
+def test_anthropic_request_maps_effort_onto_output_config(monkeypatch):
+    # Anthropic's equivalent of reasoning_effort is output_config.effort.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    body, verdict, _ = capture_body(
+        anthropic_backend(reasoning_effort="high"), response_json=ANTHROPIC_REPLY
+    )
+    assert body["output_config"]["effort"] == "high"
+    assert "reasoning_effort" not in body  # that is the OpenAI spelling
+    assert verdict.reasoning_effort == "high"
+
+
+def test_anthropic_effort_none_maps_to_disabled_thinking(monkeypatch):
+    # Anthropic has no effort level "none" — the documented equivalent of
+    # "don't reason" is thinking: {type: disabled}. Passing "none" through as an
+    # effort value would 400.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    body, _, _ = capture_body(
+        anthropic_backend(reasoning_effort="none"), response_json=ANTHROPIC_REPLY
+    )
+    assert body["thinking"] == {"type": "disabled"}
+    assert "effort" not in body.get("output_config", {})
+
+
+def test_anthropic_request_combines_effort_and_structured_output(monkeypatch):
+    # Both live under output_config — setting one must not clobber the other.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    body, _, _ = capture_body(
+        anthropic_backend(reasoning_effort="medium", structured_output=True),
+        response_json=ANTHROPIC_REPLY,
+    )
+    assert body["output_config"]["effort"] == "medium"
+    assert body["output_config"]["format"]["type"] == "json_schema"
+
+
+def test_anthropic_request_omits_output_config_when_neither_is_declared(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    body, _, _ = capture_body(anthropic_backend(), response_json=ANTHROPIC_REPLY)
+    assert "output_config" not in body
+    assert "thinking" not in body
+
+
 def test_judge_records_run_index(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "k")
 

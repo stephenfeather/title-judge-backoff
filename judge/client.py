@@ -39,9 +39,11 @@ TEMPERATURE_OMITTED = None
 # recorded on every verdict rather than left to the provider default.
 VALID_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 
-# Large reasoning models are genuinely slow: thinkingmachines/inkling answered
-# in 79s. A timeout below that reports a slow model as unreachable, which is a
-# wrong diagnosis rather than a slow one. Override per backend via timeout_s.
+# Backends can take a long time to come back even when they never answer:
+# thinkingmachines/inkling took 79s to return an HTTP 500 (it did NOT answer in
+# 79s). A timeout below that turns "slow" and "slow then failed" into the same
+# unreachable verdict, hiding which one we actually hit — and the response body
+# is where the difference shows up. Override per backend via timeout_s.
 REQUEST_TIMEOUT_S = 180.0
 
 
@@ -163,6 +165,22 @@ def _openai_content(payload: dict) -> str:
     return payload["choices"][0]["message"]["content"]
 
 
+# Anthropic supports the same two capabilities as the OpenAI path, under
+# different names — so `reasoning_effort` and `structured_output` are honored
+# here rather than silently dropped while the verdict and manifest still claim
+# them. The spellings differ in three ways:
+#   * effort lives at output_config.effort, not top-level reasoning_effort;
+#   * the JSON schema lives at output_config.format and is bare — no
+#     {name, strict, schema} wrapper (that shape is OpenAI's);
+#   * there is no effort level "none"; the documented equivalent of "do not
+#     reason" is thinking: {"type": "disabled"} (see _anthropic_request).
+# Note claude-haiku-4-5 — the only Anthropic backend on the current slate —
+# does NOT accept the effort parameter at all. Declaring effort on it will 400,
+# which is the correct loud failure rather than a silently ignored setting.
+ANTHROPIC_VERDICT_SCHEMA = VERDICT_JSON_SCHEMA["schema"]
+ANTHROPIC_EFFORT_NONE = {"type": "disabled"}
+
+
 def _anthropic_request(backend: Backend, pair: Pair) -> tuple[str, dict]:
     """Path and body for the Anthropic messages API.
 
@@ -178,6 +196,16 @@ def _anthropic_request(backend: Backend, pair: Pair) -> tuple[str, dict]:
     }
     if backend.temperature is not None:
         body["temperature"] = backend.temperature
+
+    output_config: dict = {}
+    if backend.reasoning_effort == "none":
+        body["thinking"] = ANTHROPIC_EFFORT_NONE
+    elif backend.reasoning_effort is not None:
+        output_config["effort"] = backend.reasoning_effort
+    if backend.structured_output:
+        output_config["format"] = {"type": "json_schema", "schema": ANTHROPIC_VERDICT_SCHEMA}
+    if output_config:
+        body["output_config"] = output_config
     return "/messages", body
 
 
