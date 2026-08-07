@@ -17,14 +17,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import statistics
 import sys
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Callable
 
 from judge.check import check_key_presence, ping_backend, render_check_report
-from judge.client import Backend, JudgeClient, RateLimiter, load_backends
+from judge.client import Backend, JudgeClient, LimiterRegistry, load_backends
 from judge.prompts import PROMPT_VERSION
 from judge.schema import Pair, pair_from_dict, verdict_from_json_line, verdict_to_json_line
 
@@ -211,7 +215,102 @@ def load_pairs(path: Path) -> list[Pair]:
     return [pair_from_dict(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
 
 
-def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: int) -> None:
+class ResultWriter:
+    """The single writer for one results file, fed by a queue.
+
+    The append-and-flush-per-line contract is what makes a killed run
+    resumable, and it only holds while exactly one thing owns the handle. N
+    worker threads writing directly would interleave partial lines and leave a
+    torn file that `already_judged_ids` cannot parse. Workers hand finished
+    lines here instead; this thread does every write, in queue order.
+    """
+
+    _STOP = object()
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._drain, name=f"writer-{path.name}")
+        self._failure: BaseException | None = None
+
+    def __enter__(self) -> ResultWriter:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._queue.put(self._STOP)
+        self._thread.join()
+        # A writer that died — full disk, revoked permissions — would otherwise
+        # drop every verdict after it silently, and a multi-hour run would look
+        # like it merely judged fewer pairs. Fail loudly instead.
+        if self._failure is not None:
+            raise self._failure
+
+    def write(self, line: str) -> None:
+        self._queue.put(line)
+
+    def _drain(self) -> None:
+        try:
+            with open(self._path, "a") as fh:
+                while (item := self._queue.get()) is not self._STOP:
+                    fh.write(item + "\n")
+                    fh.flush()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            self._failure = exc
+            # Keep draining so no worker's put() outlives a dead consumer.
+            while self._queue.get() is not self._STOP:
+                pass
+
+
+class RunHealth:
+    """Per-call timings and errors, collected across worker threads.
+
+    Latency is the evidence base for issue #9 — an unguarded list.append can
+    drop samples under concurrency, and a lost sample silently biases the p50
+    that decides whether a backend is usable at pack scale.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.latencies: list[float] = []
+        self.failed_latencies: list[float] = []
+        self.errors: list[str] = []
+        self._attempts = 0
+
+    def claim_attempt(self) -> int:
+        """1-based index of this attempt, counting failures — as enumerate did."""
+        with self._lock:
+            self._attempts += 1
+            return self._attempts
+
+    def record_ok(self, seconds: float) -> None:
+        with self._lock:
+            self.latencies.append(seconds)
+
+    def record_failure(self, seconds: float, exc: Exception) -> None:
+        with self._lock:
+            # Time failures too — a timeout is the slowest call a backend
+            # makes, and the one worth knowing about.
+            self.failed_latencies.append(seconds)
+            self.errors.append(type(exc).__name__)
+
+
+def run_backend(
+    backend: Backend,
+    pairs: list[Pair],
+    out_dir: Path,
+    *,
+    votes: int,
+    concurrency: int = 1,
+    limiters: LimiterRegistry | None = None,
+    client_factory: Callable[[Backend], JudgeClient] = JudgeClient,
+) -> None:
+    """Judge every owed vote for one backend, `concurrency` calls in flight.
+
+    At concurrency=1 this is the original serial loop: one worker consuming a
+    FIFO queue in submission order, so the results file is written in exactly
+    the pair-then-vote order prior runs produced.
+    """
     results_path = out_dir / f"{backend.name}.jsonl"
     judged = already_judged_ids(
         results_path,
@@ -220,6 +319,8 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: in
         temperature=backend.temperature,
         reasoning_effort=backend.reasoning_effort,
     )
+    # Partitioned ONCE, before any worker starts. A worker that re-read the
+    # results file could hand the same (pair_id, run_index) to two threads.
     todo = pending_votes(pairs, judged, votes=votes)
     label = " (eval-only backend)" if backend.eval_only else ""
     print(
@@ -228,33 +329,37 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: in
     if not todo:
         return
 
-    client = JudgeClient(backend)
-    limiter = RateLimiter(rpm=backend.rpm)
-    latencies: list[float] = []
-    failed_latencies: list[float] = []
-    errors: list[str] = []
+    client = client_factory(backend)
+    limiter = (limiters or LimiterRegistry()).for_backend(backend)
+    health = RunHealth()
+
+    def judge_one(item: tuple[Pair, int], writer: ResultWriter) -> None:
+        pair, run_index = item
+        i = health.claim_attempt()
+        limiter.wait()
+        started = time.monotonic()
+        try:
+            verdict = client.judge(pair, run_index=run_index)
+        except Exception as exc:  # noqa: BLE001 - keep going, resume covers gaps
+            health.record_failure(time.monotonic() - started, exc)
+            print(
+                f"[{backend.name}] {pair.id} vote {run_index}: ERROR {exc}",
+                file=sys.stderr,
+            )
+            return
+        health.record_ok(time.monotonic() - started)
+        writer.write(verdict_to_json_line(verdict))
+        if i % 20 == 0 or i == len(todo):
+            print(f"[{backend.name}] {i}/{len(todo)}")
+
     try:
-        with open(results_path, "a") as fh:
-            for i, (pair, run_index) in enumerate(todo, 1):
-                limiter.wait()
-                started = time.monotonic()
-                try:
-                    verdict = client.judge(pair, run_index=run_index)
-                except Exception as exc:  # noqa: BLE001 - keep going, resume covers gaps
-                    # Time failures too — a timeout is the slowest call a
-                    # backend makes, and the one worth knowing about.
-                    failed_latencies.append(time.monotonic() - started)
-                    errors.append(type(exc).__name__)
-                    print(
-                        f"[{backend.name}] {pair.id} vote {run_index}: ERROR {exc}",
-                        file=sys.stderr,
-                    )
-                    continue
-                latencies.append(time.monotonic() - started)
-                fh.write(verdict_to_json_line(verdict) + "\n")
-                fh.flush()
-                if i % 20 == 0 or i == len(todo):
-                    print(f"[{backend.name}] {i}/{len(todo)}")
+        with ResultWriter(results_path) as writer:
+            with ThreadPoolExecutor(
+                max_workers=concurrency, thread_name_prefix=f"judge-{backend.name}"
+            ) as pool:
+                futures = [pool.submit(judge_one, item, writer) for item in todo]
+                for future in futures:
+                    future.result()  # surface anything judge_one did not catch
         # Written after the run so observed_models reflects every snapshot that
         # actually answered, including a mid-run swap.
         manifest_path = out_dir / f"{backend.name}.manifest.json"
@@ -267,9 +372,9 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: in
                     n_pairs=len(pairs),
                     sample_payload=client.request_body(pairs[0]),
                     observed_models=client.observed_models,
-                    latencies=latencies,
-                    errors=errors,
-                    failed_latencies=failed_latencies,
+                    latencies=health.latencies,
+                    errors=health.errors,
+                    failed_latencies=health.failed_latencies,
                 ),
                 indent=2,
             )
@@ -277,6 +382,67 @@ def run_backend(backend: Backend, pairs: list[Pair], out_dir: Path, *, votes: in
         )
     finally:
         client.close()
+
+
+def run_slate(
+    backends: list[Backend],
+    pairs: list[Pair],
+    out_dir: Path,
+    *,
+    votes: int,
+    concurrency: int = 1,
+    limiters: LimiterRegistry | None = None,
+    client_factory: Callable[[Backend], JudgeClient] = JudgeClient,
+    on_backend_done: Callable[[str], None] | None = None,
+) -> None:
+    """Run every backend on the slate.
+
+    Backends run concurrently whenever concurrency > 1. Five of the eight
+    slate backends sit on unrelated hosts and share nothing, so serializing
+    them made the slate cost sum() where it could cost max() — and worse, a
+    single melting-down host stalled every backend queued behind it.
+
+    concurrency == 1 keeps them strictly serial, in slate order, so a run is
+    reproducible byte for byte against the runs that came before this change.
+    That includes failure behaviour: a raising backend aborts the slate, as it
+    always did. Only the parallel path isolates failures, because there the
+    other backends have already done work worth keeping.
+    """
+    if not backends:
+        return
+    limiters = limiters or LimiterRegistry()
+
+    def run_one(backend: Backend) -> None:
+        run_backend(
+            backend,
+            pairs,
+            out_dir,
+            votes=votes,
+            concurrency=concurrency,
+            limiters=limiters,
+            client_factory=client_factory,
+        )
+        if on_backend_done is not None:
+            on_backend_done(backend.name)
+
+    if concurrency == 1:
+        for backend in backends:
+            run_one(backend)
+        return
+
+    with ThreadPoolExecutor(max_workers=len(backends), thread_name_prefix="backend") as pool:
+        futures = {pool.submit(run_one, backend): backend for backend in backends}
+        failures = []
+        for future, backend in futures.items():
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 - report all, not just the first
+                print(f"[{backend.name}] FAILED: {exc}", file=sys.stderr)
+                failures.append(f"{backend.name}: {exc}")
+    if failures:
+        raise RuntimeError(
+            f"{len(failures)} backend(s) failed: " + "; ".join(failures)
+        )
 
 
 def main() -> None:
@@ -308,9 +474,22 @@ def main() -> None:
         action="store_true",
         help="proceed even when some backends have no API key (default: refuse)",
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help=(
+            "calls in flight per backend; N>1 also runs backends in parallel "
+            "(default 1 = fully serial, reproduces pre-concurrency runs exactly). "
+            "Rate limits are enforced per HOST, so raising this cannot exceed a "
+            "provider's quota no matter how many backends share an endpoint"
+        ),
+    )
     args = parser.parse_args()
     if args.votes < 1:
         parser.error("--votes must be at least 1")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be at least 1")
 
     backends = load_backends(args.backends)
 
@@ -331,11 +510,15 @@ def main() -> None:
 
     pairs = load_pairs(args.data)
     args.out.mkdir(parents=True, exist_ok=True)
+
+    runnable = []
     for backend in backends:
         if check_key_presence(backend).status == "skipped":
             print(f"[{backend.name}] SKIPPED: ${backend.api_key_env} is not set", file=sys.stderr)
             continue
-        run_backend(backend, pairs, args.out, votes=args.votes)
+        runnable.append(backend)
+
+    run_slate(runnable, pairs, args.out, votes=args.votes, concurrency=args.concurrency)
 
 
 if __name__ == "__main__":

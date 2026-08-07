@@ -1,9 +1,11 @@
 import json
+import threading
+import time
 
 import httpx
 import pytest
 
-from judge.client import Backend, JudgeClient, RateLimiter, load_backends
+from judge.client import Backend, LimiterRegistry, JudgeClient, RateLimiter, load_backends
 from judge.schema import Pair, ReasonCode
 
 BACKENDS_TOML = """\
@@ -111,6 +113,100 @@ def test_rate_limiter_spaces_calls_by_rpm():
     clock["now"] += 0.5
     limiter.wait()          # 0.5s later: wait the remaining 1.5s
     assert sleeps == [2.0, 1.5]
+
+
+def limiter_backend(name, base_url, rpm):
+    return Backend(
+        name=name,
+        base_url=base_url,
+        model_id=f"model/{name}",
+        rpm=rpm,
+        eval_only=False,
+        api_key_env="NVIDIA_API_KEY",
+    )
+
+
+def test_rate_limiter_does_not_release_concurrent_callers_together():
+    # The serial limiter reads _last, sleeps, then writes _last. N threads can
+    # all read the SAME _last, all sleep one interval, and all fire at once —
+    # which is how two NVIDIA backends asked one host for 80 rpm and got 503s.
+    # Real clock on purpose: a virtual clock advanced by a fake sleep cannot
+    # observe simultaneity, and simultaneity is the whole bug.
+    interval = 0.02
+    limiter = RateLimiter(rpm=int(60 / interval))
+    limiter.wait()  # prime _last so every thread races the same stale value
+    gate = threading.Barrier(6)
+    released = []
+    lock = threading.Lock()
+
+    def worker():
+        gate.wait()
+        limiter.wait()
+        with lock:
+            released.append(time.monotonic())
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Six calls one interval apart span five intervals. Unlocked they all land
+    # within roughly one, so the span is the discriminator, not the count.
+    span = max(released) - min(released)
+    assert span >= 4 * interval, f"6 calls released within {span:.3f}s of each other"
+
+
+def test_limiter_registry_shares_one_limiter_across_backends_on_the_same_host():
+    # Six nvidia-* backends share integrate.api.nvidia.com and its quota. Keyed
+    # per backend they would ask for 6x40 rpm; keyed per host they ask for 40.
+    registry = LimiterRegistry(sleep=lambda _: None)
+    deepseek = limiter_backend("nvidia-deepseek", "https://integrate.api.nvidia.com/v1", 40)
+    nemotron = limiter_backend("nvidia-nemotron", "https://integrate.api.nvidia.com/v1", 40)
+    assert registry.for_backend(deepseek) is registry.for_backend(nemotron)
+
+
+def test_limiter_registry_separates_unrelated_hosts():
+    registry = LimiterRegistry(sleep=lambda _: None)
+    nvidia = limiter_backend("nvidia-deepseek", "https://integrate.api.nvidia.com/v1", 40)
+    xai = limiter_backend("xai-grok", "https://api.x.ai/v1", 60)
+    assert registry.for_backend(nvidia) is not registry.for_backend(xai)
+
+
+def test_limiter_registry_ignores_path_when_keying_on_host():
+    # Two base_urls on one host with different paths are still one quota.
+    registry = LimiterRegistry(sleep=lambda _: None)
+    a = limiter_backend("a", "https://generativelanguage.googleapis.com/v1beta/openai", 60)
+    b = limiter_backend("b", "https://generativelanguage.googleapis.com/v1", 60)
+    assert registry.for_backend(a) is registry.for_backend(b)
+
+
+def test_limiter_registry_tightens_to_the_lowest_rpm_on_a_shared_host():
+    # The shared limiter must never exceed the most conservative declaration on
+    # the host, and must not depend on which backend registered first.
+    sleeps = []
+    clock = {"now": 0.0}
+    registry = LimiterRegistry(now=lambda: clock["now"], sleep=sleeps.append)
+    fast = limiter_backend("fast", "https://integrate.api.nvidia.com/v1", 60)
+    slow = limiter_backend("slow", "https://integrate.api.nvidia.com/v1", 20)
+    limiter = registry.for_backend(fast)
+    registry.for_backend(slow)  # tightens the already-created limiter to 20 rpm
+    limiter.wait()
+    limiter.wait()
+    assert sleeps == [3.0]  # 60/20, not 60/60
+
+
+def test_limiter_registry_keeps_the_lowest_rpm_regardless_of_registration_order():
+    sleeps = []
+    clock = {"now": 0.0}
+    registry = LimiterRegistry(now=lambda: clock["now"], sleep=sleeps.append)
+    slow = limiter_backend("slow", "https://integrate.api.nvidia.com/v1", 20)
+    fast = limiter_backend("fast", "https://integrate.api.nvidia.com/v1", 60)
+    registry.for_backend(slow)
+    limiter = registry.for_backend(fast)  # must NOT loosen back to 60
+    limiter.wait()
+    limiter.wait()
+    assert sleeps == [3.0]
 
 
 def test_judge_client_parses_chat_completion(monkeypatch):

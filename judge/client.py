@@ -7,11 +7,13 @@ only (never from config or code).
 from __future__ import annotations
 
 import os
+import threading
 import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -105,7 +107,18 @@ def load_backends(path: str | Path) -> list[Backend]:
 
 
 class RateLimiter:
-    """Spaces calls at least 60/rpm seconds apart; clock injectable for tests."""
+    """Spaces calls at least 60/rpm seconds apart; clock injectable for tests.
+
+    Safe to share between threads. The sleep happens while the lock is HELD,
+    which is the point: the decision "when may the next call leave" is
+    inherently serial, so admitting one caller per interval is exactly the
+    intended behaviour. Only admission is serialized — the HTTP call itself
+    runs outside the lock, so N workers stay in flight concurrently while calls
+    still depart at the declared rate.
+
+    Releasing the lock before sleeping would defeat it: every waiting thread
+    would read the same `_last`, sleep the same interval, and fire together.
+    """
 
     def __init__(
         self,
@@ -117,13 +130,65 @@ class RateLimiter:
         self._now = now
         self._sleep = sleep
         self._last: float | None = None
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
-        if self._last is not None:
-            remaining = self._interval - (self._now() - self._last)
-            if remaining > 0:
-                self._sleep(remaining)
-        self._last = self._now()
+        with self._lock:
+            if self._last is not None:
+                remaining = self._interval - (self._now() - self._last)
+                if remaining > 0:
+                    self._sleep(remaining)
+            self._last = self._now()
+
+    def tighten_to(self, rpm: int) -> None:
+        """Lower the rate to `rpm` if that is stricter than the current one.
+
+        Only ever tightens, so the result does not depend on the order backends
+        register — see LimiterRegistry.
+        """
+        with self._lock:
+            self._interval = max(self._interval, 60.0 / rpm)
+
+
+def limiter_host(base_url: str) -> str:
+    """The rate-limit key for a base_url: its host, ignoring path and scheme."""
+    return urlparse(base_url).netloc
+
+
+class LimiterRegistry:
+    """One RateLimiter per HOST, shared by every backend on that host.
+
+    Quotas are enforced by providers per endpoint, not per model. Six nvidia-*
+    backends share integrate.api.nvidia.com; limiting each of them to its own
+    40 rpm asks that one host for 240. Measured on 2026-08-06: running nemotron
+    alongside deepseek drove deepseek to p50 9.77s with 81 failures where it had
+    been p50 2.48s with none. Same backend, same host, same hour.
+
+    Because the limiter is shared, the host runs at the LOWEST rpm any of its
+    backends declared — a conservative declaration is never loosened by a
+    later, more permissive one.
+    """
+
+    def __init__(
+        self,
+        now: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._now = now
+        self._sleep = sleep
+        self._limiters: dict[str, RateLimiter] = {}
+        self._lock = threading.Lock()
+
+    def for_backend(self, backend: Backend) -> RateLimiter:
+        host = limiter_host(backend.base_url)
+        with self._lock:
+            limiter = self._limiters.get(host)
+            if limiter is None:
+                limiter = RateLimiter(rpm=backend.rpm, now=self._now, sleep=self._sleep)
+                self._limiters[host] = limiter
+            else:
+                limiter.tighten_to(backend.rpm)
+            return limiter
 
 
 VERDICT_JSON_SCHEMA = {
