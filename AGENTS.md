@@ -77,6 +77,34 @@ verdict, never left to a provider default.
 Stability comes from `--votes` (majority-of-N, default 3), not from sampling
 parameters. Any new metric must be reported with its spread.
 
+## No majority is a state, not a value
+
+`VoteResult.verdict` and `VoteResult.reason` are **`None`** when the votes
+reached no majority — when two or more values shared the top count, so any
+winner would be the tie-break's invention. Use `settled_majority()` for
+rulings; `majority()` still returns a modal value and exists only for
+`flip_rate`, which is invariant to which tied candidate wins.
+
+Rules for any new consumer:
+
+- **Decide explicitly.** `None` is deliberate so that ignoring it raises
+  `AttributeError` rather than producing a plausible wrong number.
+- **Verdict and reason settle independently.** The common shape is a settled
+  verdict with an unsettled reason — three votes agreeing on "reject" while
+  splitting 1-1-1 on why. That verdict is real evidence and must still score.
+- **Exclude from metrics, and COUNT the exclusion.** `score.py` reports
+  `n_unsettled_verdict` and `n_unsettled_reason`; the scenario report
+  enumerates the pairs. A metric over 189 of 200 is honest; a silent exclusion
+  is its own kind of lie.
+- **Never compare two unsettled values.** `None == None` would score two
+  models that both failed to decide as agreeing.
+- **Flip rates always survive.** An unsettled pair is contested, not missing,
+  and the ruling queue ranks it up for exactly that reason.
+
+Verdict ties are not hypothetical: a backend that stops short leaves pairs
+with two votes, and inkling has one such 1-1 split in the 2026-08-06 run.
+"Verdict is binary so it cannot tie" holds only for a complete run.
+
 ## Concurrency
 
 `--concurrency N` runs N calls per backend and runs backends in parallel; the

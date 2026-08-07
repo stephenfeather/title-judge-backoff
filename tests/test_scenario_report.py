@@ -8,6 +8,7 @@ from scenario_report import (
     contention_ranking,
     load_results,
     render_scenario_report,
+    unsettled_reason_pairs,
 )
 
 
@@ -182,6 +183,68 @@ def test_render_scenario_report_states_that_kappa_is_not_computable():
     md = render_scenario_report(by_model, {})
     assert "no operator rulings" in md.lower()
     assert "kappa" in md.lower()
+
+
+def unsettled_votes(model_id, pair_id):
+    """Three votes, three reasons: settled verdict, no majority reason."""
+    return votes(
+        model_id,
+        pair_id,
+        [("reject", "meaning_change"), ("reject", "ok"), ("reject", "overcorrection")],
+    )
+
+
+def test_unsettled_reason_pairs_catches_a_two_two_split_not_just_all_distinct():
+    # The version shipped in PR #19 looked for "every reason different", which
+    # misses a 2-2 tie on four votes — equally undecided, and reachable when a
+    # pair is re-judged after a resume. Deriving from tally_votes instead of
+    # re-implementing the rule removes the second definition entirely.
+    two_two = votes(
+        "m",
+        "split-2-2",
+        [
+            ("reject", "casing_error"),
+            ("reject", "casing_error"),
+            ("reject", "overcorrection"),
+            ("reject", "overcorrection"),
+        ],
+    )
+    clear = votes("m", "clear", [("reject", "ok"), ("reject", "ok"), ("reject", "casing_error")])
+    assert unsettled_reason_pairs(two_two + clear) == ["split-2-2"]
+
+
+def test_contention_counts_models_that_failed_to_settle():
+    # Requirement 3 of issue #12. Previously an unsettled pair was ranked on
+    # whatever the tie-break invented, which could push it up OR bury it. It
+    # must rank BECAUSE it is unsettled: a pair its own judges could not decide
+    # is the definition of an ambiguous rubric, which is what the queue is for.
+    by_model = {
+        "a": unsettled_votes("a", "cannot-decide") + votes("a", "easy", [("approve", "ok")] * 3),
+        "b": unsettled_votes("b", "cannot-decide") + votes("b", "easy", [("approve", "ok")] * 3),
+    }
+    rows = {r.pair_id: r for r in contention_ranking(by_model)}
+    assert rows["cannot-decide"].n_unsettled == 2
+    assert rows["easy"].n_unsettled == 0
+    assert rows["cannot-decide"].contention > rows["easy"].contention
+
+
+def test_an_unsettled_pair_outranks_one_its_judges_merely_disagreed_on():
+    # Two models disagreeing is evidence. A model unable to decide at all is
+    # stronger evidence, and previously scored lower because a tie-broken value
+    # can happen to match the other model's.
+    by_model = {
+        "a": unsettled_votes("a", "undecidable") + votes("a", "disputed", [("approve", "ok")] * 3),
+        "b": unsettled_votes("b", "undecidable")
+        + votes("b", "disputed", [("reject", "casing_error")] * 3),
+    }
+    rows = {r.pair_id: r for r in contention_ranking(by_model)}
+    assert rows["undecidable"].contention >= rows["disputed"].contention
+
+
+def test_contention_ranking_does_not_crash_on_an_unsettled_pair():
+    # The regression that motivated all of this: `r.reason.value` on a None.
+    by_model = {"a": unsettled_votes("a", "p1")}
+    assert contention_ranking(by_model)[0].pair_id == "p1"
 
 
 def test_completion_is_counted_from_rows_not_from_manifest_health():

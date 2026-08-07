@@ -1,7 +1,7 @@
 import pytest
 
 from judge.schema import ReasonCode, Verdict
-from judge.vote import VoteResult, flip_rate, majority, tally_votes
+from judge.vote import VoteResult, flip_rate, majority, settled_majority, tally_votes
 
 
 def make_verdict(pair_id, verdict, reason, run_index):
@@ -115,3 +115,85 @@ def test_tally_votes_tolerates_uneven_vote_counts():
     by_id = {r.pair_id: r for r in tally_votes(verdicts)}
     assert by_id["p1"].n_votes == 2
     assert by_id["p2"].n_votes == 1
+
+
+# --- no majority is a state, not a value (issue #12) ------------------------
+
+
+def test_settled_majority_is_none_when_the_top_count_is_shared():
+    # A winner needs a count no other value matches. Two values tied at the top
+    # means the tie-break invented the answer.
+    assert settled_majority(["approve", "approve", "reject"]) == "approve"
+    assert settled_majority(["approve", "reject"]) is None
+    assert settled_majority(["a", "b", "c"]) is None
+    assert settled_majority(["only"]) == "only"
+
+
+def test_settled_majority_rejects_empty_naming_itself():
+    with pytest.raises(ValueError, match="settled_majority"):
+        settled_majority([])
+
+
+def test_tally_marks_a_three_way_reason_split_unsettled():
+    # deepseek e10-4fd6ba61ea52: verdict settled 3-0, reason split 1-1-1. The
+    # verdict is real; the reason was invented by the tie-break.
+    verdicts = [
+        make_verdict("p1", "reject", ReasonCode.MEANING_CHANGE, 0),
+        make_verdict("p1", "reject", ReasonCode.OK, 1),
+        make_verdict("p1", "reject", ReasonCode.OVERCORRECTION, 2),
+    ]
+    (result,) = tally_votes(verdicts)
+    assert result.verdict == "reject"
+    assert result.verdict_settled is True
+    assert result.reason is None
+    assert result.reason_settled is False
+    assert result.settled is False
+
+
+def test_tally_marks_an_even_verdict_split_unsettled():
+    # inkling stopped at 582/600 on 429s, leaving pairs with two votes. A 1-1
+    # verdict split has no majority either — "verdict is binary so it cannot
+    # tie" only holds for a COMPLETE run.
+    verdicts = [
+        make_verdict("p1", "approve", ReasonCode.OK, 0),
+        make_verdict("p1", "reject", ReasonCode.CASING_ERROR, 1),
+    ]
+    (result,) = tally_votes(verdicts)
+    assert result.verdict is None
+    assert result.verdict_settled is False
+    assert result.reason is None
+
+
+def test_tally_still_settles_an_ordinary_majority():
+    verdicts = [
+        make_verdict("p1", "approve", ReasonCode.OK, 0),
+        make_verdict("p1", "reject", ReasonCode.OK, 1),
+        make_verdict("p1", "approve", ReasonCode.OK, 2),
+    ]
+    (result,) = tally_votes(verdicts)
+    assert result.verdict == "approve"
+    assert result.reason is ReasonCode.OK
+    assert result.settled is True
+
+
+def test_flip_rate_does_not_depend_on_which_tied_value_wins():
+    # flip_rate still uses the modal value, which is safe: when the top count
+    # is shared, every candidate yields the same fraction. So the disagreement
+    # signal survives even where the winner is meaningless.
+    assert flip_rate(["a", "b", "c"]) == pytest.approx(2 / 3)
+    assert flip_rate(["c", "b", "a"]) == pytest.approx(2 / 3)
+    assert flip_rate(["approve", "reject"]) == 0.5
+    assert flip_rate(["reject", "approve"]) == 0.5
+
+
+def test_unsettled_pair_still_reports_its_flip_rates():
+    # The disagreement is the finding. Losing it would make an unsettled pair
+    # look like a missing row rather than a contested one.
+    verdicts = [
+        make_verdict("p1", "reject", ReasonCode.MEANING_CHANGE, 0),
+        make_verdict("p1", "reject", ReasonCode.OK, 1),
+        make_verdict("p1", "reject", ReasonCode.OVERCORRECTION, 2),
+    ]
+    (result,) = tally_votes(verdicts)
+    assert result.verdict_flip_rate == 0.0
+    assert result.reason_flip_rate == pytest.approx(2 / 3)
