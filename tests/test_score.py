@@ -1,7 +1,10 @@
+import random
+
 import pytest
 
 from judge.schema import Pair, ReasonCode, Verdict
 from judge.stats import intervals_overlap
+from judge.vote import tally_votes
 from score import ModelScore, cohens_kappa, render_leaderboard, score_model, separability_tiers
 
 
@@ -322,3 +325,58 @@ def test_leaderboard_shows_spread_and_flip_columns():
     assert "95% ci" in md.lower()
     assert "flip" in md.lower()
     assert "votes" in md.lower()
+
+
+# --------------------------------------------------------------------------
+# Line-order independence (issue #9 acceptance 5)
+#
+# A serial run always appends verdicts in pair-then-vote order, and scoring
+# quietly leaned on that. Concurrent workers make the order arbitrary, so the
+# same verdicts must score identically however they land in the file.
+# --------------------------------------------------------------------------
+
+
+ORDER_VERDICTS = (
+    votes_for("p1", [("approve", "ok"), ("reject", "meaning_change"), ("approve", "ok")])
+    + votes_for("p2", [("approve", "ok"), ("approve", "ok"), ("reject", "casing_error")])
+    + votes_for("p3", [("reject", "meaning_change")] * 3)
+    + votes_for("p4", [("reject", "casing_error"), ("approve", "ok"), ("reject", "casing_error")])
+)
+
+
+def test_score_model_is_independent_of_verdict_order():
+    baseline = score_model(PAIRS, list(ORDER_VERDICTS))
+    for seed in range(8):
+        shuffled = list(ORDER_VERDICTS)
+        random.Random(seed).shuffle(shuffled)
+        assert score_model(PAIRS, shuffled) == baseline, f"seed {seed} scored differently"
+
+
+def test_majority_verdict_tie_is_broken_by_run_index_not_file_position():
+    # An even split. It happens whenever a vote is lost to an API error, which
+    # on the 2026-08-06 sweep was common. "First occurrence" means whichever
+    # line the writer flushed first wins, so under concurrency the same data
+    # could score differently on re-run. The tie must resolve on run_index,
+    # which is a property of the vote rather than of the file.
+    tied = [
+        make_verdict("p1", "approve", "ok", run_index=0),
+        make_verdict("p1", "reject", "meaning_change", run_index=1),
+    ]
+    forward = tally_votes(list(tied))
+    backward = tally_votes(list(reversed(tied)))
+    assert forward == backward
+    assert forward[0].verdict == "approve"  # run_index 0 wins the tie
+
+
+def test_majority_reason_tie_is_broken_by_run_index_not_file_position():
+    # Three votes, three distinct reason codes: a genuine three-way tie, and
+    # score.py scores per-reason confusion off the winner.
+    tied = [
+        make_verdict("p1", "reject", "meaning_change", run_index=0),
+        make_verdict("p1", "reject", "casing_error", run_index=1),
+        make_verdict("p1", "reject", "overcorrection", run_index=2),
+    ]
+    forward = tally_votes(list(tied))
+    backward = tally_votes(list(reversed(tied)))
+    assert forward == backward
+    assert forward[0].reason == ReasonCode("meaning_change")
