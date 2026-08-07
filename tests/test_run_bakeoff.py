@@ -436,6 +436,28 @@ def test_result_writer_keeps_lines_intact_under_concurrent_writers(tmp_path):
     }
 
 
+def test_result_writer_does_not_acknowledge_a_write_before_it_is_flushed(tmp_path):
+    # #10's central claim is that --concurrency 1 reproduces prior runs
+    # exactly. The old serial loop flushed before issuing the next request, so
+    # a kill could lose at most the call in flight. An async queue widens that
+    # to "whatever is still queued" — verdicts already PAID FOR that resume
+    # then re-judges. Small, but it undercuts the reproducibility claim that
+    # makes this PR safe to merge, so write() waits for the flush.
+    path = tmp_path / "out.jsonl"
+    with ResultWriter(path) as writer:
+        writer.write("first")
+        # No join and no sleep: if write() acknowledged early, this read would
+        # see an empty file.
+        assert path.read_text() == "first\n"
+        writer.write("second")
+        assert path.read_text() == "first\nsecond\n"
+
+        # And in bulk, where an async writer would fall behind for certain.
+        for i in range(200):
+            writer.write(f"bulk-{i}")
+        assert len(path.read_text().splitlines()) == 202
+
+
 def test_result_writer_appends_rather_than_truncating(tmp_path):
     path = tmp_path / "out.jsonl"
     path.write_text("pre-existing\n")

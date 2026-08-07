@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import threading
 import time
 import tomllib
@@ -214,8 +215,22 @@ def rate_limit_penalty(exc: BaseException) -> float | None:
     except ValueError:
         return RETRY_AFTER_DEFAULT_S
     if not math.isfinite(seconds) or seconds < 0:
+        print(
+            f"ignoring unusable Retry-After {raw!r}; backing off "
+            f"{RETRY_AFTER_DEFAULT_S:g}s instead",
+            file=sys.stderr,
+        )
         return RETRY_AFTER_DEFAULT_S
-    return min(seconds, MAX_BACKOFF_S)
+    if seconds > MAX_BACKOFF_S:
+        # Say so: silently waiting a fifth of what the host asked for is the
+        # kind of thing that turns into an unexplained 429 storm later.
+        print(
+            f"Retry-After {seconds:g}s exceeds the {MAX_BACKOFF_S:g}s cap; "
+            f"backing off {MAX_BACKOFF_S:g}s and expect more 429s",
+            file=sys.stderr,
+        )
+        return MAX_BACKOFF_S
+    return seconds
 
 
 def limiter_host(base_url: str) -> str:

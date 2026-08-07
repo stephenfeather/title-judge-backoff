@@ -253,6 +253,7 @@ class ResultWriter:
     """
 
     _STOP = object()
+    _ACK_POLL_S = 0.25  # how often a blocked write() re-checks that the writer lives
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -291,25 +292,56 @@ class ResultWriter:
         return open(self._path, "a")
 
     def write(self, line: str) -> None:
-        self._queue.put(line)
+        """Hand a line to the writer and WAIT until it is on disk.
+
+        Returning before the flush would mean a kill could lose verdicts that
+        were already paid for. The old serial loop flushed before issuing the
+        next request, so at most the call in flight was at risk; an unwaited
+        queue widens that to everything still queued. Small in practice, but
+        this PR's central claim is that --concurrency 1 reproduces prior runs
+        exactly, and a durability regression there undercuts the claim.
+
+        The wait costs a local flush — sub-millisecond — against calls that
+        take seconds, and workers still never touch the file themselves, so the
+        single-writer guarantee is unchanged.
+        """
+        flushed = threading.Event()
+        self._queue.put((line, flushed))
+        # Poll rather than wait forever: a caller that reached write() after
+        # the writer thread stopped would otherwise hang the run outright,
+        # which is a worse failure than the lost line it is guarding.
+        while not flushed.wait(timeout=self._ACK_POLL_S):
+            if not self._thread.is_alive():
+                raise WriterGone(f"results writer is gone: {self._failure!r}")
+        if self._failure is not None:
+            raise WriterGone(f"results writer died: {self._failure!r}")
 
     def _drain(self) -> None:
         try:
             with self._open() as fh:
                 while (item := self._queue.get()) is not self._STOP:
-                    fh.write(item + "\n")
-                    fh.flush()
+                    line, flushed = item
+                    try:
+                        fh.write(line + "\n")
+                        fh.flush()
+                    finally:
+                        # Release the waiting worker even on failure, or it
+                        # blocks forever on a consumer that is about to die.
+                        flushed.set()
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
             # Deliberately BaseException, not Exception. Anything at all that
             # kills this thread must be recorded, because a writer that dies
             # unnoticed turns a corrupted run into one that merely looks short.
             # It IS re-raised — on the caller's thread, out of __exit__.
             self._failure = exc
-            # Discard whatever is still queued so no producer ends up blocked
-            # on a consumer that is no longer writing anything.
+            # Discard whatever is still queued, releasing each waiter as we go.
+            # write() blocks on its flush event, so a producer left unreleased
+            # here would hang forever on a consumer that is no longer writing.
             while True:
-                if self._queue.get() is self._STOP:
+                item = self._queue.get()
+                if item is self._STOP:
                     break
+                item[1].set()
 
 
 class RunHealth:
@@ -481,7 +513,14 @@ def run_backend(
                 # An operator killing a run expects the spend to stop.
                 # BaseException, not Exception: KeyboardInterrupt is the case
                 # that matters most and is not an Exception.
-                pool.shutdown(wait=False, cancel_futures=True)
+                #
+                # cancel_futures drops everything not yet started, which is
+                # where the unspent money is. wait=True still lets the handful
+                # already in flight finish: they are bounded by `concurrency`,
+                # and abandoning them would leave a worker blocked in
+                # writer.write() after ResultWriter.__exit__ had already joined
+                # the writer thread — a hang instead of a clean stop.
+                pool.shutdown(wait=True, cancel_futures=True)
                 raise
             else:
                 pool.shutdown(wait=True)
