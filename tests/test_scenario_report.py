@@ -182,3 +182,43 @@ def test_render_scenario_report_states_that_kappa_is_not_computable():
     md = render_scenario_report(by_model, {})
     assert "no operator rulings" in md.lower()
     assert "kappa" in md.lower()
+
+
+def test_completion_is_counted_from_rows_not_from_manifest_health():
+    # health.calls_ok covers only the LAST launch segment, so on any resumed
+    # backend it under-reports — four of seven manifests in the 2026-08-06 run
+    # misreport completion this way. Completion is rows on disk and distinct
+    # pair_ids, and the report has to say so where a reader will see it.
+    by_model = {
+        "resumed": votes("resumed", "p1", [("approve", "ok")] * 3)
+        + votes("resumed", "p2", [("approve", "ok")] * 3)
+    }
+    manifests = {"resumed": {"health": {"calls_ok": 1, "calls_failed": 0}}}
+    md = render_scenario_report(by_model, manifests)
+
+    assert "6" in md  # six rows on disk, not the 1 the health block claims
+    assert "calls_ok" in md
+    assert "last launch" in md.lower()
+
+
+def test_report_names_the_pairs_whose_reason_has_no_majority():
+    # A 1-1-1 reason split has no majority. tally_votes returns one anyway, and
+    # it is recorded indistinguishably from a 3-0 consensus (issue #12). Until
+    # that is representable, the report must at least name them, or a reader
+    # takes a fabricated tie-break for a settled ruling.
+    by_model = {
+        "m": votes(
+            "m",
+            "three-way-tie",
+            [("reject", "meaning_change"), ("reject", "ok"), ("reject", "overcorrection")],
+        )
+        + votes("m", "unanimous-pair", [("approve", "ok")] * 3)
+    }
+    md = render_scenario_report(by_model, {})
+    assert "no majority" in md.lower()
+
+    # Scoped to the caveats block: every pair also appears in the ruling queue,
+    # so a whole-document check would pass for the wrong reason.
+    fabricated_block = md.split("### Reason codes with no majority")[1].split("###")[0]
+    assert "three-way-tie" in fabricated_block
+    assert "unanimous-pair" not in fabricated_block
