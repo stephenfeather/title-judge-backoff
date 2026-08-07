@@ -6,13 +6,14 @@ only (never from config or code).
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -180,14 +181,28 @@ class RateLimiter:
 # only signal, and it means the bucket was too generous.
 RETRY_AFTER_DEFAULT_S = 30.0
 
+# Upper bound on any single backoff, however large a value the host asks for.
+# A leg that stalls longer than this should fail and be resumed rather than sit
+# under the limiter lock with nothing observable — an unbounded Retry-After
+# would park every backend on the host for as long as the header says.
+MAX_BACKOFF_S = 300.0
+
 
 def rate_limit_penalty(exc: BaseException) -> float | None:
     """Seconds to hold the host back for, or None if `exc` is not a 429.
 
-    `Retry-After` is honored when the host sends a plain number of seconds.
-    The header may legally be an HTTP-date instead; rather than parse dates we
-    fall back to the default, because guessing a small number is worse than
-    waiting a conservative one.
+    `Retry-After` is honored only when it is a finite, non-negative number of
+    seconds, and is clamped to MAX_BACKOFF_S. Everything else falls back to the
+    default. The rejected cases are not hypothetical pedantry:
+
+      * "inf" parses through float(). Feeding it to penalize() sets the host
+        deadline to infinity, and time.sleep(inf) then raises OverflowError —
+        aborting the leg, and every other backend on that host behind it.
+      * "nan" fails OPEN, which is worse. `nan > 0` is False so no sleep
+        happens, `_last` becomes nan, and every later comparison is nan too:
+        backoff is silently disabled on that host for the rest of the run.
+      * An HTTP-date is legal in this header. Rather than parse dates, fall
+        back — guessing a small number is worse than waiting a safe one.
     """
     if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 429:
         return None
@@ -195,14 +210,26 @@ def rate_limit_penalty(exc: BaseException) -> float | None:
     if raw is None:
         return RETRY_AFTER_DEFAULT_S
     try:
-        return float(raw)
+        seconds = float(raw)
     except ValueError:
         return RETRY_AFTER_DEFAULT_S
+    if not math.isfinite(seconds) or seconds < 0:
+        return RETRY_AFTER_DEFAULT_S
+    return min(seconds, MAX_BACKOFF_S)
 
 
 def limiter_host(base_url: str) -> str:
-    """The rate-limit key for a base_url: its host, ignoring path and scheme."""
-    return urlparse(base_url).netloc
+    """The rate-limit key for a base_url: its host, ignoring path and scheme.
+
+    Falls back to the first path segment when there is no scheme. urlparse puts
+    the whole string in `path` in that case, leaving netloc empty — and an empty
+    key would collapse EVERY schemeless backend into one shared limiter,
+    throttling unrelated providers against each other with no error to notice.
+    """
+    parsed = urlparse(base_url)
+    if parsed.netloc:
+        return parsed.netloc
+    return parsed.path.split("/", 1)[0]
 
 
 class LimiterRegistry:

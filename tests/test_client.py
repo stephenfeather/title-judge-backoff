@@ -6,11 +6,13 @@ import httpx
 import pytest
 
 from judge.client import (
+    MAX_BACKOFF_S,
     RETRY_AFTER_DEFAULT_S,
     Backend,
     JudgeClient,
     LimiterRegistry,
     RateLimiter,
+    limiter_host,
     load_backends,
     rate_limit_penalty,
 )
@@ -249,6 +251,44 @@ def test_rate_limit_penalty_falls_back_on_an_unparseable_retry_after():
     # Retry-After may legally be an HTTP-date. Rather than parse dates, fall
     # back — a wrong small number is worse than a conservative default.
     assert rate_limit_penalty(http_429("Wed, 21 Oct 2026 07:28:00 GMT")) == RETRY_AFTER_DEFAULT_S
+
+
+def test_rate_limit_penalty_rejects_a_non_finite_retry_after():
+    # `float("inf")` parses. Feeding it to penalize() poisons the host deadline:
+    # time.sleep(inf) raises OverflowError on this platform, so the leg aborts
+    # and every other backend on the host aborts behind it. `nan` is worse and
+    # fails OPEN — nan > 0 is False, so no sleep happens, _last becomes nan, and
+    # every later comparison is nan, silently disabling backoff for the run.
+    assert rate_limit_penalty(http_429("inf")) == RETRY_AFTER_DEFAULT_S
+    assert rate_limit_penalty(http_429("nan")) == RETRY_AFTER_DEFAULT_S
+
+
+def test_rate_limit_penalty_rejects_a_negative_retry_after():
+    assert rate_limit_penalty(http_429("-5")) == RETRY_AFTER_DEFAULT_S
+
+
+def test_rate_limit_penalty_is_bounded():
+    # Even a well-formed enormous value would park the host under the limiter
+    # lock with nothing observable. A bake-off leg should fail and be resumed,
+    # not silently sit still for eleven days.
+    assert rate_limit_penalty(http_429("999999")) == MAX_BACKOFF_S
+
+
+def test_limiter_host_does_not_collapse_schemeless_urls_into_one_bucket():
+    # urlparse puts everything in `path` when there is no scheme, so netloc is
+    # "" and EVERY schemeless backend keys to the same empty-string bucket —
+    # silently sharing one rate limit across unrelated providers. Latent today
+    # because every configured base_url carries a scheme, and invisible if it
+    # ever stops being true.
+    nvidia = limiter_host("integrate.api.nvidia.com/v1")
+    openai = limiter_host("api.openai.com/v1")
+    assert nvidia == "integrate.api.nvidia.com"
+    assert openai == "api.openai.com"
+    assert nvidia != openai
+
+
+def test_limiter_host_agrees_with_itself_across_scheme_presence():
+    assert limiter_host("https://api.x.ai/v1") == limiter_host("api.x.ai/v1")
 
 
 def test_penalize_delays_every_caller_on_the_host_not_just_the_one_that_429ed():
