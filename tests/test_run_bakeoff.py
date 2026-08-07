@@ -395,7 +395,7 @@ class RateLimitedClient(FakeClient):
 class MixedFailureClient(FakeClient):
     """Fails with a different exception type per pair, to exercise error_kinds."""
 
-    _KINDS = [ValueError, RuntimeError, TypeError, KeyError, ArithmeticError, OSError]
+    _KINDS = (ValueError, RuntimeError, TypeError, KeyError, ArithmeticError, OSError)
 
     def judge(self, pair, run_index=0):
         raise self._KINDS[int(pair.id.removeprefix("p")) % len(self._KINDS)](pair.id)
@@ -444,14 +444,79 @@ def test_result_writer_appends_rather_than_truncating(tmp_path):
     assert path.read_text().splitlines() == ["pre-existing", "new"]
 
 
+class _FailingFile:
+    """A file handle whose writes start failing partway through — a full disk."""
+
+    def __init__(self, real, fail_after):
+        self._real = real
+        self._fail_after = fail_after
+        self._writes = 0
+
+    def write(self, data):
+        self._writes += 1
+        if self._writes > self._fail_after:
+            raise OSError(28, "No space left on device")
+        return self._real.write(data)
+
+    def flush(self):
+        return self._real.flush()
+
+    def close(self):
+        return self._real.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._real.close()
+        return False
+
+
+class FullDiskWriter(ResultWriter):
+    FAIL_AFTER = 2
+
+    def _open(self):
+        return _FailingFile(open(self._path, "a"), self.FAIL_AFTER)
+
+
+def test_a_dead_writer_stops_the_workers_instead_of_burning_the_rest_of_the_run(tmp_path):
+    # P1. If persistence dies mid-run, continuing to call the API spends real
+    # money producing verdicts that are then discarded. Surfacing the error at
+    # the END of a multi-hour sweep is barely better than losing it silently,
+    # because the quota is already gone. Workers must notice and stop.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i:03d}") for i in range(60)]
+    # A per-call delay is not padding — it is the realistic case. A judge call
+    # takes seconds; the writer's local write+flush takes microseconds, so the
+    # writer is always far ahead and the guard sees the failure on the very
+    # next call. Without a delay the fake outruns its own writer by ~40 calls,
+    # which measures the fake rather than the guard.
+    client = FakeClient(backend, delay=0.002)
+
+    with pytest.raises(OSError):
+        run_backend(
+            backend,
+            pairs,
+            tmp_path,
+            votes=1,
+            concurrency=1,
+            limiters=no_sleep_limiters(),
+            client_factory=lambda b: client,
+            writer_factory=FullDiskWriter,
+        )
+
+    # The writer dies on write 3, so calls 1-3 are already paid for and one or
+    # two may be in flight. Anything approaching 60 means the guard does nothing.
+    assert len(client.calls) <= 8, f"kept calling the API after the writer died: {len(client.calls)}"
+
+
 def test_result_writer_reraises_a_failure_from_its_own_thread(tmp_path):
     # A writer that dies on a full disk would otherwise drop every verdict
     # after it in silence, and a multi-hour run would look like it simply
     # judged fewer pairs. The failure has to reach the caller's thread.
     unwritable = tmp_path / "nope" / "out.jsonl"  # parent does not exist
-    with pytest.raises(FileNotFoundError):
-        with ResultWriter(unwritable) as writer:
-            writer.write("lost")
+    with pytest.raises(FileNotFoundError), ResultWriter(unwritable) as writer:
+        writer.write("lost")
 
 
 def test_run_slate_with_no_runnable_backends_is_a_no_op(tmp_path):
@@ -638,6 +703,40 @@ def test_health_error_kinds_are_reported_in_a_stable_order(tmp_path):
     assert list(error_kinds) == sorted(error_kinds)
 
 
+def test_an_interrupt_stops_scheduling_rather_than_draining_the_queue(tmp_path):
+    # Every vote is submitted up front, so a plain shutdown(wait=True) would
+    # keep sending the remaining PAID requests — potentially for hours — before
+    # the interrupt propagated. Two runs were killed by hand on 2026-08-06; an
+    # operator pressing Ctrl-C expects the spend to stop.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i:03d}") for i in range(80)]
+
+    class InterruptingClient(FakeClient):
+        def judge(self, pair, run_index=0):
+            # super() records the call, so counting here too would double it.
+            result = super().judge(pair, run_index)
+            if len(self.calls) == 3:
+                raise KeyboardInterrupt("operator pressed ctrl-c")
+            return result
+
+    # As above, a per-call delay is the realistic shape: cancellation only has
+    # to outrun the NEXT call, which in production is seconds away.
+    client = InterruptingClient(backend, delay=0.002)
+    with pytest.raises(KeyboardInterrupt):
+        run_backend(
+            backend,
+            pairs,
+            tmp_path,
+            votes=1,
+            concurrency=1,
+            limiters=no_sleep_limiters(),
+            client_factory=lambda b: client,
+        )
+    # KeyboardInterrupt is a BaseException, so judge_one's `except Exception`
+    # does not swallow it — it must reach the pool and cancel what is pending.
+    assert len(client.calls) < 20, f"kept spending after the interrupt: {len(client.calls)}"
+
+
 def test_run_backend_resume_writes_no_duplicate_votes(tmp_path):
     # Acceptance 2: resume after a mid-run kill yields zero duplicate
     # (pair_id, run_index). The todo list is partitioned ONCE up front; a worker
@@ -681,7 +780,8 @@ def test_run_backend_resume_writes_no_duplicate_votes(tmp_path):
     keys = [(v["pair_id"], v["run_index"]) for v in read_verdicts(results_path)]
     assert len(keys) == len(set(keys)) == 30
     # Resumed votes are judged exactly once, and the completed ones not at all.
-    assert sorted(client.calls) == sorted(set([(p.id, r) for p in pairs for r in range(3)]) - set(already))
+    owed = {(p.id, r) for p in pairs for r in range(3)} - set(already)
+    assert sorted(client.calls) == sorted(owed)
 
 
 def test_run_backend_records_every_latency_under_concurrency(tmp_path):
@@ -747,6 +847,42 @@ def test_run_slate_at_concurrency_1_runs_backends_in_slate_order(tmp_path):
         client_factory=factory,
     )
     assert order == [("start", "b0"), ("start", "b1"), ("start", "b2")]
+
+
+def test_run_slate_registers_every_host_limiter_before_any_call_departs(tmp_path):
+    # Raised by the adversarial review, and real. The registry only ever
+    # TIGHTENS, but tightening is useless if it happens after the calls have
+    # already left: for_backend() is called inside each backend's own task, so
+    # a high-rpm backend can run at its own rate before a low-rpm sibling on
+    # the same host has registered at all. At concurrency 1 the first backend
+    # can finish its entire leg first. That is an over-rate burst on a shared
+    # host — the exact 503-storm class of failure host-keying exists to stop.
+    host = "https://integrate.api.nvidia.com/v1"
+    fast = concurrency_backend("fast", base_url=host, rpm=6000)  # interval 0.01
+    slow = concurrency_backend("slow", base_url=host, rpm=60)  # interval 1.0
+    registry = no_sleep_limiters()
+    intervals_in_force = []
+
+    class IntervalSpyClient(FakeClient):
+        def judge(self, pair, run_index=0):
+            # White-box on purpose: the effective rate at the moment a call
+            # departs is the property under test, and asserting it on wall
+            # clock would be flaky.
+            intervals_in_force.append(registry.for_backend(self.backend)._interval)
+            return super().judge(pair, run_index)
+
+    run_slate(
+        [fast, slow],
+        [make_pair("p0")],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=registry,
+        client_factory=IntervalSpyClient,
+    )
+    # Both backends share one host, so both must depart at the tightest
+    # declared rate — including the one that got there first.
+    assert intervals_in_force == [1.0, 1.0]
 
 
 def test_run_slate_does_not_let_one_slow_backend_delay_the_others(tmp_path):
@@ -846,5 +982,5 @@ def test_already_judged_ids_is_independent_of_line_order(tmp_path):
     random.Random(1).shuffle(scrambled)
     shuffled.write_text("".join(line + "\n" for line in scrambled))
 
-    config = dict(model_id="m", prompt_version="v1", temperature=None, reasoning_effort=None)
+    config = {"model_id": "m", "prompt_version": "v1", "temperature": None, "reasoning_effort": None}
     assert already_judged_ids(ordered, **config) == already_judged_ids(shuffled, **config)

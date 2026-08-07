@@ -23,9 +23,10 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable
+from typing import Self
 
 from judge.check import check_key_presence, ping_backend, render_check_report
 from judge.client import (
@@ -37,7 +38,12 @@ from judge.client import (
     rate_limit_penalty,
 )
 from judge.prompts import PROMPT_VERSION
-from judge.schema import Pair, pair_from_dict, verdict_from_json_line, verdict_to_json_line
+from judge.schema import (
+    Pair,
+    pair_from_dict,
+    verdict_from_json_line,
+    verdict_to_json_line,
+)
 
 # Majority-of-3 is the efficient point: it cuts effective flip rate from ~13% to
 # ~5% and judge-noise sd(kappa) from ~0.048 to ~0.030 — below the +/-0.057
@@ -226,6 +232,15 @@ def load_pairs(path: Path) -> list[Pair]:
     return [pair_from_dict(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
 
 
+class WriterGone(RuntimeError):
+    """Raised in a worker when the results writer has died.
+
+    Stops the pool so the run cannot go on spending paid API calls whose
+    verdicts have nowhere to land. The writer's own exception is the root cause
+    and is what ultimately surfaces, out of ResultWriter.__exit__.
+    """
+
+
 class ResultWriter:
     """The single writer for one results file, fed by a queue.
 
@@ -244,7 +259,7 @@ class ResultWriter:
         self._thread = threading.Thread(target=self._drain, name=f"writer-{path.name}")
         self._failure: BaseException | None = None
 
-    def __enter__(self) -> ResultWriter:
+    def __enter__(self) -> Self:
         self._thread.start()
         return self
 
@@ -257,12 +272,29 @@ class ResultWriter:
         if self._failure is not None:
             raise self._failure
 
+    @property
+    def failure(self) -> BaseException | None:
+        """The error that killed the writer, or None while it is healthy.
+
+        Workers must consult this BEFORE spending another API call. Persistence
+        being gone does not stop the run on its own: `write()` still accepts,
+        the drain loop still runs, and every remaining worker keeps making PAID
+        requests whose verdicts are then discarded. On a multi-hour sweep that
+        is the worst failure this runner has — the money is gone by the time
+        __exit__ reports it.
+        """
+        return self._failure
+
+    def _open(self):
+        """Seam: tests substitute a handle that starts failing mid-run."""
+        return open(self._path, "a")
+
     def write(self, line: str) -> None:
         self._queue.put(line)
 
     def _drain(self) -> None:
         try:
-            with open(self._path, "a") as fh:
+            with self._open() as fh:
                 while (item := self._queue.get()) is not self._STOP:
                     fh.write(item + "\n")
                     fh.flush()
@@ -315,6 +347,7 @@ def run_backend(
     concurrency: int = 1,
     limiters: LimiterRegistry | None = None,
     client_factory: Callable[[Backend], JudgeClient] = JudgeClient,
+    writer_factory: Callable[[Path], ResultWriter] = ResultWriter,
 ) -> None:
     """Judge every owed vote for one backend, `concurrency` calls in flight.
 
@@ -346,6 +379,11 @@ def run_backend(
 
     def judge_one(item: tuple[Pair, int], writer: ResultWriter) -> None:
         pair, run_index = item
+        # Never spend a paid call we cannot persist. Checked before the limiter
+        # so a dead writer stops the run in the time it takes the in-flight
+        # calls to land, rather than at the end of a multi-hour sweep.
+        if writer.failure is not None:
+            raise WriterGone(f"results writer died: {writer.failure!r}")
         i = health.claim_attempt()
         limiter.wait()
         started = time.monotonic()
@@ -377,13 +415,25 @@ def run_backend(
             print(f"[{backend.name}] {i}/{len(todo)}")
 
     try:
-        with ResultWriter(results_path) as writer:
-            with ThreadPoolExecutor(
+        with writer_factory(results_path) as writer:
+            pool = ThreadPoolExecutor(
                 max_workers=concurrency, thread_name_prefix=f"judge-{backend.name}"
-            ) as pool:
+            )
+            try:
                 futures = [pool.submit(judge_one, item, writer) for item in todo]
                 for future in futures:
                     future.result()  # surface anything judge_one did not catch
+            except BaseException:
+                # Every vote is submitted up front, so a plain
+                # shutdown(wait=True) would keep sending the REMAINING paid
+                # requests — possibly for hours — before a Ctrl-C propagated.
+                # An operator killing a run expects the spend to stop.
+                # BaseException, not Exception: KeyboardInterrupt is the case
+                # that matters most and is not an Exception.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                pool.shutdown(wait=True)
         # Written after the run so observed_models reflects every snapshot that
         # actually answered, including a mid-run swap.
         manifest_path = out_dir / f"{backend.name}.manifest.json"
@@ -435,6 +485,16 @@ def run_slate(
     if not backends:
         return
     limiters = limiters or LimiterRegistry()
+
+    # Register the WHOLE slate before any backend sends anything. The registry
+    # only ever tightens, but tightening after the calls have left is useless:
+    # for_backend() used to be reached on each backend's own thread, so a
+    # loose-rpm backend could run at its own rate until a stricter sibling on
+    # the same host registered — and at concurrency 1 it could finish its
+    # entire leg first. That is a quota burst on a shared host, which is the
+    # one thing host-keying exists to prevent.
+    for backend in backends:
+        limiters.for_backend(backend)
 
     def run_one(backend: Backend) -> None:
         run_backend(
