@@ -2,7 +2,7 @@ import random
 
 import pytest
 
-from judge.schema import Pair, ReasonCode, Verdict
+from judge.schema import Pair, ReasonCode, Verdict, verdict_to_json_line
 from judge.stats import intervals_overlap
 from judge.vote import tally_votes
 from score import ModelScore, cohens_kappa, render_leaderboard, score_model, separability_tiers
@@ -339,7 +339,15 @@ def test_leaderboard_shows_spread_and_flip_columns():
 ORDER_VERDICTS = (
     votes_for("p1", [("approve", "ok"), ("reject", "meaning_change"), ("approve", "ok")])
     + votes_for("p2", [("approve", "ok"), ("approve", "ok"), ("reject", "casing_error")])
-    + votes_for("p3", [("reject", "meaning_change")] * 3)
+    # p3 is modelled on deepseek's e10-4fd6ba61ea52 from the 2026-08-06 S1 run:
+    # verdict settled 3-0, reason split three ways. Only the tie-break decides
+    # its reason, so any order dependence shows up here first. `reason` has five
+    # codes and demonstrably splits three ways in production; `verdict` is
+    # binary and cannot, which is why the reason column is the real exposure.
+    + votes_for(
+        "p3",
+        [("reject", "meaning_change"), ("reject", "ok"), ("reject", "overcorrection")],
+    )
     + votes_for("p4", [("reject", "casing_error"), ("approve", "ok"), ("reject", "casing_error")])
 )
 
@@ -350,6 +358,52 @@ def test_score_model_is_independent_of_verdict_order():
         shuffled = list(ORDER_VERDICTS)
         random.Random(seed).shuffle(shuffled)
         assert score_model(PAIRS, shuffled) == baseline, f"seed {seed} scored differently"
+
+
+def test_scoring_a_shuffled_results_file_is_byte_identical(tmp_path):
+    # Acceptance 5, end to end and through the file layer: write a results
+    # file, shuffle its LINES, score both, compare every reported number.
+    #
+    # This is not hypothetical. Resume already breaks pair-then-vote order
+    # today with no concurrency involved: when a vote fails, its retry appends
+    # at the end of the file on the next launch. In the 2026-08-06 S1 run that
+    # left 47 of deepseek's 200 pairs with their votes out of run_index order,
+    # and it silently decided the reason code on two three-way ties.
+    lines = [verdict_to_json_line(v) for v in ORDER_VERDICTS]
+
+    ordered_path = tmp_path / "ordered.jsonl"
+    shuffled_path = tmp_path / "shuffled.jsonl"
+    ordered_path.write_text("".join(f"{line}\n" for line in lines))
+
+    scrambled = list(lines)
+    random.Random(20260806).shuffle(scrambled)
+    assert scrambled != lines, "fixture did not actually shuffle"
+    shuffled_path.write_text("".join(f"{line}\n" for line in scrambled))
+
+    from score import load_verdicts, render_leaderboard
+
+    ordered_score = score_model(PAIRS, load_verdicts(ordered_path))
+    shuffled_score = score_model(PAIRS, load_verdicts(shuffled_path))
+
+    assert shuffled_score == ordered_score
+    # Including the CI, which a seeded bootstrap over a reordered sequence
+    # would silently move, and the rendered report the operator actually reads.
+    assert shuffled_score.kappa_ci == ordered_score.kappa_ci
+    assert render_leaderboard([shuffled_score]) == render_leaderboard([ordered_score])
+
+
+def test_resume_style_reordering_does_not_change_the_ruling():
+    # The exact shape resume produces: a failed vote retried on a later launch
+    # lands AFTER every other pair's votes rather than beside its siblings.
+    # Modelled on deepseek's e10-4fd6ba61ea52, whose run_index 0 sat at file
+    # position 521 while its run_index 1 and 2 sat at positions 28 and 29.
+    in_order = list(ORDER_VERDICTS)
+    late, rest = [], []
+    for v in in_order:
+        (late if v.run_index == 0 else rest).append(v)
+    resumed = rest + late  # every vote 0 retried at the end
+
+    assert score_model(PAIRS, resumed) == score_model(PAIRS, in_order)
 
 
 def test_majority_verdict_tie_is_broken_by_run_index_not_file_position():
