@@ -5,7 +5,13 @@ import pytest
 from judge.schema import Pair, ReasonCode, Verdict, verdict_to_json_line
 from judge.stats import intervals_overlap
 from judge.vote import tally_votes
-from score import ModelScore, cohens_kappa, render_leaderboard, score_model, separability_tiers
+from score import (
+    ModelScore,
+    cohens_kappa,
+    render_leaderboard,
+    score_model,
+    separability_tiers,
+)
 
 
 def make_pair(pair_id, ground_truth, reason):
