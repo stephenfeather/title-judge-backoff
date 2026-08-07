@@ -197,6 +197,97 @@ def _health_table(manifests: dict[str, dict]) -> list[str]:
     return lines
 
 
+def _completion_table(
+    by_model: dict[str, list[Verdict]], manifests: dict[str, dict]
+) -> list[str]:
+    """Rows actually on disk per backend, next to what the health block claims.
+
+    `health.calls_ok` covers only the LAST launch segment, so any backend that
+    was resumed under-reports — four of seven manifests in the 2026-08-06 run
+    misreport completion this way. Completion is the row count and the distinct
+    pair count; the health block is a per-launch operational record and nothing
+    more. Both are shown together so the discrepancy is visible rather than a
+    thing you have to know.
+    """
+    lines = [
+        "| Backend | Rows on disk | Distinct pairs | health.calls_ok (last launch only) |",
+        "|---|---|---|---|",
+    ]
+    for name in sorted(by_model):
+        verdicts = by_model[name]
+        claimed = manifests.get(name, {}).get("health", {}).get("calls_ok")
+        lines.append(
+            f"| {name} | {len(verdicts)} | {len({v.pair_id for v in verdicts})} | "
+            f"{'-' if claimed is None else claimed} |"
+        )
+    return lines
+
+
+def unsettled_reason_pairs(verdicts: list[Verdict]) -> list[str]:
+    """Pairs whose reason votes were all different — a tie with no majority.
+
+    `majority()` returns a value anyway, so these are recorded exactly like a
+    unanimous ruling. Naming them is the cheapest honest mitigation until the
+    no-majority case is representable (issue #12).
+    """
+    grouped: dict[str, list[str]] = {}
+    for v in verdicts:
+        grouped.setdefault(v.pair_id, []).append(v.reason.value)
+    return sorted(
+        pair_id
+        for pair_id, reasons in grouped.items()
+        if len(reasons) > 1 and len(set(reasons)) == len(reasons)
+    )
+
+
+def _caveats_section(by_model: dict[str, list[Verdict]], manifests: dict[str, dict]) -> list[str]:
+    lines = [
+        "## Caveats — read before quoting any number above",
+        "",
+        "### Completion is rows on disk, never health.calls_ok",
+        "",
+        "The manifest health block describes only the **last launch segment**, so a",
+        "backend that was resumed reports far fewer calls than it actually has rows.",
+        "Use this table for completion:",
+        "",
+        *_completion_table(by_model, manifests),
+        "",
+    ]
+
+    fabricated = {
+        name: unsettled_reason_pairs(verdicts)
+        for name, verdicts in by_model.items()
+        if unsettled_reason_pairs(verdicts)
+    }
+    lines += [
+        "### Reason codes with no majority are fabricated, not agreed",
+        "",
+        "Where a pair's reason votes are all different there is **no majority**.",
+        "`majority()` returns one regardless, and it is recorded indistinguishably",
+        "from a unanimous ruling. Since PR #10 that choice is reproducible; it is",
+        "still not correct, and the per-reason confusion matrix consumes it as a",
+        "real observation. Tracked as issue #12.",
+        "",
+    ]
+    if fabricated:
+        for name in sorted(fabricated):
+            lines.append(f"- **{name}**: {', '.join(fabricated[name])}")
+    else:
+        lines.append("- None in this run.")
+    lines += [
+        "",
+        "### Throughput claims are unverified against a live provider",
+        "",
+        "The concurrency work in PR #10 proves its speedup against a fake client with",
+        "injected latency. No live provider has been measured, so the projected",
+        "wall-clock figures in issue #9 remain projections. Six of the ten configured",
+        "backends also share `integrate.api.nvidia.com`, and therefore one rate-limit",
+        "bucket, so cross-host parallelism buys less than a full slate suggests.",
+        "",
+    ]
+    return lines
+
+
 def render_scenario_report(
     by_model: dict[str, list[Verdict]], manifests: dict[str, dict], *, queue_size: int = 40
 ) -> str:
@@ -255,8 +346,12 @@ def render_scenario_report(
         "",
         "## Operational health",
         "",
+        "Per-LAUNCH figures, not cumulative — see Caveats below before reading",
+        "these as completion.",
+        "",
         *(_health_table(manifests) if manifests else ["_No manifests found._"]),
         "",
+        *_caveats_section(by_model, manifests),
         "## Ruling queue (most contested first)",
         "",
         f"{len(contested)} of {len(ranking)} pairs are contested — models disagreed with",
