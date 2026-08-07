@@ -239,6 +239,11 @@ def order_rows(
     changes the calibration set most. Ties keep pack order, so the sequence is
     deterministic and a re-run presents rows the same way.
 
+    Rows the judges could not DECIDE lead, ahead of rows they merely disagreed
+    about. Flip rate alone missed them: a unanimous verdict whose reason codes
+    split dead even has a verdict flip rate of 0.0, so it sorted in with the
+    calm rows despite being the clearest evidence the rubric is ambiguous.
+
     Rows the sweep never judged sort last rather than first: no verdicts is not
     the same as no disagreement, and ranking them as calm would bury rows nobody
     has looked at yet behind rows everyone agreed on. With no sweep data at all,
@@ -247,12 +252,19 @@ def order_rows(
     if order == ORDER_PACK or not stats:
         return list(rows)
 
-    def rank(indexed: tuple[int, dict]) -> tuple[int, float, int]:
+    def rank(indexed: tuple[int, dict]) -> tuple[int, int, float, int]:
         index, row = indexed
         stat = stats.get(row["id"])
         if stat is None:
-            return (1, 0.0, index)  # unjudged: last, pack order among themselves
-        return (0, -stat.flip_rate, index)
+            return (1, 0, 0.0, index)  # unjudged: last, pack order among themselves
+        # A pair the judges DEADLOCKED on leads, ahead of one they merely
+        # wobbled over. Ranking on flip rate alone missed these entirely: a
+        # unanimous "reject" whose reason codes split dead even scores a
+        # verdict flip rate of 0.0 and filed itself with the calm rows —
+        # behind rows every judge agreed on. It is the pair most in need of a
+        # human, and the operator's attention is the scarce resource here.
+        undecided = 0 if (stat.settled and stat.reason_settled) else 1
+        return (0, -undecided, -stat.flip_rate, index)
 
     return [row for _, row in sorted(enumerate(rows), key=rank)]
 

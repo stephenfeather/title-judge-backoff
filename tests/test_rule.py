@@ -381,6 +381,51 @@ def test_rows_the_sweep_never_judged_go_last_in_pack_order():
     assert [r["id"] for r in ordered] == ["split", "calm", "unjudged1", "unjudged2"]
 
 
+def test_a_pair_the_judges_could_not_decide_comes_first():
+    # Issue #21, the ordering half. A card that shouts UNDECIDED is worthless
+    # if the row sits at position 180 of a 200-row pass. The pair the judges
+    # deadlocked on is the pair most in need of a human, so it leads.
+    verdicts = (
+        # e10-816b0c7d2b94 shape: unanimous reject, reason dead even 14/14. Its
+        # VERDICT flip rate is 0.0, so ranking on flip rate alone filed it with
+        # the pairs everyone agreed on — behind a unanimous row, in fact.
+        [Verdict("tied-reason", "reject", ReasonCode.OK, f"a{i}", "v1", 0.0) for i in range(14)]
+        + [
+            Verdict("tied-reason", "reject", ReasonCode.CASING_ERROR, f"b{i}", "v1", 0.0)
+            for i in range(14)
+        ]
+        + [Verdict("calm", "approve", ReasonCode.OK, f"c{i}", "v1", 0.0) for i in range(4)]
+        + [
+            Verdict("wobbly", "approve", ReasonCode.OK, "d0", "v1", 0.0),
+            Verdict("wobbly", "reject", ReasonCode.CASING_ERROR, "d1", "v1", 0.0),
+            Verdict("wobbly", "approve", ReasonCode.OK, "d2", "v1", 0.0),
+        ]
+    )
+    stats = flips.flip_stats(verdicts)
+    rows = [row("calm"), row("tied-reason"), row("wobbly")]
+    ordered = [r["id"] for r in rule.order_rows(rows, stats)]
+    assert ordered[0] == "tied-reason"
+    # A merely-wobbly pair still beats a calm one.
+    assert ordered == ["tied-reason", "wobbly", "calm"]
+
+
+def test_a_tied_verdict_also_leads():
+    verdicts = [
+        Verdict("deadlock", "approve", ReasonCode.OK, f"a{i}", "v1", 0.0) for i in range(16)
+    ] + [
+        Verdict("deadlock", "reject", ReasonCode.CASING_ERROR, f"b{i}", "v1", 0.0)
+        for i in range(16)
+    ]
+    verdicts += [
+        Verdict("wobbly", "approve", ReasonCode.OK, "d0", "v1", 0.0),
+        Verdict("wobbly", "reject", ReasonCode.CASING_ERROR, "d1", "v1", 0.0),
+        Verdict("wobbly", "approve", ReasonCode.OK, "d2", "v1", 0.0),
+    ]
+    stats = flips.flip_stats(verdicts)
+    ordered = [r["id"] for r in rule.order_rows([row("wobbly"), row("deadlock")], stats)]
+    assert ordered[0] == "deadlock"
+
+
 def test_without_sweep_data_pack_order_is_preserved():
     rows = [row("a"), row("b"), row("c")]
     assert [r["id"] for r in rule.order_rows(rows, {})] == ["a", "b", "c"]

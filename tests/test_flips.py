@@ -125,15 +125,29 @@ def test_pane_rate_is_the_same_function_the_vote_tally_uses():
     assert stats["a"].flip_rate == flip_rate(values)
 
 
-def test_majority_tie_breaks_by_first_occurrence():
-    """Matches `judge.vote.majority` — a re-run must not relabel a split pair."""
+def test_a_tied_pair_has_no_majority_rather_than_a_tie_broken_one():
+    """Issue #21. This card feeds the pass where GROUND TRUTH is created, so a
+    fabricated value here anchors a label nothing can later recompute."""
     stats = flips.flip_stats(
         [
             verdict("a", "reject", ReasonCode.CASING_ERROR, "m1"),
             verdict("a", "approve", ReasonCode.OK, "m2"),
         ]
     )
-    assert stats["a"].majority == "reject"
+    assert stats["a"].majority is None
+    assert stats["a"].settled is False
+
+
+def test_a_clear_pair_still_reports_its_majority():
+    stats = flips.flip_stats(
+        [
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "approve", ReasonCode.OK, "m2"),
+            verdict("a", "reject", ReasonCode.CASING_ERROR, "m3"),
+        ]
+    )
+    assert stats["a"].majority == "approve"
+    assert stats["a"].settled is True
 
 
 def test_repeat_verdicts_from_one_model_count_as_repeats():
@@ -358,3 +372,74 @@ def test_render_flip_pane_counts_votes_and_models_separately():
 
 def test_render_flip_pane_without_stats_is_empty():
     assert flips.render_flip_pane(None) == ""
+
+
+# --- undecided must be unmissable (issue #21) -------------------------------
+#
+# Fixtures are the three real ties measured across the pooled 2026-08-06 run:
+#   e10-4f92576a25bf  verdict  approve 16 / reject 16          n=32
+#   e10-816b0c7d2b94  reason   ok 14 / casing_error 14         n=33
+#   e10-8a1d3065c6e8  reason   overcorrection 12 / ok 12       n=33
+
+
+def split_verdicts(pair_id, approve, reject):
+    """`approve` + `reject` judgments spread across distinct models."""
+    return [
+        verdict(pair_id, "approve", ReasonCode.OK, f"m{i}") for i in range(approve)
+    ] + [
+        verdict(pair_id, "reject", ReasonCode.CASING_ERROR, f"m{approve + i}")
+        for i in range(reject)
+    ]
+
+
+def test_pane_says_undecided_when_the_verdict_is_tied():
+    # e10-4f92576a25bf: 16-16 across 32 judgments from eight models. Not a coin
+    # flip on thin data — deep, well-sampled disagreement, and the single pair
+    # an operator most needs flagged rather than summarised.
+    stats = flips.flip_stats(split_verdicts("e10-4f92576a25bf", 16, 16))
+    pane = flips.render_flip_pane(stats["e10-4f92576a25bf"])
+    assert "UNDECIDED" in pane
+    # The counts must still be there — the flag explains them, it does not
+    # replace them.
+    assert "approve 16" in pane and "reject 16" in pane
+
+
+def test_pane_does_not_cry_undecided_when_the_judges_agreed():
+    # A 17-15 split is contested but decided. Flagging it too would make the
+    # marker noise, and a marker that fires on everything flags nothing.
+    stats = flips.flip_stats(split_verdicts("clear", 17, 15))
+    pane = flips.render_flip_pane(stats["clear"])
+    assert "UNDECIDED" not in pane
+
+
+def test_pane_flags_a_tied_reason_even_when_the_verdict_settled():
+    # e10-816b0c7d2b94: every judge said reject, but ok 14 / casing_error 14 on
+    # WHY. The verdict is real; the reason is not, and the reason is what the
+    # per-reason confusion matrix will score once rulings exist.
+    verdicts = (
+        [verdict("e10-816b0c7d2b94", "reject", ReasonCode.OK, f"a{i}") for i in range(14)]
+        + [
+            verdict("e10-816b0c7d2b94", "reject", ReasonCode.CASING_ERROR, f"b{i}")
+            for i in range(14)
+        ]
+        + [
+            verdict("e10-816b0c7d2b94", "reject", ReasonCode.OVERCORRECTION, f"c{i}")
+            for i in range(5)
+        ]
+    )
+    pane = flips.render_flip_pane(flips.flip_stats(verdicts)["e10-816b0c7d2b94"])
+    banner = pane.splitlines()[0]
+    assert "UNDECIDED" in banner
+    # Specifically the REASON, not the verdict — asserting the bare word
+    # "reason" would pass off the reasons breakdown line and prove nothing.
+    assert "reason (" in banner
+    assert "verdict (" not in banner
+    assert "ok 14 = casing_error 14" in banner or "casing_error 14 = ok 14" in banner
+
+
+def test_undecided_marker_is_on_the_headline_line():
+    # A marker buried under the reason breakdown is a marker an operator
+    # scanning a 200-row pass will miss, which is the whole failure mode.
+    stats = flips.flip_stats(split_verdicts("tied", 16, 16))
+    pane = flips.render_flip_pane(stats["tied"])
+    assert "UNDECIDED" in pane.splitlines()[0]
