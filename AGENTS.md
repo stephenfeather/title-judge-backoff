@@ -23,9 +23,16 @@ uv run pytest -x -q                         # stop on first failure, quiet
 - **No live API calls in tests — ever.** HTTP behavior is tested with
   `httpx.MockTransport`; time/rate limiting with injected `now`/`sleep`
   callables. A test must pass with no network and no API keys set.
-- **Synthetic fixtures only.** Invented titles (e.g. "Acme Widget 3000").
-  Never put vendor-derived titles or real calibration pairs in tests —
-  `*.jsonl` is gitignored for a reason, and this repo may go public.
+- **Synthetic fixtures only.** Invented titles (e.g. "Acme Widget 3000") and
+  invented pair ids (e.g. `e10-aaa`). Never put vendor-derived titles, real
+  pair ids, or their measured vote distributions in tests — **this repo IS
+  public**, so anything committed is published the moment it lands. `*.jsonl`
+  is gitignored for that reason.
+
+  This line used to read "may go public", and both a human and an agent read
+  it as a future concern while copying real pair ids into fixtures. It is not
+  a future concern. The same rule applies to anything else that gets published
+  from here — issue bodies, PR descriptions, commit messages.
 - **TDD is house policy.** Write the failing test first, watch it fail,
   then implement. New behavior in `judge/`, `run_bakeoff.py`, or `score.py`
   needs a test in `tests/`.
