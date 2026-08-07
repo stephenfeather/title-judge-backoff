@@ -113,8 +113,42 @@ Runs are resumable: re-running `run_bakeoff.py` skips the individual
 `(pair, vote)` calls a backend has already made, so a run interrupted after 2
 of 3 votes resumes at the third rather than re-judging or skipping the pair.
 Resuming across a changed `temperature`, `reasoning_effort`, `model_id`, or
-`prompt_version` is refused outright — use a fresh `--out` directory. Calls are
-rate-limited per backend (`rpm` in `backends.toml`).
+`prompt_version` is refused outright — use a fresh `--out` directory.
+
+### Concurrency
+
+`--concurrency N` sets how many calls each backend keeps in flight, and any
+`N > 1` also runs the backends themselves in parallel. The default of 1 is
+fully serial on both axes, so it reproduces pre-concurrency runs exactly.
+
+Serial throughput is `1 / max(60/rpm, latency)`, so a backend slower than its
+own rate interval never spends the budget it already has. On the 2026-08-06
+sweep grok, deepseek and inkling each ran at ~14–15% of their declared `rpm`.
+Raising `--concurrency` recovers that without asking any provider for extra
+quota.
+
+**Rate limits are enforced per HOST, not per backend.** Six `nvidia-*` backends
+share `integrate.api.nvidia.com` and share its quota; one limiter per host is
+what stops eight workers across two backends from asking one endpoint for twice
+its allowance. A host runs at the lowest `rpm` any of its backends declares.
+This is not theoretical: running nemotron alongside deepseek on 2026-08-06 drove
+deepseek from p50 2.48s with zero failures to p50 9.77s with 81.
+
+A `429` holds the whole host back, not just the worker that received it, for
+`Retry-After` seconds where the host sends one and 30s where it does not.
+DeepInfra sends no rate-limit headers at all, so on that host headroom is not
+discoverable in advance — a declared `rpm` is a request, and a 429 is the reply.
+The 429'd call is not retried within the run; resume picks it up next launch.
+
+Because workers finish out of order, verdict lines are no longer written in
+pair-then-vote order. Nothing downstream depends on line order — resume keys on
+`(pair_id, run_index)` and scoring orders by the pairs file — but hand-written
+tooling that assumed the old ordering should not.
+
+Note that line order was **already** not guaranteed before concurrency: a vote
+that fails is retried on the next launch and appends at the end of the file. In
+the 2026-08-06 S1 run that left 47 of deepseek's 200 pairs with their votes out
+of `run_index` order.
 
 ## Backend roles and protocols
 

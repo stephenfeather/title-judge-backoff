@@ -1,9 +1,21 @@
 import json
+import threading
+import time
 
 import httpx
 import pytest
 
-from judge.client import Backend, JudgeClient, RateLimiter, load_backends
+from judge.client import (
+    MAX_BACKOFF_S,
+    RETRY_AFTER_DEFAULT_S,
+    Backend,
+    JudgeClient,
+    LimiterRegistry,
+    RateLimiter,
+    limiter_host,
+    load_backends,
+    rate_limit_penalty,
+)
 from judge.schema import Pair, ReasonCode
 
 BACKENDS_TOML = """\
@@ -111,6 +123,212 @@ def test_rate_limiter_spaces_calls_by_rpm():
     clock["now"] += 0.5
     limiter.wait()          # 0.5s later: wait the remaining 1.5s
     assert sleeps == [2.0, 1.5]
+
+
+def limiter_backend(name, base_url, rpm):
+    return Backend(
+        name=name,
+        base_url=base_url,
+        model_id=f"model/{name}",
+        rpm=rpm,
+        eval_only=False,
+        api_key_env="NVIDIA_API_KEY",
+    )
+
+
+def test_rate_limiter_does_not_release_concurrent_callers_together():
+    # The serial limiter reads _last, sleeps, then writes _last. N threads can
+    # all read the SAME _last, all sleep one interval, and all fire at once —
+    # which is how two NVIDIA backends asked one host for 80 rpm and got 503s.
+    # Real clock on purpose: a virtual clock advanced by a fake sleep cannot
+    # observe simultaneity, and simultaneity is the whole bug.
+    interval = 0.02
+    limiter = RateLimiter(rpm=int(60 / interval))
+    limiter.wait()  # prime _last so every thread races the same stale value
+    gate = threading.Barrier(6)
+    released = []
+    lock = threading.Lock()
+
+    def worker():
+        gate.wait()
+        limiter.wait()
+        with lock:
+            released.append(time.monotonic())
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Six calls one interval apart span five intervals. Unlocked they all land
+    # within roughly one, so the span is the discriminator, not the count.
+    span = max(released) - min(released)
+    assert span >= 4 * interval, f"6 calls released within {span:.3f}s of each other"
+
+
+def test_limiter_registry_shares_one_limiter_across_backends_on_the_same_host():
+    # Six nvidia-* backends share integrate.api.nvidia.com and its quota. Keyed
+    # per backend they would ask for 6x40 rpm; keyed per host they ask for 40.
+    registry = LimiterRegistry(sleep=lambda _: None)
+    deepseek = limiter_backend("nvidia-deepseek", "https://integrate.api.nvidia.com/v1", 40)
+    nemotron = limiter_backend("nvidia-nemotron", "https://integrate.api.nvidia.com/v1", 40)
+    assert registry.for_backend(deepseek) is registry.for_backend(nemotron)
+
+
+def test_limiter_registry_separates_unrelated_hosts():
+    registry = LimiterRegistry(sleep=lambda _: None)
+    nvidia = limiter_backend("nvidia-deepseek", "https://integrate.api.nvidia.com/v1", 40)
+    xai = limiter_backend("xai-grok", "https://api.x.ai/v1", 60)
+    assert registry.for_backend(nvidia) is not registry.for_backend(xai)
+
+
+def test_limiter_registry_ignores_path_when_keying_on_host():
+    # Two base_urls on one host with different paths are still one quota.
+    registry = LimiterRegistry(sleep=lambda _: None)
+    a = limiter_backend("a", "https://generativelanguage.googleapis.com/v1beta/openai", 60)
+    b = limiter_backend("b", "https://generativelanguage.googleapis.com/v1", 60)
+    assert registry.for_backend(a) is registry.for_backend(b)
+
+
+def test_limiter_registry_tightens_to_the_lowest_rpm_on_a_shared_host():
+    # The shared limiter must never exceed the most conservative declaration on
+    # the host, and must not depend on which backend registered first.
+    sleeps = []
+    clock = {"now": 0.0}
+    registry = LimiterRegistry(now=lambda: clock["now"], sleep=sleeps.append)
+    fast = limiter_backend("fast", "https://integrate.api.nvidia.com/v1", 60)
+    slow = limiter_backend("slow", "https://integrate.api.nvidia.com/v1", 20)
+    limiter = registry.for_backend(fast)
+    registry.for_backend(slow)  # tightens the already-created limiter to 20 rpm
+    limiter.wait()
+    limiter.wait()
+    assert sleeps == [3.0]  # 60/20, not 60/60
+
+
+def test_limiter_registry_keeps_the_lowest_rpm_regardless_of_registration_order():
+    sleeps = []
+    clock = {"now": 0.0}
+    registry = LimiterRegistry(now=lambda: clock["now"], sleep=sleeps.append)
+    slow = limiter_backend("slow", "https://integrate.api.nvidia.com/v1", 20)
+    fast = limiter_backend("fast", "https://integrate.api.nvidia.com/v1", 60)
+    registry.for_backend(slow)
+    limiter = registry.for_backend(fast)  # must NOT loosen back to 60
+    limiter.wait()
+    limiter.wait()
+    assert sleeps == [3.0]
+
+
+def http_429(retry_after=None):
+    headers = {"retry-after": retry_after} if retry_after is not None else {}
+    response = httpx.Response(429, headers=headers, request=httpx.Request("POST", "https://x.test"))
+    return httpx.HTTPStatusError("429", request=response.request, response=response)
+
+
+def test_rate_limit_penalty_ignores_errors_that_are_not_429():
+    other = httpx.HTTPStatusError(
+        "500",
+        request=httpx.Request("POST", "https://x.test"),
+        response=httpx.Response(500, request=httpx.Request("POST", "https://x.test")),
+    )
+    assert rate_limit_penalty(other) is None
+    assert rate_limit_penalty(RuntimeError("boom")) is None
+
+
+def test_rate_limit_penalty_defaults_when_the_host_sends_no_header():
+    # DeepInfra — the successor host for deepseek once NVIDIA's free tier ends
+    # — sends no x-ratelimit-* and no Retry-After at all (verified live
+    # 2026-08-07). Headroom is not discoverable in-band, so a 429 there carries
+    # no number and the default has to apply.
+    assert rate_limit_penalty(http_429()) == RETRY_AFTER_DEFAULT_S
+
+
+def test_rate_limit_penalty_honors_retry_after_when_the_host_sends_one():
+    assert rate_limit_penalty(http_429("12")) == 12.0
+
+
+def test_rate_limit_penalty_falls_back_on_an_unparseable_retry_after():
+    # Retry-After may legally be an HTTP-date. Rather than parse dates, fall
+    # back — a wrong small number is worse than a conservative default.
+    assert rate_limit_penalty(http_429("Wed, 21 Oct 2026 07:28:00 GMT")) == RETRY_AFTER_DEFAULT_S
+
+
+def test_rate_limit_penalty_rejects_a_non_finite_retry_after():
+    # `float("inf")` parses. Feeding it to penalize() poisons the host deadline:
+    # time.sleep(inf) raises OverflowError on this platform, so the leg aborts
+    # and every other backend on the host aborts behind it. `nan` is worse and
+    # fails OPEN — nan > 0 is False, so no sleep happens, _last becomes nan, and
+    # every later comparison is nan, silently disabling backoff for the run.
+    assert rate_limit_penalty(http_429("inf")) == RETRY_AFTER_DEFAULT_S
+    assert rate_limit_penalty(http_429("nan")) == RETRY_AFTER_DEFAULT_S
+
+
+def test_rate_limit_penalty_rejects_a_negative_retry_after():
+    assert rate_limit_penalty(http_429("-5")) == RETRY_AFTER_DEFAULT_S
+
+
+def test_rate_limit_penalty_is_bounded():
+    # Even a well-formed enormous value would park the host under the limiter
+    # lock with nothing observable. A bake-off leg should fail and be resumed,
+    # not silently sit still for eleven days.
+    assert rate_limit_penalty(http_429("999999")) == MAX_BACKOFF_S
+
+
+def test_limiter_host_does_not_collapse_schemeless_urls_into_one_bucket():
+    # urlparse puts everything in `path` when there is no scheme, so netloc is
+    # "" and EVERY schemeless backend keys to the same empty-string bucket —
+    # silently sharing one rate limit across unrelated providers. Latent today
+    # because every configured base_url carries a scheme, and invisible if it
+    # ever stops being true.
+    nvidia = limiter_host("integrate.api.nvidia.com/v1")
+    openai = limiter_host("api.openai.com/v1")
+    assert nvidia == "integrate.api.nvidia.com"
+    assert openai == "api.openai.com"
+    assert nvidia != openai
+
+
+def test_limiter_host_agrees_with_itself_across_scheme_presence():
+    assert limiter_host("https://api.x.ai/v1") == limiter_host("api.x.ai/v1")
+
+
+def test_penalize_delays_every_caller_on_the_host_not_just_the_one_that_429ed():
+    # The concurrency-specific bug: back off only the worker that got the 429
+    # and the other seven keep hammering the same host. The bucket is the
+    # enforcement point, so the penalty has to live there.
+    sleeps = []
+    clock = {"now": 0.0}
+    limiter = RateLimiter(rpm=6000, now=lambda: clock["now"], sleep=sleeps.append)
+    limiter.wait()  # a call departs at t=0
+    limiter.penalize(30.0)  # ...and comes back 429
+    limiter.wait()  # the NEXT caller — a different worker — must wait it out
+    assert sleeps == [30.01]  # 30s penalty + the 0.01s rate interval
+
+
+def test_penalize_does_not_shorten_an_existing_longer_backoff():
+    # Eight workers in flight can each catch a 429 for the same overload. The
+    # penalties must not stack into a multi-minute stall, nor let a late small
+    # one undercut a longer wait already in force.
+    sleeps = []
+    clock = {"now": 0.0}
+    limiter = RateLimiter(rpm=6000, now=lambda: clock["now"], sleep=sleeps.append)
+    limiter.wait()
+    limiter.penalize(30.0)
+    limiter.penalize(5.0)  # a second worker's 429, shorter
+    limiter.wait()
+    assert sleeps == [30.01]
+
+
+def test_penalize_is_shared_by_every_backend_on_the_host():
+    # Two NVIDIA backends, one endpoint: a 429 earned by one must slow both.
+    sleeps = []
+    clock = {"now": 0.0}
+    registry = LimiterRegistry(now=lambda: clock["now"], sleep=sleeps.append)
+    deepseek = limiter_backend("nvidia-deepseek", "https://integrate.api.nvidia.com/v1", 6000)
+    nemotron = limiter_backend("nvidia-nemotron", "https://integrate.api.nvidia.com/v1", 6000)
+    registry.for_backend(deepseek).wait()
+    registry.for_backend(deepseek).penalize(30.0)
+    registry.for_backend(nemotron).wait()
+    assert sleeps == [30.01]
 
 
 def test_judge_client_parses_chat_completion(monkeypatch):

@@ -1,12 +1,22 @@
+import json
+import random
+import threading
+import time
+
+import httpx
 import pytest
 
-from judge.client import Backend
+from judge.client import RETRY_AFTER_DEFAULT_S, Backend, LimiterRegistry
+from judge.prompts import PROMPT_VERSION
 from judge.schema import Pair, ReasonCode, Verdict, verdict_to_json_line
 from run_bakeoff import (
+    ResultWriter,
     already_judged_ids,
     pending_votes,
     render_skip_warning,
+    run_backend,
     run_manifest,
+    run_slate,
     skipped_backend_names,
 )
 
@@ -308,3 +318,691 @@ def test_run_manifest_omits_nothing_when_temperature_is_set():
     )
     assert manifest["temperature"] == 0.0
     assert manifest["observed_models"] == []
+
+
+# --------------------------------------------------------------------------
+# Concurrency (issue #9)
+# --------------------------------------------------------------------------
+
+
+def concurrency_backend(name="nv", base_url="https://integrate.api.nvidia.com/v1", rpm=6000):
+    # rpm high enough that the limiter is never the thing under test here;
+    # spacing itself is covered in tests/test_client.py.
+    return Backend(
+        name=name,
+        base_url=base_url,
+        model_id=f"model/{name}",
+        rpm=rpm,
+        eval_only=False,
+        api_key_env="NVIDIA_API_KEY",
+    )
+
+
+class FakeClient:
+    """Stands in for JudgeClient: records calls, optionally slow, optionally fails."""
+
+    def __init__(self, backend, *, delay=0.0, fail_pair_ids=()):
+        self.backend = backend
+        self.observed_models = {backend.model_id}
+        self.delay = delay
+        self.fail_pair_ids = set(fail_pair_ids)
+        self.calls = []
+        self.closed = False
+        self.max_in_flight = 0
+        self._in_flight = 0
+        self._lock = threading.Lock()
+
+    def request_body(self, pair):
+        return {"model": self.backend.model_id}
+
+    def judge(self, pair, run_index=0):
+        with self._lock:
+            self._in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+            self.calls.append((pair.id, run_index))
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            if pair.id in self.fail_pair_ids:
+                raise RuntimeError(f"backend exploded on {pair.id}")
+            return Verdict(
+                pair_id=pair.id,
+                verdict="approve",
+                reason=ReasonCode.OK,
+                model_id=self.backend.model_id,
+                prompt_version=PROMPT_VERSION,
+                temperature=self.backend.temperature,
+                run_index=run_index,
+                reasoning_effort=self.backend.reasoning_effort,
+            )
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+    def close(self):
+        self.closed = True
+
+
+class RateLimitedClient(FakeClient):
+    """Always 429s, the way an over-subscribed shared host does."""
+
+    def judge(self, pair, run_index=0):
+        request = httpx.Request("POST", f"{self.backend.base_url}/chat/completions")
+        response = httpx.Response(429, request=request)
+        raise httpx.HTTPStatusError("429 Too Many Requests", request=request, response=response)
+
+
+class MixedFailureClient(FakeClient):
+    """Fails with a different exception type per pair, to exercise error_kinds."""
+
+    _KINDS = (ValueError, RuntimeError, TypeError, KeyError, ArithmeticError, OSError)
+
+    def judge(self, pair, run_index=0):
+        raise self._KINDS[int(pair.id.removeprefix("p")) % len(self._KINDS)](pair.id)
+
+
+def no_sleep_limiters():
+    return LimiterRegistry(sleep=lambda _: None)
+
+
+def read_verdicts(path):
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def vote_keys(path):
+    return {(v["pair_id"], v["run_index"]) for v in read_verdicts(path)}
+
+
+def test_result_writer_keeps_lines_intact_under_concurrent_writers(tmp_path):
+    # The append+flush contract is what makes resume work. Many threads, ONE
+    # handle: no interleaved or partial lines, nothing dropped.
+    path = tmp_path / "out.jsonl"
+    n_threads, per_thread = 8, 50
+    with ResultWriter(path) as writer:
+        def worker(w):
+            for i in range(per_thread):
+                writer.write(f"worker-{w}-line-{i}")
+
+        threads = [threading.Thread(target=worker, args=(w,)) for w in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == n_threads * per_thread
+    assert set(lines) == {
+        f"worker-{w}-line-{i}" for w in range(n_threads) for i in range(per_thread)
+    }
+
+
+def test_result_writer_does_not_acknowledge_a_write_before_it_is_flushed(tmp_path):
+    # #10's central claim is that --concurrency 1 reproduces prior runs
+    # exactly. The old serial loop flushed before issuing the next request, so
+    # a kill could lose at most the call in flight. An async queue widens that
+    # to "whatever is still queued" — verdicts already PAID FOR that resume
+    # then re-judges. Small, but it undercuts the reproducibility claim that
+    # makes this PR safe to merge, so write() waits for the flush.
+    path = tmp_path / "out.jsonl"
+    with ResultWriter(path) as writer:
+        writer.write("first")
+        # No join and no sleep: if write() acknowledged early, this read would
+        # see an empty file.
+        assert path.read_text() == "first\n"
+        writer.write("second")
+        assert path.read_text() == "first\nsecond\n"
+
+        # And in bulk, where an async writer would fall behind for certain.
+        for i in range(200):
+            writer.write(f"bulk-{i}")
+        assert len(path.read_text().splitlines()) == 202
+
+
+def test_result_writer_appends_rather_than_truncating(tmp_path):
+    path = tmp_path / "out.jsonl"
+    path.write_text("pre-existing\n")
+    with ResultWriter(path) as writer:
+        writer.write("new")
+    assert path.read_text().splitlines() == ["pre-existing", "new"]
+
+
+class _FailingFile:
+    """A file handle whose writes start failing partway through — a full disk."""
+
+    def __init__(self, real, fail_after):
+        self._real = real
+        self._fail_after = fail_after
+        self._writes = 0
+
+    def write(self, data):
+        self._writes += 1
+        if self._writes > self._fail_after:
+            raise OSError(28, "No space left on device")
+        return self._real.write(data)
+
+    def flush(self):
+        return self._real.flush()
+
+    def close(self):
+        return self._real.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._real.close()
+        return False
+
+
+class FullDiskWriter(ResultWriter):
+    FAIL_AFTER = 2
+
+    def _open(self):
+        return _FailingFile(open(self._path, "a"), self.FAIL_AFTER)
+
+
+def test_a_dead_writer_stops_the_workers_instead_of_burning_the_rest_of_the_run(tmp_path):
+    # P1. If persistence dies mid-run, continuing to call the API spends real
+    # money producing verdicts that are then discarded. Surfacing the error at
+    # the END of a multi-hour sweep is barely better than losing it silently,
+    # because the quota is already gone. Workers must notice and stop.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i:03d}") for i in range(60)]
+    # A per-call delay is not padding — it is the realistic case. A judge call
+    # takes seconds; the writer's local write+flush takes microseconds, so the
+    # writer is always far ahead and the guard sees the failure on the very
+    # next call. Without a delay the fake outruns its own writer by ~40 calls,
+    # which measures the fake rather than the guard.
+    client = FakeClient(backend, delay=0.002)
+
+    with pytest.raises(OSError):
+        run_backend(
+            backend,
+            pairs,
+            tmp_path,
+            votes=1,
+            concurrency=1,
+            limiters=no_sleep_limiters(),
+            client_factory=lambda b: client,
+            writer_factory=FullDiskWriter,
+        )
+
+    # The writer dies on write 3, so calls 1-3 are already paid for and one or
+    # two may be in flight. Anything approaching 60 means the guard does nothing.
+    assert len(client.calls) <= 8, f"kept calling the API after the writer died: {len(client.calls)}"
+
+
+def test_result_writer_reraises_a_failure_from_its_own_thread(tmp_path):
+    # A writer that dies on a full disk would otherwise drop every verdict
+    # after it in silence, and a multi-hour run would look like it simply
+    # judged fewer pairs. The failure has to reach the caller's thread.
+    unwritable = tmp_path / "nope" / "out.jsonl"  # parent does not exist
+    with pytest.raises(FileNotFoundError), ResultWriter(unwritable) as writer:
+        writer.write("lost")
+
+
+def test_run_slate_with_no_runnable_backends_is_a_no_op(tmp_path):
+    # Every backend skipped for a missing key is a normal outcome under
+    # --allow-skipped; it must not trip the thread pool.
+    run_slate([], [make_pair("p0")], tmp_path, votes=1, concurrency=4)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_run_backend_at_concurrency_1_writes_in_pair_then_vote_order(tmp_path):
+    # Decision 6: the default must reproduce prior runs exactly, so line order
+    # at --concurrency 1 stays pair-then-vote, byte for byte.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(4)]
+    client = FakeClient(backend)
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=2,
+        concurrency=1,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: client,
+    )
+    written = [(v["pair_id"], v["run_index"]) for v in read_verdicts(tmp_path / "nv.jsonl")]
+    assert written == [(p.id, r) for p in pairs for r in range(2)]
+    assert client.max_in_flight == 1
+
+
+def test_run_backend_concurrent_produces_the_same_verdict_set(tmp_path):
+    # Acceptance 1: identical verdict SETS at concurrency 1 vs N, modulo order.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(20)]
+
+    serial_dir = tmp_path / "serial"
+    parallel_dir = tmp_path / "parallel"
+    serial_dir.mkdir()
+    parallel_dir.mkdir()
+
+    for out_dir, concurrency in ((serial_dir, 1), (parallel_dir, 8)):
+        run_backend(
+            backend,
+            pairs,
+            out_dir,
+            votes=3,
+            concurrency=concurrency,
+            limiters=no_sleep_limiters(),
+            client_factory=lambda b: FakeClient(b, delay=0.001),
+        )
+
+    assert vote_keys(serial_dir / "nv.jsonl") == vote_keys(parallel_dir / "nv.jsonl")
+    assert len(read_verdicts(parallel_dir / "nv.jsonl")) == 60
+
+
+def test_run_backend_actually_runs_workers_in_parallel(tmp_path):
+    # A latency-bound backend must spend its rate budget: with 8 workers and a
+    # per-call delay, calls overlap instead of queueing one at a time.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(16)]
+    client = FakeClient(backend, delay=0.02)
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=1,
+        concurrency=8,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: client,
+    )
+    assert client.max_in_flight > 1, "workers never overlapped — still serial"
+
+
+def test_run_backend_spends_the_rate_budget_when_latency_bound(tmp_path):
+    # Acceptance 3. Serial throughput is 1/max(60/rpm, latency), so a backend
+    # whose latency exceeds its rate interval never spends the budget it was
+    # already granted — grok ran at 14% of its declared rpm this way. With the
+    # limiter out of the way, N workers must cut wall clock by roughly N.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(24)]
+
+    def elapsed_at(concurrency, out_dir):
+        out_dir.mkdir()
+        started = time.monotonic()
+        run_backend(
+            backend,
+            pairs,
+            out_dir,
+            votes=1,
+            concurrency=concurrency,
+            limiters=no_sleep_limiters(),
+            client_factory=lambda b: FakeClient(b, delay=0.02),
+        )
+        return time.monotonic() - started
+
+    serial = elapsed_at(1, tmp_path / "serial")
+    parallel = elapsed_at(8, tmp_path / "parallel")
+    assert parallel < serial / 3, f"8 workers took {parallel:.2f}s vs {serial:.2f}s serial"
+
+
+def test_run_backend_still_cannot_outrun_the_host_rate_limit(tmp_path):
+    # The safety property that makes raising --concurrency sane. Workers only
+    # overlap the WAITING; departures stay one interval apart, so 8 threads on a
+    # 40 rpm host still send 40 rpm. Real limiter, real sleeps, on purpose.
+    interval = 0.025
+    backend = concurrency_backend(rpm=int(60 / interval))
+    pairs = [make_pair(f"p{i}") for i in range(8)]
+    started = time.monotonic()
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=1,
+        concurrency=8,
+        limiters=LimiterRegistry(),
+        client_factory=FakeClient,
+    )
+    elapsed = time.monotonic() - started
+    # 8 calls one interval apart occupy at least 7 intervals however many
+    # threads are waiting on them.
+    assert elapsed >= 7 * interval * 0.9, f"8 calls left in {elapsed:.3f}s — rate limit bypassed"
+
+
+def test_a_429_from_one_worker_holds_back_the_whole_host(tmp_path):
+    # The concurrency-specific failure: with per-worker backoff the other seven
+    # workers keep hammering a host that just said stop. The penalty has to
+    # land on the shared bucket, so it must be visible to a DIFFERENT backend
+    # on the same host.
+    penalties = []
+    backend = concurrency_backend("nv-a", base_url="https://integrate.api.nvidia.com/v1")
+    other = concurrency_backend("nv-b", base_url="https://integrate.api.nvidia.com/v1")
+    registry = no_sleep_limiters()
+    shared = registry.for_backend(other)
+    shared.penalize = lambda seconds: penalties.append(seconds)  # type: ignore[method-assign]
+
+    pairs = [make_pair("p0")]
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=registry,
+        client_factory=lambda b: RateLimitedClient(b),
+    )
+    assert penalties == [RETRY_AFTER_DEFAULT_S], "the shared host bucket was never penalized"
+
+
+def test_a_non_429_failure_does_not_hold_back_the_host(tmp_path):
+    # A 500 says "this call broke", not "you are going too fast". Backing the
+    # whole host off for every transient error would throttle the run to
+    # nothing on a flaky backend.
+    penalties = []
+    backend = concurrency_backend()
+    registry = no_sleep_limiters()
+    registry.for_backend(backend).penalize = lambda s: penalties.append(s)  # type: ignore[method-assign]
+    run_backend(
+        backend,
+        [make_pair("p0")],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=registry,
+        client_factory=lambda b: FakeClient(b, fail_pair_ids=["p0"]),
+    )
+    assert penalties == []
+
+
+def test_health_error_kinds_are_reported_in_a_stable_order(tmp_path):
+    # Concurrency makes the ARRIVAL order of errors arbitrary, and
+    # dict(Counter(...)) preserves insertion order — so the manifest's
+    # error_kinds keys would shuffle between otherwise identical runs.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(6)]
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=1,
+        concurrency=6,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: MixedFailureClient(b),
+    )
+    error_kinds = json.loads((tmp_path / "nv.manifest.json").read_text())["health"]["error_kinds"]
+    assert list(error_kinds) == sorted(error_kinds)
+
+
+def test_an_interrupt_stops_scheduling_rather_than_draining_the_queue(tmp_path):
+    # Every vote is submitted up front, so a plain shutdown(wait=True) would
+    # keep sending the remaining PAID requests — potentially for hours — before
+    # the interrupt propagated. Two runs were killed by hand on 2026-08-06; an
+    # operator pressing Ctrl-C expects the spend to stop.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i:03d}") for i in range(80)]
+
+    class InterruptingClient(FakeClient):
+        def judge(self, pair, run_index=0):
+            # super() records the call, so counting here too would double it.
+            result = super().judge(pair, run_index)
+            if len(self.calls) == 3:
+                raise KeyboardInterrupt("operator pressed ctrl-c")
+            return result
+
+    # As above, a per-call delay is the realistic shape: cancellation only has
+    # to outrun the NEXT call, which in production is seconds away.
+    client = InterruptingClient(backend, delay=0.002)
+    with pytest.raises(KeyboardInterrupt):
+        run_backend(
+            backend,
+            pairs,
+            tmp_path,
+            votes=1,
+            concurrency=1,
+            limiters=no_sleep_limiters(),
+            client_factory=lambda b: client,
+        )
+    # KeyboardInterrupt is a BaseException, so judge_one's `except Exception`
+    # does not swallow it — it must reach the pool and cancel what is pending.
+    assert len(client.calls) < 20, f"kept spending after the interrupt: {len(client.calls)}"
+
+
+def test_run_backend_resume_writes_no_duplicate_votes(tmp_path):
+    # Acceptance 2: resume after a mid-run kill yields zero duplicate
+    # (pair_id, run_index). The todo list is partitioned ONCE up front; a worker
+    # that re-scanned the results file could hand the same vote to two threads.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(10)]
+    results_path = tmp_path / "nv.jsonl"
+
+    # Simulate a run killed partway: the first 12 of 30 votes landed.
+    already = [(p.id, r) for p in pairs for r in range(3)][:12]
+    results_path.write_text(
+        "".join(
+            verdict_to_json_line(
+                Verdict(
+                    pair_id=pair_id,
+                    verdict="approve",
+                    reason=ReasonCode.OK,
+                    model_id=backend.model_id,
+                    prompt_version=PROMPT_VERSION,
+                    temperature=backend.temperature,
+                    run_index=run_index,
+                    reasoning_effort=backend.reasoning_effort,
+                )
+            )
+            + "\n"
+            for pair_id, run_index in already
+        )
+    )
+
+    client = FakeClient(backend, delay=0.001)
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=3,
+        concurrency=8,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: client,
+    )
+
+    keys = [(v["pair_id"], v["run_index"]) for v in read_verdicts(results_path)]
+    assert len(keys) == len(set(keys)) == 30
+    # Resumed votes are judged exactly once, and the completed ones not at all.
+    owed = {(p.id, r) for p in pairs for r in range(3)} - set(already)
+    assert sorted(client.calls) == sorted(owed)
+
+
+def test_run_backend_records_every_latency_under_concurrency(tmp_path):
+    # Decision 7: per-call latencies are the evidence base for issue #9, so a
+    # concurrent run must not drop samples through an unguarded list.append.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(25)]
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=2,
+        concurrency=8,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: FakeClient(b, delay=0.001),
+    )
+    health = json.loads((tmp_path / "nv.manifest.json").read_text())["health"]
+    assert health["calls_ok"] == 50
+    assert health["calls_failed"] == 0
+    assert health["latency_median"] is not None
+
+
+def test_run_backend_records_failures_from_every_worker(tmp_path):
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(10)]
+    doomed = [p.id for p in pairs[:4]]
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=2,
+        concurrency=8,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: FakeClient(b, delay=0.001, fail_pair_ids=doomed),
+    )
+    health = json.loads((tmp_path / "nv.manifest.json").read_text())["health"]
+    assert health["calls_failed"] == 8
+    assert health["calls_ok"] == 12
+    assert health["error_kinds"] == {"RuntimeError": 8}
+    # Failed votes are simply absent; resume covers them on the next launch.
+    assert len(read_verdicts(tmp_path / "nv.jsonl")) == 12
+
+
+def test_run_slate_at_concurrency_1_runs_backends_in_slate_order(tmp_path):
+    # Decision 6 again, on the other axis: N=1 keeps backends serial.
+    backends = [concurrency_backend(f"b{i}", rpm=6000) for i in range(3)]
+    order = []
+    clients = {}
+
+    def factory(backend):
+        order.append(("start", backend.name))
+        client = FakeClient(backend, delay=0.005)
+        clients[backend.name] = client
+        return client
+
+    run_slate(
+        backends,
+        [make_pair("p0")],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=no_sleep_limiters(),
+        client_factory=factory,
+    )
+    assert order == [("start", "b0"), ("start", "b1"), ("start", "b2")]
+
+
+def test_run_slate_registers_every_host_limiter_before_any_call_departs(tmp_path):
+    # Raised by the adversarial review, and real. The registry only ever
+    # TIGHTENS, but tightening is useless if it happens after the calls have
+    # already left: for_backend() is called inside each backend's own task, so
+    # a high-rpm backend can run at its own rate before a low-rpm sibling on
+    # the same host has registered at all. At concurrency 1 the first backend
+    # can finish its entire leg first. That is an over-rate burst on a shared
+    # host — the exact 503-storm class of failure host-keying exists to stop.
+    host = "https://integrate.api.nvidia.com/v1"
+    fast = concurrency_backend("fast", base_url=host, rpm=6000)  # interval 0.01
+    slow = concurrency_backend("slow", base_url=host, rpm=60)  # interval 1.0
+    registry = no_sleep_limiters()
+    intervals_in_force = []
+
+    class IntervalSpyClient(FakeClient):
+        def judge(self, pair, run_index=0):
+            # White-box on purpose: the effective rate at the moment a call
+            # departs is the property under test, and asserting it on wall
+            # clock would be flaky.
+            intervals_in_force.append(registry.for_backend(self.backend)._interval)
+            return super().judge(pair, run_index)
+
+    run_slate(
+        [fast, slow],
+        [make_pair("p0")],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=registry,
+        client_factory=IntervalSpyClient,
+    )
+    # Both backends share one host, so both must depart at the tightest
+    # declared rate — including the one that got there first.
+    assert intervals_in_force == [1.0, 1.0]
+
+
+def test_run_slate_does_not_let_one_slow_backend_delay_the_others(tmp_path):
+    # Acceptance 4: a backend returning continuous 5xx must not hold up any
+    # other backend's completion. The slow one is failing AND slow, which is
+    # exactly the nemotron 503 case.
+    slow = concurrency_backend("slow", base_url="https://slow.test/v1")
+    fast_a = concurrency_backend("fast-a", base_url="https://fast-a.test/v1")
+    fast_b = concurrency_backend("fast-b", base_url="https://fast-b.test/v1")
+    pairs = [make_pair(f"p{i}") for i in range(4)]
+
+    finished = []
+    lock = threading.Lock()
+
+    def factory(backend):
+        delay = 0.05 if backend.name == "slow" else 0.0
+        fail = [p.id for p in pairs] if backend.name == "slow" else []
+        return FakeClient(backend, delay=delay, fail_pair_ids=fail)
+
+    def record(name):
+        with lock:
+            finished.append(name)
+
+    run_slate(
+        backends=[slow, fast_a, fast_b],
+        pairs=pairs,
+        out_dir=tmp_path,
+        votes=1,
+        concurrency=2,
+        limiters=no_sleep_limiters(),
+        client_factory=factory,
+        on_backend_done=record,
+    )
+
+    assert finished[-1] == "slow", f"fast backends waited on the slow one: {finished}"
+    assert set(finished) == {"slow", "fast-a", "fast-b"}
+
+
+def test_run_slate_isolates_a_backend_that_raises(tmp_path):
+    # A stale-config ValueError in one backend must not cost the whole slate the
+    # work the other backends already did — but it must still be reported.
+    good = concurrency_backend("good", base_url="https://good.test/v1")
+    bad = concurrency_backend("bad", base_url="https://bad.test/v1")
+    pairs = [make_pair("p0")]
+
+    def factory(backend):
+        if backend.name == "bad":
+            raise ValueError("stale run config")
+        return FakeClient(backend)
+
+    with pytest.raises(RuntimeError, match="bad"):
+        run_slate(
+            backends=[bad, good],
+            pairs=pairs,
+            out_dir=tmp_path,
+            votes=1,
+            concurrency=2,
+            limiters=no_sleep_limiters(),
+            client_factory=factory,
+        )
+    # The healthy backend still finished and its verdicts are on disk.
+    assert len(read_verdicts(tmp_path / "good.jsonl")) == 1
+
+
+def test_run_backend_shares_one_limiter_across_backends_on_a_host(tmp_path):
+    # The registry is threaded through run_backend, not built per backend —
+    # otherwise two NVIDIA legs would each get their own 40 rpm budget.
+    registry = no_sleep_limiters()
+    a = concurrency_backend("nv-a", base_url="https://integrate.api.nvidia.com/v1", rpm=6000)
+    b = concurrency_backend("nv-b", base_url="https://integrate.api.nvidia.com/v1", rpm=6000)
+    pairs = [make_pair("p0")]
+    for backend in (a, b):
+        run_backend(
+            backend,
+            pairs,
+            tmp_path,
+            votes=1,
+            concurrency=1,
+            limiters=registry,
+            client_factory=FakeClient,
+        )
+    assert registry.for_backend(a) is registry.for_backend(b)
+
+
+def test_already_judged_ids_is_independent_of_line_order(tmp_path):
+    # Acceptance 5: concurrency makes line order arbitrary, so resume must not
+    # care about it.
+    verdicts = [
+        make_verdict(f"p{i}", run_index=r, temperature=None) for i in range(6) for r in range(3)
+    ]
+    lines = [verdict_to_json_line(v) for v in verdicts]
+
+    ordered = tmp_path / "ordered.jsonl"
+    shuffled = tmp_path / "shuffled.jsonl"
+    ordered.write_text("".join(line + "\n" for line in lines))
+    scrambled = list(lines)
+    random.Random(1).shuffle(scrambled)
+    shuffled.write_text("".join(line + "\n" for line in scrambled))
+
+    config = {"model_id": "m", "prompt_version": "v1", "temperature": None, "reasoning_effort": None}
+    assert already_judged_ids(ordered, **config) == already_judged_ids(shuffled, **config)

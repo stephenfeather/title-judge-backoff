@@ -72,10 +72,21 @@ def flip_rate(values: list) -> float:
 
 
 def tally_votes(verdicts: list[Verdict]) -> list[VoteResult]:
-    """Collapse N votes per pair into one ruling each, in first-seen order."""
+    """Collapse N votes per pair into one ruling each, in first-seen order.
+
+    Each pair's votes are ordered by `run_index` before tallying, so the
+    first-occurrence tie-break in majority() resolves on a property of the VOTE
+    rather than on where the line happens to sit in the results file. A serial
+    run always appended in run_index order, so this changes nothing for any
+    existing result file — but concurrent workers write in completion order,
+    and without this an even split (common when a vote is lost to an API error)
+    would resolve differently every time the same data was scored.
+    """
     grouped: dict[str, list[Verdict]] = {}
     for v in verdicts:
         grouped.setdefault(v.pair_id, []).append(v)
+    for votes in grouped.values():
+        votes.sort(key=lambda v: v.run_index)
 
     return [
         VoteResult(

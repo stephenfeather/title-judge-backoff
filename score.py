@@ -105,8 +105,13 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     if not known:
         raise ValueError("no verdicts matched any ground-truth pair")
 
-    voted = tally_votes(known)
-    matched = [(by_id[r.pair_id], r) for r in voted]
+    # Ordered by the PAIRS file, not by first appearance in the results file.
+    # bootstrap_ci resamples this sequence from a fixed seed, so ordering it by
+    # the results file would make the reported CI depend on the order verdicts
+    # happened to be written — which concurrent workers make arbitrary. The
+    # pairs file is the same on every run, so this is stable by construction.
+    ruled = {r.pair_id: r for r in tally_votes(known)}
+    matched = [(pair, ruled[pair.id]) for pair in pairs if pair.id in ruled]
 
     # Narrowed once, here: the unruled guard above means every pair carries a
     # ruling, so the rest of this function works with plain strings.
