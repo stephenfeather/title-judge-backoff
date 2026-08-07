@@ -43,17 +43,29 @@ class ContentionRow:
     cross_model_reason_disagreement: float  # ditto for reason codes
     mean_verdict_flip_rate: float  # mean within-model flip rate across models
     mean_reason_flip_rate: float
+    n_unsettled: int = 0  # models whose own votes reached no majority on this pair
 
     @property
     def contention(self) -> float:
         """Single sortable score. Cross-model disagreement dominates, since two
         models disagreeing is stronger evidence of an ambiguous rubric than one
-        model wavering between its own votes."""
+        model wavering between its own votes.
+
+        A model that could not decide AT ALL counts for more than one that
+        decided differently from its neighbour. That is the point of issue #12:
+        the queue used to rank an unsettled pair on whatever its tie-break
+        invented, which could push it up or bury it depending on whether the
+        invented value happened to match another model's. Now it ranks on the
+        fact of being unsettled, which is exactly the ambiguous-rubric signal
+        the queue exists to surface.
+        """
+        unsettled_fraction = self.n_unsettled / self.n_models if self.n_models else 0.0
         return (
             2 * self.cross_model_disagreement
             + self.cross_model_reason_disagreement
             + self.mean_verdict_flip_rate
             + 0.5 * self.mean_reason_flip_rate
+            + 2 * unsettled_fraction
         )
 
 
@@ -93,12 +105,21 @@ def contention_ranking(by_model: dict[str, list[Verdict]]) -> list[ContentionRow
     rows = []
     for pid in pair_ids:
         present = [rulings[pid] for rulings in voted.values() if pid in rulings]
+        # Cross-model disagreement compares only the models that actually
+        # reached a majority. An unsettled model has no ruling to disagree
+        # with; its contribution is counted as n_unsettled instead, which the
+        # contention score weights directly.
         rows.append(
             ContentionRow(
                 pair_id=pid,
                 n_models=len(present),
-                cross_model_disagreement=_disagreement([r.verdict for r in present]),
-                cross_model_reason_disagreement=_disagreement([r.reason.value for r in present]),
+                n_unsettled=sum(1 for r in present if not r.settled),
+                cross_model_disagreement=_disagreement(
+                    [r.verdict for r in present if r.verdict is not None]
+                ),
+                cross_model_reason_disagreement=_disagreement(
+                    [r.reason.value for r in present if r.reason is not None]
+                ),
                 mean_verdict_flip_rate=sum(r.verdict_flip_rate for r in present) / len(present),
                 mean_reason_flip_rate=sum(r.reason_flip_rate for r in present) / len(present),
             )
@@ -224,20 +245,14 @@ def _completion_table(
 
 
 def unsettled_reason_pairs(verdicts: list[Verdict]) -> list[str]:
-    """Pairs whose reason votes were all different — a tie with no majority.
+    """Pairs whose reason votes reached no majority.
 
-    `majority()` returns a value anyway, so these are recorded exactly like a
-    unanimous ruling. Naming them is the cheapest honest mitigation until the
-    no-majority case is representable (issue #12).
+    Asks `tally_votes` rather than re-deriving the rule. The first version of
+    this function looked for "every reason different", which is not the same
+    question: four votes splitting 2-2 are equally undecided and were missed.
+    One definition of "settled", in judge/vote.py, and everything else asks it.
     """
-    grouped: dict[str, list[str]] = {}
-    for v in verdicts:
-        grouped.setdefault(v.pair_id, []).append(v.reason.value)
-    return sorted(
-        pair_id
-        for pair_id, reasons in grouped.items()
-        if len(reasons) > 1 and len(set(reasons)) == len(reasons)
-    )
+    return sorted(r.pair_id for r in tally_votes(verdicts) if not r.reason_settled)
 
 
 def _caveats_section(by_model: dict[str, list[Verdict]], manifests: dict[str, dict]) -> list[str]:
@@ -262,11 +277,14 @@ def _caveats_section(by_model: dict[str, list[Verdict]], manifests: dict[str, di
     lines += [
         "### Reason codes with no majority are fabricated, not agreed",
         "",
-        "Where a pair's reason votes are all different there is **no majority**.",
-        "`majority()` returns one regardless, and it is recorded indistinguishably",
-        "from a unanimous ruling. Since PR #10 that choice is reproducible; it is",
-        "still not correct, and the per-reason confusion matrix consumes it as a",
-        "real observation. Tracked as issue #12.",
+        "Where no reason code holds the top count on its own there is **no**",
+        "**majority**, so these pairs now carry no reason at all rather than one the",
+        "tie-break invented. They are EXCLUDED from the reason distributions and",
+        "the per-model reason tables above, and from `score.py`'s reason confusion —",
+        "listed here so the exclusion is visible rather than silent (issue #12).",
+        "",
+        "Their flip rates are still counted: an unsettled pair is a contested pair,",
+        "not a missing one, and it ranks high in the ruling queue for that reason.",
         "",
     ]
     if fabricated:
@@ -361,12 +379,17 @@ def render_scenario_report(
         "on. Uncontested pairs are not evidence of correctness — every model can be",
         "confidently wrong together.",
         "",
-        "| Pair | Models | Cross-model verdict | Cross-model reason | Verdict flip | Reason flip |",
-        "|---|---|---|---|---|---|",
+        "`Undecided` counts models whose OWN votes reached no majority on this pair.",
+        "It weighs heavily: a judge that cannot decide is stronger evidence of an",
+        "ambiguous rubric than two judges deciding differently.",
+        "",
+        "| Pair | Models | Undecided | Cross-model verdict | Cross-model reason | Verdict flip | Reason flip |",
+        "|---|---|---|---|---|---|---|",
     ]
     for row in ranking[:queue_size]:
         lines.append(
-            f"| {row.pair_id} | {row.n_models} | {row.cross_model_disagreement:.3f} | "
+            f"| {row.pair_id} | {row.n_models} | {row.n_unsettled} | "
+            f"{row.cross_model_disagreement:.3f} | "
             f"{row.cross_model_reason_disagreement:.3f} | {row.mean_verdict_flip_rate:.3f} | "
             f"{row.mean_reason_flip_rate:.3f} |"
         )

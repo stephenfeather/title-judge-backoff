@@ -22,14 +22,40 @@ from judge.schema import ReasonCode, Verdict
 
 @dataclass(frozen=True)
 class VoteResult:
-    """The agreed ruling for one pair, plus how much its N votes disagreed."""
+    """The agreed ruling for one pair, plus how much its N votes disagreed.
+
+    `verdict` and `reason` are None when the votes had NO MAJORITY — when two
+    or more values shared the top count, so any winner would be the tie-break's
+    invention rather than the model's answer. None rather than a sentinel
+    string on purpose: a consumer that keeps treating it as a label gets an
+    AttributeError, not a plausible-looking wrong number.
+
+    The two are independent. The common shape in the 2026-08-06 S1 run is a
+    settled verdict with an unsettled reason — three votes agreeing on
+    "reject" while splitting 1-1-1 on why.
+
+    Flip rates are always present. An unsettled pair is a CONTESTED pair, not
+    a missing one, and the flip rate is the measure of how contested.
+    """
 
     pair_id: str
-    verdict: str
-    reason: ReasonCode
+    verdict: str | None
+    reason: ReasonCode | None
     n_votes: int
     verdict_flip_rate: float  # fraction of votes differing from the modal verdict
     reason_flip_rate: float  # ditto for the reason code, tracked separately
+
+    @property
+    def verdict_settled(self) -> bool:
+        return self.verdict is not None
+
+    @property
+    def reason_settled(self) -> bool:
+        return self.reason is not None
+
+    @property
+    def settled(self) -> bool:
+        return self.verdict_settled and self.reason_settled
 
 
 def majority(values: list):
@@ -44,6 +70,26 @@ def majority(values: list):
     best = max(counts.values())
     # First-occurrence order settles ties; some value always attains `best`.
     return next(value for value in values if counts[value] == best)
+
+
+def settled_majority(values: list):
+    """The winning value, or None when the top count is SHARED.
+
+    `majority()` above always returns something, because `flip_rate` needs a
+    modal value to measure against and any of the tied candidates serves that
+    purpose equally. This function answers the different question the rulings
+    actually depend on: did the votes decide, or did the tie-break decide?
+
+    Returning None rather than a sentinel is deliberate. A caller that ignores
+    the distinction gets an AttributeError on the next `.value`, which is a
+    better outcome than a fabricated ruling flowing quietly into a metric.
+    """
+    if not values:
+        raise ValueError("settled_majority() needs at least one value")
+    counts = Counter(values)
+    best = max(counts.values())
+    winners = [value for value, count in counts.items() if count == best]
+    return winners[0] if len(winners) == 1 else None
 
 
 def flip_rate(values: list) -> float:
@@ -91,8 +137,8 @@ def tally_votes(verdicts: list[Verdict]) -> list[VoteResult]:
     return [
         VoteResult(
             pair_id=pair_id,
-            verdict=majority([v.verdict for v in votes]),
-            reason=majority([v.reason for v in votes]),
+            verdict=settled_majority([v.verdict for v in votes]),
+            reason=settled_majority([v.reason for v in votes]),
             n_votes=len(votes),
             verdict_flip_rate=flip_rate([v.verdict for v in votes]),
             reason_flip_rate=flip_rate([v.reason for v in votes]),

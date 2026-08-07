@@ -246,6 +246,8 @@ def make_score(model_id, kappa, ci):
         model_id=model_id,
         n=4,
         coverage=1.0,
+        n_unsettled_verdict=0,
+        n_unsettled_reason=0,
         accuracy=1.0,
         kappa=kappa,
         false_approve_rate=0.0,
@@ -412,12 +414,73 @@ def test_resume_style_reordering_does_not_change_the_ruling():
     assert score_model(PAIRS, resumed) == score_model(PAIRS, in_order)
 
 
-def test_majority_verdict_tie_is_broken_by_run_index_not_file_position():
-    # An even split. It happens whenever a vote is lost to an API error, which
-    # on the 2026-08-06 sweep was common. "First occurrence" means whichever
-    # line the writer flushed first wins, so under concurrency the same data
-    # could score differently on re-run. The tie must resolve on run_index,
-    # which is a property of the vote rather than of the file.
+def test_unsettled_verdict_is_excluded_from_kappa_and_counted():
+    # A 1-1 verdict split has no majority. Scoring it would be scoring the
+    # tie-break, and false_approve_rate is a SAFETY number — a coin flip
+    # recorded as an approve directly corrupts the metric that governs
+    # deployment risk. Excluded, and the exclusion is reported.
+    verdicts = (
+        votes_for("p1", [("approve", "ok"), ("reject", "meaning_change")])  # tied 1-1
+        + votes_for("p2", [("approve", "ok")] * 3)
+        + votes_for("p3", [("reject", "meaning_change")] * 3)
+        + votes_for("p4", [("reject", "casing_error")] * 3)
+    )
+    result = score_model(PAIRS, verdicts)
+    assert result.n == 3, "the tied pair must not be scored"
+    assert result.n_unsettled_verdict == 1
+    # Coverage still says the backend judged all four — that is a different
+    # question from whether the votes decided, and the leaderboard's
+    # partial-coverage gate must not be tripped by contested pairs.
+    assert result.coverage == 1.0
+
+
+def test_unsettled_reason_is_excluded_from_confusion_but_not_from_kappa():
+    # deepseek's shape: verdict settled 3-0, reason split 1-1-1. The verdict is
+    # real evidence and must still be scored; only the reason is unusable.
+    verdicts = (
+        votes_for(
+            "p3",
+            [("reject", "meaning_change"), ("reject", "ok"), ("reject", "overcorrection")],
+        )
+        + votes_for("p1", [("approve", "ok")] * 3)
+        + votes_for("p2", [("approve", "ok")] * 3)
+        + votes_for("p4", [("reject", "casing_error")] * 3)
+    )
+    result = score_model(PAIRS, verdicts)
+    assert result.n == 4, "a settled verdict is still evidence"
+    assert result.n_unsettled_verdict == 0
+    assert result.n_unsettled_reason == 1
+    # p3's ground truth is meaning_change; no cell may be credited for it.
+    assert not any(gt == "meaning_change" for gt, _ in result.reason_confusion)
+
+
+def test_leaderboard_reports_the_excluded_pairs():
+    # A metric over 3 of 4 pairs is honest; a silent exclusion is its own lie.
+    verdicts = (
+        votes_for("p1", [("approve", "ok"), ("reject", "meaning_change")])
+        + votes_for("p2", [("approve", "ok")] * 3)
+        + votes_for("p3", [("reject", "meaning_change")] * 3)
+        + votes_for("p4", [("reject", "casing_error")] * 3)
+    )
+    md = render_leaderboard([score_model(PAIRS, verdicts)])
+    assert "unsettled" in md.lower()
+
+
+def test_a_model_whose_every_pair_is_unsettled_does_not_crash():
+    # Degenerate but reachable on a backend that lost a vote on every pair.
+    verdicts = [
+        v
+        for pid in ("p1", "p2", "p3", "p4")
+        for v in votes_for(pid, [("approve", "ok"), ("reject", "casing_error")])
+    ]
+    with pytest.raises(ValueError, match="no pair"):
+        score_model(PAIRS, verdicts)
+
+
+def test_a_tied_verdict_is_reported_unsettled_rather_than_tie_broken():
+    # PR #10 made this tie-break deterministic by run_index. Issue #12 goes
+    # further: reproducible was never the same as correct, so there is now no
+    # winner at all. Order-independence still holds — it just holds trivially.
     tied = [
         make_verdict("p1", "approve", "ok", run_index=0),
         make_verdict("p1", "reject", "meaning_change", run_index=1),
@@ -425,12 +488,11 @@ def test_majority_verdict_tie_is_broken_by_run_index_not_file_position():
     forward = tally_votes(list(tied))
     backward = tally_votes(list(reversed(tied)))
     assert forward == backward
-    assert forward[0].verdict == "approve"  # run_index 0 wins the tie
+    assert forward[0].verdict is None
+    assert forward[0].verdict_settled is False
 
 
-def test_majority_reason_tie_is_broken_by_run_index_not_file_position():
-    # Three votes, three distinct reason codes: a genuine three-way tie, and
-    # score.py scores per-reason confusion off the winner.
+def test_a_three_way_reason_split_is_reported_unsettled():
     tied = [
         make_verdict("p1", "reject", "meaning_change", run_index=0),
         make_verdict("p1", "reject", "casing_error", run_index=1),
@@ -439,4 +501,6 @@ def test_majority_reason_tie_is_broken_by_run_index_not_file_position():
     forward = tally_votes(list(tied))
     backward = tally_votes(list(reversed(tied)))
     assert forward == backward
-    assert forward[0].reason == ReasonCode("meaning_change")
+    assert forward[0].reason is None
+    # The verdict was unanimous and is still reported.
+    assert forward[0].verdict == "reject"

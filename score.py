@@ -27,8 +27,15 @@ BOOTSTRAP_SEED = 20260806
 @dataclass(frozen=True)
 class ModelScore:
     model_id: str
-    n: int
+    n: int  # pairs SCORED — judged, and their votes reached a verdict majority
     coverage: float  # fraction of ground-truth pairs this model actually judged
+    # Pairs judged but excluded because their votes had no majority (#12).
+    # Reported rather than dropped: a metric over 189 of 200 pairs is honest,
+    # one over 200 where 11 were coin flips is not, and a silent exclusion is
+    # its own kind of lie. Counted independently — a settled verdict with an
+    # unsettled reason still scores for kappa, just not for reason confusion.
+    n_unsettled_verdict: int
+    n_unsettled_reason: int
     accuracy: float
     kappa: float  # on the majority verdict across votes
     false_approve_rate: float
@@ -111,7 +118,28 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     # happened to be written — which concurrent workers make arbitrary. The
     # pairs file is the same on every run, so this is stable by construction.
     ruled = {r.pair_id: r for r in tally_votes(known)}
-    matched = [(pair, ruled[pair.id]) for pair in pairs if pair.id in ruled]
+    judged = [(pair, ruled[pair.id]) for pair in pairs if pair.id in ruled]
+
+    # A pair whose votes had no majority was never decided by the model — the
+    # tie-break decided it. Scoring it means scoring the tie-break, so it is
+    # excluded and the exclusion is COUNTED (see #12). Verdict and reason are
+    # excluded independently: the common shape is a settled verdict with an
+    # unsettled reason, and the verdict there is real evidence.
+    #
+    # false_approve_rate is the sharpest case. It is a safety number, and a
+    # coin flip recorded as an approve corrupts exactly the metric that governs
+    # deployment risk.
+    # `is not None` rather than the `settled` properties: identical meaning,
+    # but it lets a type checker narrow away the Optional for everything below.
+    matched = [(p, r) for p, r in judged if r.verdict is not None]
+    n_unsettled_verdict = len(judged) - len(matched)
+    n_unsettled_reason = sum(1 for _, r in judged if r.reason is None)
+    if not matched:
+        raise ValueError(
+            f"no pair has a settled verdict: all {len(judged)} judged pairs had "
+            f"votes with no majority, so there is nothing to score. Their flip "
+            f"rates are still meaningful — see the scenario report."
+        )
 
     # Narrowed once, here: the unruled guard above means every pair carries a
     # ruling, so the rest of this function works with plain strings.
@@ -119,13 +147,15 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     reason_by_id = {p.id: p.reason.value for p in pairs if p.reason is not None}
 
     truth = [truth_by_id[p.id] for p, _ in matched]
-    predicted = [r.verdict for _, r in matched]
+    predicted = [r.verdict for _, r in matched if r.verdict is not None]
     n = len(matched)
 
     rejects = [(p, r) for p, r in matched if truth_by_id[p.id] == "reject"]
     false_approves = sum(r.verdict == "approve" for _, r in rejects)
 
-    confusion = Counter((reason_by_id[p.id], r.reason.value) for p, r in matched)
+    confusion = Counter(
+        (reason_by_id[p.id], r.reason.value) for p, r in judged if r.reason is not None
+    )
 
     run_kappas = _per_run_kappas(truth_by_id, known)
     kappa_mean, kappa_sd = mean_sd(run_kappas)
@@ -141,7 +171,13 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     return ModelScore(
         model_id=known[0].model_id,
         n=n,
-        coverage=n / len(pairs),
+        # Coverage answers "did this backend judge the whole set", which is a
+        # different question from "did its votes decide". Computed over JUDGED
+        # pairs so a contested pair does not trip the leaderboard's
+        # partial-coverage gate and silently drop the model from the ranking.
+        coverage=len(judged) / len(pairs),
+        n_unsettled_verdict=n_unsettled_verdict,
+        n_unsettled_reason=n_unsettled_reason,
         accuracy=sum(t == pr for t, pr in zip(truth, predicted)) / n,
         kappa=cohens_kappa(truth, predicted),
         false_approve_rate=false_approves / len(rejects) if rejects else 0.0,
@@ -218,8 +254,14 @@ def render_leaderboard(scores: list[ModelScore]) -> str:
         "0.000 whenever votes = 1, meaning unmeasured rather than stable. Models whose",
         "95% intervals overlap share a tier and are deliberately left unordered.",
         "",
-        "| Tier | Model | n | Votes | Coverage | Accuracy | Kappa | Kappa sd | Kappa 95% CI | Verdict flip | Reason flip | False-approve rate |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "`n` counts pairs actually SCORED. A pair whose votes had no majority was",
+        "decided by nothing — the tie-break would have invented the answer — so it is",
+        "excluded and counted under `Unsettled` instead. Verdict and reason are",
+        "excluded independently: a settled verdict still scores for kappa even when",
+        "its reason did not settle.",
+        "",
+        "| Tier | Model | n | Unsettled (verdict/reason) | Votes | Coverage | Accuracy | Kappa | Kappa sd | Kappa 95% CI | Verdict flip | Reason flip | False-approve rate |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     tiers = separability_tiers(ranked)
     for tier_no, tier in enumerate(tiers, 1):
@@ -227,7 +269,9 @@ def render_leaderboard(scores: list[ModelScore]) -> str:
         for s in tier:
             lo, hi = s.kappa_ci
             lines.append(
-                f"| {label} | {s.model_id} | {s.n} | {s.n_votes} | {s.coverage:.0%} | "
+                f"| {label} | {s.model_id} | {s.n} | "
+                f"{s.n_unsettled_verdict}/{s.n_unsettled_reason} | "
+                f"{s.n_votes} | {s.coverage:.0%} | "
                 f"{s.accuracy:.3f} | {s.kappa:.3f} | {s.kappa_sd:.3f} | "
                 f"[{lo:.3f}, {hi:.3f}] | {s.verdict_flip_rate:.3f} | "
                 f"{s.reason_flip_rate:.3f} | {s.false_approve_rate:.3f} |"

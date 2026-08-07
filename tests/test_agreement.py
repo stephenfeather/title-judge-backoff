@@ -89,3 +89,51 @@ def test_agreement_uses_the_majority_across_votes():
     ]
     steady = model_votes("model-s", {"p1": ("approve", "ok")})
     assert pairwise_agreement(noisy, steady) == 1.0
+
+
+# --- unsettled pairs are not evidence of anything (issue #12) ---------------
+
+
+def tied_verdict(model_id, pair_id):
+    """Two votes, one each way: no majority."""
+    return [
+        make_verdict(pair_id, "approve", "ok", model_id=model_id, run_index=0),
+        make_verdict(pair_id, "reject", "casing_error", model_id=model_id, run_index=1),
+    ]
+
+
+def test_agreement_skips_a_pair_whose_verdict_did_not_settle():
+    # An unsettled pair has no verdict to compare. Counting it as a match or a
+    # mismatch both invent a fact.
+    left = tied_verdict("a", "tied") + model_votes("a", {"p1": ("approve", "ok")})
+    right = tied_verdict("b", "tied") + model_votes("b", {"p1": ("approve", "ok")})
+    # Only p1 is comparable, and it matches.
+    assert pairwise_agreement(left, right) == 1.0
+
+
+def test_two_unsettled_pairs_do_not_count_as_agreeing():
+    # The trap: both sides are None, None == None, and a naive comparison
+    # reports perfect agreement on a pair neither model actually decided.
+    left = tied_verdict("a", "tied")
+    right = tied_verdict("b", "tied")
+    assert pairwise_agreement(left, right) is None
+
+
+def test_reason_distribution_excludes_an_unsettled_reason():
+    three_way = [
+        make_verdict("p1", "reject", "meaning_change", model_id="m", run_index=0),
+        make_verdict("p1", "reject", "ok", model_id="m", run_index=1),
+        make_verdict("p1", "reject", "overcorrection", model_id="m", run_index=2),
+    ]
+    settled = model_votes("m", {"p2": ("reject", "casing_error")})
+    assert reason_distribution(three_way + settled) == {"casing_error": 1}
+
+
+def test_reason_cross_tab_skips_pairs_where_either_side_is_unsettled():
+    three_way = [
+        make_verdict("shared", "reject", "meaning_change", model_id="a", run_index=0),
+        make_verdict("shared", "reject", "ok", model_id="a", run_index=1),
+        make_verdict("shared", "reject", "overcorrection", model_id="a", run_index=2),
+    ]
+    other = model_votes("b", {"shared": ("reject", "casing_error")})
+    assert reason_cross_tab(three_way, other) == {}
