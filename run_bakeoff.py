@@ -33,6 +33,7 @@ from judge.client import (
     Backend,
     JudgeClient,
     LimiterRegistry,
+    RateLimiter,
     limiter_host,
     load_backends,
     rate_limit_penalty,
@@ -299,10 +300,16 @@ class ResultWriter:
                     fh.write(item + "\n")
                     fh.flush()
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            # Deliberately BaseException, not Exception. Anything at all that
+            # kills this thread must be recorded, because a writer that dies
+            # unnoticed turns a corrupted run into one that merely looks short.
+            # It IS re-raised — on the caller's thread, out of __exit__.
             self._failure = exc
-            # Keep draining so no worker's put() outlives a dead consumer.
-            while self._queue.get() is not self._STOP:
-                pass
+            # Discard whatever is still queued so no producer ends up blocked
+            # on a consumer that is no longer writing anything.
+            while True:
+                if self._queue.get() is self._STOP:
+                    break
 
 
 class RunHealth:
@@ -336,6 +343,66 @@ class RunHealth:
             # makes, and the one worth knowing about.
             self.failed_latencies.append(seconds)
             self.errors.append(type(exc).__name__)
+
+
+def _handle_call_failure(
+    backend: Backend,
+    limiter: RateLimiter,
+    exc: Exception,
+    *,
+    pair_id: str,
+    run_index: int,
+) -> None:
+    """Report one failed vote, and slow the host if it was a 429.
+
+    A 429 is the host saying the bucket is too generous, so the penalty lands
+    on the HOST — every worker on it, and every other backend sharing it — not
+    only the worker that happened to catch it. The call itself is not retried
+    in-run; resume picks it up next launch, like any other failed vote.
+    """
+    penalty = rate_limit_penalty(exc)
+    if penalty is not None:
+        limiter.penalize(penalty)
+        print(
+            f"[{backend.name}] 429 from {limiter_host(backend.base_url)}: "
+            f"holding that host back {penalty:g}s",
+            file=sys.stderr,
+        )
+    print(f"[{backend.name}] {pair_id} vote {run_index}: ERROR {exc}", file=sys.stderr)
+
+
+def _write_manifest(
+    backend: Backend,
+    pairs: list[Pair],
+    out_dir: Path,
+    *,
+    votes: int,
+    client: JudgeClient,
+    health: RunHealth,
+) -> None:
+    """Record what this run actually sent, once the run is over.
+
+    Written AFTER the calls so observed_models reflects every snapshot that
+    answered, including a provider swapping the model mid-run.
+    """
+    manifest_path = out_dir / f"{backend.name}.manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            run_manifest(
+                backend,
+                votes=votes,
+                prompt_version=PROMPT_VERSION,
+                n_pairs=len(pairs),
+                sample_payload=client.request_body(pairs[0]),
+                observed_models=client.observed_models,
+                latencies=health.latencies,
+                errors=health.errors,
+                failed_latencies=health.failed_latencies,
+            ),
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 def run_backend(
@@ -391,23 +458,7 @@ def run_backend(
             verdict = client.judge(pair, run_index=run_index)
         except Exception as exc:  # noqa: BLE001 - keep going, resume covers gaps
             health.record_failure(time.monotonic() - started, exc)
-            # A 429 is the host saying the bucket is too generous, so slow the
-            # HOST — every worker on it, and every other backend sharing it —
-            # rather than only the worker that happened to catch it. This call
-            # is not retried in-run; resume picks it up on the next launch, the
-            # same as any other failed vote.
-            penalty = rate_limit_penalty(exc)
-            if penalty is not None:
-                limiter.penalize(penalty)
-                print(
-                    f"[{backend.name}] 429 from {limiter_host(backend.base_url)}: "
-                    f"holding that host back {penalty:g}s",
-                    file=sys.stderr,
-                )
-            print(
-                f"[{backend.name}] {pair.id} vote {run_index}: ERROR {exc}",
-                file=sys.stderr,
-            )
+            _handle_call_failure(backend, limiter, exc, pair_id=pair.id, run_index=run_index)
             return
         health.record_ok(time.monotonic() - started)
         writer.write(verdict_to_json_line(verdict))
@@ -434,26 +485,7 @@ def run_backend(
                 raise
             else:
                 pool.shutdown(wait=True)
-        # Written after the run so observed_models reflects every snapshot that
-        # actually answered, including a mid-run swap.
-        manifest_path = out_dir / f"{backend.name}.manifest.json"
-        manifest_path.write_text(
-            json.dumps(
-                run_manifest(
-                    backend,
-                    votes=votes,
-                    prompt_version=PROMPT_VERSION,
-                    n_pairs=len(pairs),
-                    sample_payload=client.request_body(pairs[0]),
-                    observed_models=client.observed_models,
-                    latencies=health.latencies,
-                    errors=health.errors,
-                    failed_latencies=health.failed_latencies,
-                ),
-                indent=2,
-            )
-            + "\n"
-        )
+        _write_manifest(backend, pairs, out_dir, votes=votes, client=client, health=health)
     finally:
         client.close()
 
