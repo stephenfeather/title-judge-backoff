@@ -263,7 +263,7 @@ def order_rows(
         # verdict flip rate of 0.0 and filed itself with the calm rows —
         # behind rows every judge agreed on. It is the pair most in need of a
         # human, and the operator's attention is the scarce resource here.
-        undecided = 0 if (stat.settled and stat.reason_settled) else 1
+        undecided = 0 if stat.settled else 1  # `settled` is verdict AND reason
         return (0, -undecided, -stat.flip_rate, index)
 
     return [row for _, row in sorted(enumerate(rows), key=rank)]

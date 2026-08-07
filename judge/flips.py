@@ -63,8 +63,16 @@ class FlipStats:
     flip_rate: float
     reason_majority: str | None = None  # None when the REASON codes tied
 
+    # These three mirror `judge.vote.VoteResult` EXACTLY — same names, same
+    # meanings. Both types reach ruling and scoring code, so one vocabulary is
+    # not tidiness: `settled` previously meant verdict-only here and
+    # verdict-AND-reason there, while `reason_settled` already agreed. Partial
+    # alignment is the dangerous kind — a reader who checks one name, finds it
+    # consistent, and assumes the third silently misses an unsettled REASON,
+    # which is a tie flowing through as truth.
+
     @property
-    def settled(self) -> bool:
+    def verdict_settled(self) -> bool:
         """False when no verdict holds the top count on its own.
 
         This card feeds the pass where ground truth is CREATED. Everywhere else
@@ -77,6 +85,10 @@ class FlipStats:
     @property
     def reason_settled(self) -> bool:
         return self.reason_majority is not None
+
+    @property
+    def settled(self) -> bool:
+        return self.verdict_settled and self.reason_settled
 
 
 class VerdictLike(Protocol):
@@ -207,7 +219,7 @@ def render_flip_pane(stats: FlipStats | None) -> str:
     # Naming the tied side matters too. "UNDECIDED" alone invites the operator
     # to go hunting for why; saying which values tied answers it in place.
     flags = []
-    if not stats.settled:
+    if not stats.verdict_settled:
         flags.append(f"verdict ({_tied_values(stats.verdicts)})")
     if not stats.reason_settled:
         flags.append(f"reason ({_tied_values(stats.reasons)})")

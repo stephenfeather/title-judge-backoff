@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from judge import flips
 from judge.schema import ReasonCode, Verdict
+from judge.vote import tally_votes
 
 
 def verdict(pair_id: str, value: str, reason: ReasonCode, model_id: str) -> Verdict:
@@ -125,6 +126,43 @@ def test_pane_rate_is_the_same_function_the_vote_tally_uses():
     assert stats["a"].flip_rate == flip_rate(values)
 
 
+def test_flipstats_settled_means_the_same_thing_as_voteresult_settled():
+    """Two types, one vocabulary — a divergence here must fail, not compile.
+
+    `FlipStats.settled` originally meant "the verdict decided" while
+    `VoteResult.settled` meant "verdict AND reason decided". Same word, same
+    codebase, both consumed by ruling and scoring code. The trap was that
+    `reason_settled` already agreed across the two, so a reader who checked one
+    name and found it consistent had every reason to assume the third was too —
+    and would silently miss an unsettled REASON, which is a tie flowing through
+    as truth, the exact thing #20 and #22 exist to stop.
+    """
+    settled_verdict_tied_reason = (
+        [verdict("p", "reject", ReasonCode.OK, "m1"), verdict("p", "reject", ReasonCode.OK, "m2")]
+        + [
+            verdict("p", "reject", ReasonCode.CASING_ERROR, "m3"),
+            verdict("p", "reject", ReasonCode.CASING_ERROR, "m4"),
+        ]
+    )
+    stats = flips.flip_stats(settled_verdict_tied_reason)["p"]
+    tally = tally_votes(
+        [
+            Verdict("p", "reject", ReasonCode.OK, "m", "v1", None, run_index=0),
+            Verdict("p", "reject", ReasonCode.OK, "m", "v1", None, run_index=1),
+            Verdict("p", "reject", ReasonCode.CASING_ERROR, "m", "v1", None, run_index=2),
+            Verdict("p", "reject", ReasonCode.CASING_ERROR, "m", "v1", None, run_index=3),
+        ]
+    )[0]
+
+    for name in ("verdict_settled", "reason_settled", "settled"):
+        assert getattr(stats, name) == getattr(tally, name), f"{name} diverged"
+
+    # And specifically: a settled verdict with a tied reason is NOT settled.
+    assert stats.verdict_settled is True
+    assert stats.reason_settled is False
+    assert stats.settled is False
+
+
 def test_a_tied_pair_has_no_majority_rather_than_a_tie_broken_one():
     """Issue #21. This card feeds the pass where GROUND TRUTH is created, so a
     fabricated value here anchors a label nothing can later recompute."""
@@ -135,7 +173,7 @@ def test_a_tied_pair_has_no_majority_rather_than_a_tie_broken_one():
         ]
     )
     assert stats["a"].majority is None
-    assert stats["a"].settled is False
+    assert stats["a"].verdict_settled is False
 
 
 def test_a_clear_pair_still_reports_its_majority():
@@ -147,7 +185,7 @@ def test_a_clear_pair_still_reports_its_majority():
         ]
     )
     assert stats["a"].majority == "approve"
-    assert stats["a"].settled is True
+    assert stats["a"].verdict_settled is True
 
 
 def test_repeat_verdicts_from_one_model_count_as_repeats():
@@ -382,12 +420,23 @@ def test_render_flip_pane_without_stats_is_empty():
 #   e10-8a1d3065c6e8  reason   overcorrection 12 / ok 12       n=33
 
 
+MODELS = 8  # the slate size; the real run is 8 backends at ~4 votes each
+
+
 def split_verdicts(pair_id, approve, reject):
-    """`approve` + `reject` judgments spread across distinct models."""
+    """`approve` + `reject` judgments spread over MODELS backends.
+
+    Votes are dealt round-robin across a FIXED set of model ids rather than one
+    id per judgment. An earlier version gave every judgment its own model, so a
+    fixture claiming to reproduce "32 judgments from eight models" built 32
+    models — and `render_flip_pane` prints that count, so the test exercised a
+    shape the sweep cannot produce. Majority-of-N means votes always outnumber
+    models; a fixture where they are equal is not modelling this system.
+    """
     return [
-        verdict(pair_id, "approve", ReasonCode.OK, f"m{i}") for i in range(approve)
+        verdict(pair_id, "approve", ReasonCode.OK, f"m{i % MODELS}") for i in range(approve)
     ] + [
-        verdict(pair_id, "reject", ReasonCode.CASING_ERROR, f"m{approve + i}")
+        verdict(pair_id, "reject", ReasonCode.CASING_ERROR, f"m{(approve + i) % MODELS}")
         for i in range(reject)
     ]
 
@@ -396,9 +445,16 @@ def test_pane_says_undecided_when_the_verdict_is_tied():
     # e10-4f92576a25bf: 16-16 across 32 judgments from eight models. Not a coin
     # flip on thin data — deep, well-sampled disagreement, and the single pair
     # an operator most needs flagged rather than summarised.
-    stats = flips.flip_stats(split_verdicts("e10-4f92576a25bf", 16, 16))
-    pane = flips.render_flip_pane(stats["e10-4f92576a25bf"])
+    stats = flips.flip_stats(split_verdicts("e10-4f92576a25bf", 16, 16))["e10-4f92576a25bf"]
+    # Pin the shape the comment claims. The pane PRINTS the model count, so a
+    # fixture that drifts from the real data renders a case the sweep cannot
+    # produce — and this comment's "eight models" was quoted onward once
+    # already, off a fixture that actually built 32.
+    assert (stats.n, len(stats.models)) == (32, 8)
+
+    pane = flips.render_flip_pane(stats)
     assert "UNDECIDED" in pane
+    assert "from 8 models" in pane
     # The counts must still be there — the flag explains them, it does not
     # replace them.
     assert "approve 16" in pane and "reject 16" in pane
