@@ -3,9 +3,10 @@ import random
 import threading
 import time
 
+import httpx
 import pytest
 
-from judge.client import Backend, LimiterRegistry
+from judge.client import RETRY_AFTER_DEFAULT_S, Backend, LimiterRegistry
 from judge.prompts import PROMPT_VERSION
 from judge.schema import Pair, ReasonCode, Verdict, verdict_to_json_line
 from run_bakeoff import (
@@ -382,6 +383,24 @@ class FakeClient:
         self.closed = True
 
 
+class RateLimitedClient(FakeClient):
+    """Always 429s, the way an over-subscribed shared host does."""
+
+    def judge(self, pair, run_index=0):
+        request = httpx.Request("POST", f"{self.backend.base_url}/chat/completions")
+        response = httpx.Response(429, request=request)
+        raise httpx.HTTPStatusError("429 Too Many Requests", request=request, response=response)
+
+
+class MixedFailureClient(FakeClient):
+    """Fails with a different exception type per pair, to exercise error_kinds."""
+
+    _KINDS = [ValueError, RuntimeError, TypeError, KeyError, ArithmeticError, OSError]
+
+    def judge(self, pair, run_index=0):
+        raise self._KINDS[int(pair.id.removeprefix("p")) % len(self._KINDS)](pair.id)
+
+
 def no_sleep_limiters():
     return LimiterRegistry(sleep=lambda _: None)
 
@@ -553,6 +572,70 @@ def test_run_backend_still_cannot_outrun_the_host_rate_limit(tmp_path):
     # 8 calls one interval apart occupy at least 7 intervals however many
     # threads are waiting on them.
     assert elapsed >= 7 * interval * 0.9, f"8 calls left in {elapsed:.3f}s — rate limit bypassed"
+
+
+def test_a_429_from_one_worker_holds_back_the_whole_host(tmp_path):
+    # The concurrency-specific failure: with per-worker backoff the other seven
+    # workers keep hammering a host that just said stop. The penalty has to
+    # land on the shared bucket, so it must be visible to a DIFFERENT backend
+    # on the same host.
+    penalties = []
+    backend = concurrency_backend("nv-a", base_url="https://integrate.api.nvidia.com/v1")
+    other = concurrency_backend("nv-b", base_url="https://integrate.api.nvidia.com/v1")
+    registry = no_sleep_limiters()
+    shared = registry.for_backend(other)
+    shared.penalize = lambda seconds: penalties.append(seconds)  # type: ignore[method-assign]
+
+    pairs = [make_pair("p0")]
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=registry,
+        client_factory=lambda b: RateLimitedClient(b),
+    )
+    assert penalties == [RETRY_AFTER_DEFAULT_S], "the shared host bucket was never penalized"
+
+
+def test_a_non_429_failure_does_not_hold_back_the_host(tmp_path):
+    # A 500 says "this call broke", not "you are going too fast". Backing the
+    # whole host off for every transient error would throttle the run to
+    # nothing on a flaky backend.
+    penalties = []
+    backend = concurrency_backend()
+    registry = no_sleep_limiters()
+    registry.for_backend(backend).penalize = lambda s: penalties.append(s)  # type: ignore[method-assign]
+    run_backend(
+        backend,
+        [make_pair("p0")],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=registry,
+        client_factory=lambda b: FakeClient(b, fail_pair_ids=["p0"]),
+    )
+    assert penalties == []
+
+
+def test_health_error_kinds_are_reported_in_a_stable_order(tmp_path):
+    # Concurrency makes the ARRIVAL order of errors arbitrary, and
+    # dict(Counter(...)) preserves insertion order — so the manifest's
+    # error_kinds keys would shuffle between otherwise identical runs.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(6)]
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=1,
+        concurrency=6,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: MixedFailureClient(b),
+    )
+    error_kinds = json.loads((tmp_path / "nv.manifest.json").read_text())["health"]["error_kinds"]
+    assert list(error_kinds) == sorted(error_kinds)
 
 
 def test_run_backend_resume_writes_no_duplicate_votes(tmp_path):

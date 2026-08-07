@@ -90,6 +90,17 @@ pre-concurrency runs. Three invariants hold this together — do not weaken them
 - **One writer per results file.** Workers hand lines to `ResultWriter`, whose
   single thread owns the handle. The append-and-flush-per-line contract is what
   makes a killed run resumable, and it only holds with one writer.
+- **A 429 backs off the HOST, not the worker.** `RateLimiter.penalize()` holds
+  every caller on that host — including other backends sharing it. Backing off
+  only the worker that caught the 429 leaves the other N-1 hammering an
+  overloaded host, which is the concurrency version of the same bug. The call
+  itself is not retried in-run; resume covers it like any other failed vote.
+
+Never infer rate-limit headroom from response headers. DeepInfra — the
+successor host for deepseek after NVIDIA's free tier ends — sends no
+`x-ratelimit-*` and no `Retry-After` at all (verified live 2026-08-07). Treat a
+declared `rpm` as a request, not a guarantee; a 429 is the host telling you the
+bucket was too generous.
 
 The todo list is partitioned ONCE, before any worker starts. A worker that
 re-read the results file could hand the same `(pair_id, run_index)` to two

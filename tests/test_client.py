@@ -5,7 +5,15 @@ import time
 import httpx
 import pytest
 
-from judge.client import Backend, LimiterRegistry, JudgeClient, RateLimiter, load_backends
+from judge.client import (
+    RETRY_AFTER_DEFAULT_S,
+    Backend,
+    JudgeClient,
+    LimiterRegistry,
+    RateLimiter,
+    load_backends,
+    rate_limit_penalty,
+)
 from judge.schema import Pair, ReasonCode
 
 BACKENDS_TOML = """\
@@ -207,6 +215,80 @@ def test_limiter_registry_keeps_the_lowest_rpm_regardless_of_registration_order(
     limiter.wait()
     limiter.wait()
     assert sleeps == [3.0]
+
+
+def http_429(retry_after=None):
+    headers = {"retry-after": retry_after} if retry_after is not None else {}
+    response = httpx.Response(429, headers=headers, request=httpx.Request("POST", "https://x.test"))
+    return httpx.HTTPStatusError("429", request=response.request, response=response)
+
+
+def test_rate_limit_penalty_ignores_errors_that_are_not_429():
+    other = httpx.HTTPStatusError(
+        "500",
+        request=httpx.Request("POST", "https://x.test"),
+        response=httpx.Response(500, request=httpx.Request("POST", "https://x.test")),
+    )
+    assert rate_limit_penalty(other) is None
+    assert rate_limit_penalty(RuntimeError("boom")) is None
+
+
+def test_rate_limit_penalty_defaults_when_the_host_sends_no_header():
+    # DeepInfra — the successor host for deepseek once NVIDIA's free tier ends
+    # — sends no x-ratelimit-* and no Retry-After at all (verified live
+    # 2026-08-07). Headroom is not discoverable in-band, so a 429 there carries
+    # no number and the default has to apply.
+    assert rate_limit_penalty(http_429()) == RETRY_AFTER_DEFAULT_S
+
+
+def test_rate_limit_penalty_honors_retry_after_when_the_host_sends_one():
+    assert rate_limit_penalty(http_429("12")) == 12.0
+
+
+def test_rate_limit_penalty_falls_back_on_an_unparseable_retry_after():
+    # Retry-After may legally be an HTTP-date. Rather than parse dates, fall
+    # back — a wrong small number is worse than a conservative default.
+    assert rate_limit_penalty(http_429("Wed, 21 Oct 2026 07:28:00 GMT")) == RETRY_AFTER_DEFAULT_S
+
+
+def test_penalize_delays_every_caller_on_the_host_not_just_the_one_that_429ed():
+    # The concurrency-specific bug: back off only the worker that got the 429
+    # and the other seven keep hammering the same host. The bucket is the
+    # enforcement point, so the penalty has to live there.
+    sleeps = []
+    clock = {"now": 0.0}
+    limiter = RateLimiter(rpm=6000, now=lambda: clock["now"], sleep=sleeps.append)
+    limiter.wait()  # a call departs at t=0
+    limiter.penalize(30.0)  # ...and comes back 429
+    limiter.wait()  # the NEXT caller — a different worker — must wait it out
+    assert sleeps == [30.01]  # 30s penalty + the 0.01s rate interval
+
+
+def test_penalize_does_not_shorten_an_existing_longer_backoff():
+    # Eight workers in flight can each catch a 429 for the same overload. The
+    # penalties must not stack into a multi-minute stall, nor let a late small
+    # one undercut a longer wait already in force.
+    sleeps = []
+    clock = {"now": 0.0}
+    limiter = RateLimiter(rpm=6000, now=lambda: clock["now"], sleep=sleeps.append)
+    limiter.wait()
+    limiter.penalize(30.0)
+    limiter.penalize(5.0)  # a second worker's 429, shorter
+    limiter.wait()
+    assert sleeps == [30.01]
+
+
+def test_penalize_is_shared_by_every_backend_on_the_host():
+    # Two NVIDIA backends, one endpoint: a 429 earned by one must slow both.
+    sleeps = []
+    clock = {"now": 0.0}
+    registry = LimiterRegistry(now=lambda: clock["now"], sleep=sleeps.append)
+    deepseek = limiter_backend("nvidia-deepseek", "https://integrate.api.nvidia.com/v1", 6000)
+    nemotron = limiter_backend("nvidia-nemotron", "https://integrate.api.nvidia.com/v1", 6000)
+    registry.for_backend(deepseek).wait()
+    registry.for_backend(deepseek).penalize(30.0)
+    registry.for_backend(nemotron).wait()
+    assert sleeps == [30.01]
 
 
 def test_judge_client_parses_chat_completion(monkeypatch):

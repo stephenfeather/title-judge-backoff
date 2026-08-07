@@ -149,6 +149,56 @@ class RateLimiter:
         with self._lock:
             self._interval = max(self._interval, 60.0 / rpm)
 
+    def penalize(self, seconds: float) -> None:
+        """Hold back EVERY caller on this host for `seconds` after a 429.
+
+        Backing off only the worker that caught the 429 is the concurrency
+        version of the bug this whole registry exists to prevent: the other N-1
+        workers keep hammering the same overloaded host while one of them
+        sleeps. The bucket is the enforcement point, so the penalty lives here.
+
+        Never shortens a longer penalty already in force. Eight workers in
+        flight can each catch a 429 for the same overload; taking the max keeps
+        that from either stacking into a multi-minute stall or letting a late
+        small penalty undercut a longer wait.
+        """
+        with self._lock:
+            # Measured from NOW, not from any deadline already set: a 429 means
+            # "do not send for `seconds` from here". Taking the max of the two
+            # deadlines is what keeps concurrent penalties from stacking.
+            deadline = self._now() + seconds
+            self._last = deadline if self._last is None else max(self._last, deadline)
+
+
+# How long to hold a host back after a 429 that carries no Retry-After.
+#
+# Not every provider tells you. DeepInfra — the successor host for deepseek
+# once NVIDIA's free tier ends after 2026-08-07 — sends no `x-ratelimit-*` and
+# no `Retry-After` at all (verified live 2026-08-07), so on that host headroom
+# is not discoverable in band and a declared rpm is a request rather than a
+# guarantee. Nothing here infers headroom from response headers; a 429 is the
+# only signal, and it means the bucket was too generous.
+RETRY_AFTER_DEFAULT_S = 30.0
+
+
+def rate_limit_penalty(exc: BaseException) -> float | None:
+    """Seconds to hold the host back for, or None if `exc` is not a 429.
+
+    `Retry-After` is honored when the host sends a plain number of seconds.
+    The header may legally be an HTTP-date instead; rather than parse dates we
+    fall back to the default, because guessing a small number is worse than
+    waiting a conservative one.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 429:
+        return None
+    raw = exc.response.headers.get("retry-after")
+    if raw is None:
+        return RETRY_AFTER_DEFAULT_S
+    try:
+        return float(raw)
+    except ValueError:
+        return RETRY_AFTER_DEFAULT_S
+
 
 def limiter_host(base_url: str) -> str:
     """The rate-limit key for a base_url: its host, ignoring path and scheme."""

@@ -134,10 +134,21 @@ its allowance. A host runs at the lowest `rpm` any of its backends declares.
 This is not theoretical: running nemotron alongside deepseek on 2026-08-06 drove
 deepseek from p50 2.48s with zero failures to p50 9.77s with 81.
 
+A `429` holds the whole host back, not just the worker that received it, for
+`Retry-After` seconds where the host sends one and 30s where it does not.
+DeepInfra sends no rate-limit headers at all, so on that host headroom is not
+discoverable in advance — a declared `rpm` is a request, and a 429 is the reply.
+The 429'd call is not retried within the run; resume picks it up next launch.
+
 Because workers finish out of order, verdict lines are no longer written in
 pair-then-vote order. Nothing downstream depends on line order — resume keys on
 `(pair_id, run_index)` and scoring orders by the pairs file — but hand-written
 tooling that assumed the old ordering should not.
+
+Note that line order was **already** not guaranteed before concurrency: a vote
+that fails is retried on the next launch and appends at the end of the file. In
+the 2026-08-06 S1 run that left 47 of deepseek's 200 pairs with their votes out
+of `run_index` order.
 
 ## Backend roles and protocols
 

@@ -28,7 +28,14 @@ from pathlib import Path
 from typing import Callable
 
 from judge.check import check_key_presence, ping_backend, render_check_report
-from judge.client import Backend, JudgeClient, LimiterRegistry, load_backends
+from judge.client import (
+    Backend,
+    JudgeClient,
+    LimiterRegistry,
+    limiter_host,
+    load_backends,
+    rate_limit_penalty,
+)
 from judge.prompts import PROMPT_VERSION
 from judge.schema import Pair, pair_from_dict, verdict_from_json_line, verdict_to_json_line
 
@@ -172,7 +179,11 @@ def _health_summary(
         "latency_max": ordered[-1] if ordered else None,
         "failed_latency_median": statistics.median(failed) if failed else None,
         "failed_latency_max": failed[-1] if failed else None,
-        "error_kinds": dict(Counter(errors)),
+        # Sorted, not insertion-ordered: dict(Counter(...)) follows the order
+        # errors ARRIVED, which concurrency makes arbitrary. The counts were
+        # always stable; without this the manifest's key order shuffles between
+        # otherwise identical runs and diffs of two manifests become noise.
+        "error_kinds": dict(sorted(Counter(errors).items())),
     }
 
 
@@ -342,6 +353,19 @@ def run_backend(
             verdict = client.judge(pair, run_index=run_index)
         except Exception as exc:  # noqa: BLE001 - keep going, resume covers gaps
             health.record_failure(time.monotonic() - started, exc)
+            # A 429 is the host saying the bucket is too generous, so slow the
+            # HOST — every worker on it, and every other backend sharing it —
+            # rather than only the worker that happened to catch it. This call
+            # is not retried in-run; resume picks it up on the next launch, the
+            # same as any other failed vote.
+            penalty = rate_limit_penalty(exc)
+            if penalty is not None:
+                limiter.penalize(penalty)
+                print(
+                    f"[{backend.name}] 429 from {limiter_host(backend.base_url)}: "
+                    f"holding that host back {penalty:g}s",
+                    file=sys.stderr,
+                )
             print(
                 f"[{backend.name}] {pair.id} vote {run_index}: ERROR {exc}",
                 file=sys.stderr,
