@@ -386,7 +386,7 @@ def test_a_pair_the_judges_could_not_decide_comes_first():
     # if the row sits at position 180 of a 200-row pass. The pair the judges
     # deadlocked on is the pair most in need of a human, so it leads.
     verdicts = (
-        # e10-816b0c7d2b94 shape: unanimous reject, reason dead even 14/14. Its
+        # e10-tie2 shape: unanimous reject, reason dead even 14/14. Its
         # VERDICT flip rate is 0.0, so ranking on flip rate alone filed it with
         # the pairs everyone agreed on — behind a unanimous row, in fact.
         [Verdict("tied-reason", "reject", ReasonCode.OK, f"a{i}", "v1", 0.0) for i in range(14)]

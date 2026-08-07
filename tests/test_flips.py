@@ -414,10 +414,18 @@ def test_render_flip_pane_without_stats_is_empty():
 
 # --- undecided must be unmissable (issue #21) -------------------------------
 #
-# Fixtures are the three real ties measured across the pooled 2026-08-06 run:
-#   e10-4f92576a25bf  verdict  approve 16 / reject 16          n=32
-#   e10-816b0c7d2b94  reason   ok 14 / casing_error 14         n=33
-#   e10-8a1d3065c6e8  reason   overcorrection 12 / ok 12       n=33
+# Synthetic pairs covering the three tie shapes that occur in practice. Ids and
+# counts are invented; only the SHAPES are drawn from experience, because those
+# are what the rendering has to handle:
+#
+#   e10-tie1  verdict tied, deep and well sampled — the hard case
+#   e10-tie2  verdict unanimous, reason tied — the common case
+#   e10-tie3  reason tied with a third code also present, so a tie is not the
+#             same as "only two codes appeared"
+#
+# Per AGENTS.md: synthetic fixtures only. Real pair ids and their measured vote
+# distributions are calibration data and do not belong in a repo that may go
+# public — an earlier version of these tests copied both.
 
 
 MODELS = 8  # the slate size; the real run is 8 backends at ~4 votes each
@@ -442,10 +450,10 @@ def split_verdicts(pair_id, approve, reject):
 
 
 def test_pane_says_undecided_when_the_verdict_is_tied():
-    # e10-4f92576a25bf: 16-16 across 32 judgments from eight models. Not a coin
+    # e10-tie1: 16-16 across 32 judgments from eight models. Not a coin
     # flip on thin data — deep, well-sampled disagreement, and the single pair
     # an operator most needs flagged rather than summarised.
-    stats = flips.flip_stats(split_verdicts("e10-4f92576a25bf", 16, 16))["e10-4f92576a25bf"]
+    stats = flips.flip_stats(split_verdicts("e10-tie1", 16, 16))["e10-tie1"]
     # Pin the shape the comment claims. The pane PRINTS the model count, so a
     # fixture that drifts from the real data renders a case the sweep cannot
     # produce — and this comment's "eight models" was quoted onward once
@@ -469,21 +477,21 @@ def test_pane_does_not_cry_undecided_when_the_judges_agreed():
 
 
 def test_pane_flags_a_tied_reason_even_when_the_verdict_settled():
-    # e10-816b0c7d2b94: every judge said reject, but ok 14 / casing_error 14 on
+    # e10-tie2: every judge said reject, but ok 14 / casing_error 14 on
     # WHY. The verdict is real; the reason is not, and the reason is what the
     # per-reason confusion matrix will score once rulings exist.
     verdicts = (
-        [verdict("e10-816b0c7d2b94", "reject", ReasonCode.OK, f"a{i}") for i in range(14)]
+        [verdict("e10-tie2", "reject", ReasonCode.OK, f"a{i}") for i in range(14)]
         + [
-            verdict("e10-816b0c7d2b94", "reject", ReasonCode.CASING_ERROR, f"b{i}")
+            verdict("e10-tie2", "reject", ReasonCode.CASING_ERROR, f"b{i}")
             for i in range(14)
         ]
         + [
-            verdict("e10-816b0c7d2b94", "reject", ReasonCode.OVERCORRECTION, f"c{i}")
+            verdict("e10-tie2", "reject", ReasonCode.OVERCORRECTION, f"c{i}")
             for i in range(5)
         ]
     )
-    pane = flips.render_flip_pane(flips.flip_stats(verdicts)["e10-816b0c7d2b94"])
+    pane = flips.render_flip_pane(flips.flip_stats(verdicts)["e10-tie2"])
     banner = pane.splitlines()[0]
     assert "UNDECIDED" in banner
     # Specifically the REASON, not the verdict — asserting the bare word

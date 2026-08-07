@@ -347,7 +347,7 @@ def test_leaderboard_shows_spread_and_flip_columns():
 ORDER_VERDICTS = (
     votes_for("p1", [("approve", "ok"), ("reject", "meaning_change"), ("approve", "ok")])
     + votes_for("p2", [("approve", "ok"), ("approve", "ok"), ("reject", "casing_error")])
-    # p3 is modelled on deepseek's e10-4fd6ba61ea52 from the 2026-08-06 S1 run:
+    # p3 uses the shape a real sweep produces most often:
     # verdict settled 3-0, reason split three ways. Only the tie-break decides
     # its reason, so any order dependence shows up here first. `reason` has five
     # codes and demonstrably splits three ways in production; `verdict` is
@@ -403,7 +403,7 @@ def test_scoring_a_shuffled_results_file_is_byte_identical(tmp_path):
 def test_resume_style_reordering_does_not_change_the_ruling():
     # The exact shape resume produces: a failed vote retried on a later launch
     # lands AFTER every other pair's votes rather than beside its siblings.
-    # Modelled on deepseek's e10-4fd6ba61ea52, whose run_index 0 sat at file
+    # The shape resume produces: a retried vote 0 lands at file
     # position 521 while its run_index 1 and 2 sat at positions 28 and 29.
     in_order = list(ORDER_VERDICTS)
     late, rest = [], []
@@ -435,7 +435,7 @@ def test_unsettled_verdict_is_excluded_from_kappa_and_counted():
 
 
 def test_unsettled_reason_is_excluded_from_confusion_but_not_from_kappa():
-    # deepseek's shape: verdict settled 3-0, reason split 1-1-1. The verdict is
+    # The common shape: verdict settled 3-0, reason split 1-1-1. The verdict is
     # real evidence and must still be scored; only the reason is unusable.
     verdicts = (
         votes_for(
