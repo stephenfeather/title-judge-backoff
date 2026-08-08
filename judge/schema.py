@@ -61,6 +61,105 @@ class Pair:
 
 
 @dataclass(frozen=True)
+class Usage:
+    """Tokens one call actually spent, as the host reported them.
+
+    Captured rather than estimated. Before this existed, cost modelling had to
+    derive a chars/token ratio from an unrelated metering call because no run
+    had recorded a single token count.
+
+    Every field is optional because hosts differ in what they report, and an
+    absent count must stay absent: defaulting to 0 would read as a free call
+    and quietly understate a bill.
+
+    Two fields earn their place beyond raw cost:
+
+    * `reasoning_tokens` bill as output. gpt-5.6-luna at effort medium spends
+      ~120 per call, roughly doubling that backend's real cost, and none of it
+      is visible in `completion_tokens` alone on every host.
+    * `cached_tokens` is the tell for a host serving cached responses. The
+      three votes of a majority-of-3 send byte-identical requests, so an
+      undetected response cache would collapse the vote to n=1 and drive the
+      flip rate to a spurious 0.0 — a failure that IMPROVES every metric while
+      measuring nothing.
+    """
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    cached_tokens: int | None = None  # prompt tokens served from cache
+    reasoning_tokens: int | None = None  # billed as output, absent from some hosts
+
+
+def _first_int(source: dict, *keys: str) -> int | None:
+    """The first key present with an int value, or None.
+
+    Explicitly key-presence based rather than `a or b`: a real 0 — no reasoning
+    spent at effort=none — is a measurement, and truthiness chaining discards
+    it as though the host had said nothing.
+    """
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def usage_from_payload(payload: dict) -> Usage | None:
+    """The `usage` block of a response, normalized across API dialects.
+
+    Reads both families this harness talks to and tolerates either naming,
+    because "OpenAI-compatible" hosts vary in which spelling they emit:
+
+        /chat/completions   prompt_tokens / completion_tokens / total_tokens
+                            prompt_tokens_details.cached_tokens
+                            completion_tokens_details.reasoning_tokens
+        /messages           input_tokens / output_tokens, no total
+                            cache_read_input_tokens
+
+    Returns None when the host reported nothing usable, which is a different
+    statement from "this call was free". Unrecognized extra keys are dropped:
+    the fields here are the ones cost modelling and cache detection need, and
+    carrying an arbitrary per-host dict onto every verdict row would bloat the
+    results file with something nothing reads.
+    """
+    block = payload.get("usage")
+    if not isinstance(block, dict) or not block:
+        return None
+
+    prompt = _first_int(block, "prompt_tokens", "input_tokens")
+    completion = _first_int(block, "completion_tokens", "output_tokens")
+    total = _first_int(block, "total_tokens")
+    if total is None and prompt is not None and completion is not None:
+        # Anthropic sends no total; deriving it keeps the field comparable
+        # across backends rather than leaving one dialect permanently blank.
+        total = prompt + completion
+
+    prompt_details = block.get("prompt_tokens_details") or block.get("input_tokens_details") or {}
+    completion_details = (
+        block.get("completion_tokens_details") or block.get("output_tokens_details") or {}
+    )
+    cached = _first_int(block, "cache_read_input_tokens")
+    if cached is None and isinstance(prompt_details, dict):
+        cached = _first_int(prompt_details, "cached_tokens")
+    reasoning = (
+        _first_int(completion_details, "reasoning_tokens")
+        if isinstance(completion_details, dict)
+        else None
+    )
+
+    usage = Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total,
+        cached_tokens=cached,
+        reasoning_tokens=reasoning,
+    )
+    # A block of keys we recognized none of is the same as no block at all.
+    return usage if usage != Usage() else None
+
+
+@dataclass(frozen=True)
 class Verdict:
     """One judge ruling on one pair, tagged with the model/prompt that produced it.
 
@@ -81,6 +180,7 @@ class Verdict:
     temperature: float | None
     run_index: int = 0
     reasoning_effort: str | None = None
+    usage: Usage | None = None  # None = the host reported nothing, see Usage
 
     def __post_init__(self) -> None:
         _check_verdict(self.verdict)
@@ -117,4 +217,8 @@ def verdict_from_json_line(line: str) -> Verdict:
     # so old result directories stay readable instead of raising.
     record.setdefault("run_index", 0)
     record.setdefault("reasoning_effort", None)
+    # Same for usage: every row written before it was captured has no key, and
+    # must load as "not measured" rather than raising.
+    usage = record.get("usage")
+    record["usage"] = Usage(**usage) if isinstance(usage, dict) else None
     return Verdict(**record)

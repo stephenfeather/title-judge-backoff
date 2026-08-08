@@ -2,7 +2,16 @@ import json
 
 import pytest
 
-from judge.schema import Pair, ReasonCode, Verdict, pair_from_dict, verdict_from_json_line, verdict_to_json_line
+from judge.schema import (
+    Pair,
+    ReasonCode,
+    Usage,
+    Verdict,
+    pair_from_dict,
+    usage_from_payload,
+    verdict_from_json_line,
+    verdict_to_json_line,
+)
 
 
 def make_verdict(**overrides):
@@ -174,3 +183,105 @@ def test_pair_from_dict_rejects_bad_ground_truth():
                 "reason": "ok",
             }
         )
+
+
+# --- token usage (issue #11) -------------------------------------------------
+
+
+def test_usage_from_an_openai_chat_completion_payload():
+    # /chat/completions reports prompt_tokens/completion_tokens. Every backend
+    # on the slate except the Anthropic one speaks this dialect.
+    usage = usage_from_payload(
+        {"usage": {"prompt_tokens": 412, "completion_tokens": 18, "total_tokens": 430}}
+    )
+    assert usage == Usage(prompt_tokens=412, completion_tokens=18, total_tokens=430)
+
+
+def test_usage_captures_cached_and_reasoning_token_details():
+    # cached_tokens is the tell for a host serving cached responses — the
+    # failure that would collapse majority-of-3 to n=1 and drive flip rate to a
+    # spurious 0.0. reasoning_tokens bill as output and roughly double a
+    # reasoning backend's real cost.
+    usage = usage_from_payload(
+        {
+            "usage": {
+                "prompt_tokens": 412,
+                "completion_tokens": 138,
+                "total_tokens": 550,
+                "prompt_tokens_details": {"cached_tokens": 384},
+                "completion_tokens_details": {"reasoning_tokens": 120},
+            }
+        }
+    )
+    assert usage.cached_tokens == 384
+    assert usage.reasoning_tokens == 120
+
+
+def test_usage_from_an_anthropic_messages_payload():
+    # Anthropic names them input/output and sends no total at all.
+    usage = usage_from_payload({"usage": {"input_tokens": 300, "output_tokens": 20}})
+    assert usage == Usage(prompt_tokens=300, completion_tokens=20, total_tokens=320)
+
+
+def test_usage_reads_an_anthropic_cache_read():
+    usage = usage_from_payload(
+        {"usage": {"input_tokens": 300, "output_tokens": 20, "cache_read_input_tokens": 288}}
+    )
+    assert usage.cached_tokens == 288
+
+
+def test_usage_is_none_when_the_host_sends_nothing_usable():
+    # Not every OpenAI-compatible host populates usage. Absent must stay
+    # absent rather than becoming zeros, which would read as a free call.
+    assert usage_from_payload({}) is None
+    assert usage_from_payload({"usage": None}) is None
+    assert usage_from_payload({"usage": {}}) is None
+    assert usage_from_payload({"usage": "not a dict"}) is None
+
+
+def test_a_real_zero_is_recorded_rather_than_treated_as_missing():
+    # 0 reasoning tokens at effort=none is a measurement, not an absence.
+    # Chaining `a or b` on token counts would silently discard it.
+    usage = usage_from_payload(
+        {
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 5,
+                "total_tokens": 5,
+                "completion_tokens_details": {"reasoning_tokens": 0},
+            }
+        }
+    )
+    assert usage.prompt_tokens == 0
+    assert usage.reasoning_tokens == 0
+
+
+def test_verdict_round_trips_its_usage():
+    v = Verdict(
+        pair_id="p1",
+        verdict="approve",
+        reason=ReasonCode.OK,
+        model_id="m",
+        prompt_version="v1",
+        temperature=None,
+        usage=Usage(prompt_tokens=412, completion_tokens=18, total_tokens=430),
+    )
+    assert verdict_from_json_line(verdict_to_json_line(v)) == v
+
+
+def test_verdicts_written_before_usage_capture_still_load():
+    # Every existing row in results/ predates this field. They must read as
+    # "not measured" rather than raising, and must not look like a new config.
+    line = json.dumps(
+        {
+            "pair_id": "p1",
+            "verdict": "approve",
+            "reason": "ok",
+            "model_id": "m",
+            "prompt_version": "v1",
+            "temperature": None,
+            "run_index": 0,
+            "reasoning_effort": None,
+        }
+    )
+    assert verdict_from_json_line(line).usage is None
