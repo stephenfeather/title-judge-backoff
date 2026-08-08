@@ -269,6 +269,43 @@ def test_verdict_round_trips_its_usage():
     assert verdict_from_json_line(verdict_to_json_line(v)) == v
 
 
+def test_verdict_round_trips_its_provenance():
+    v = Verdict(
+        pair_id="p1",
+        verdict="approve",
+        reason=ReasonCode.OK,
+        model_id="m",
+        prompt_version="v1",
+        temperature=None,
+        base_url="https://example.test/v1",
+        config_digest="abc123def456",
+        code_version="9b0d01a1c2d3",
+    )
+    assert verdict_from_json_line(verdict_to_json_line(v)) == v
+
+
+def test_verdicts_written_before_provenance_still_load():
+    # Every existing row in results/ predates these fields. Absent must read as
+    # "unknown", which the resume guard then resolves against the manifest —
+    # reading it as a mismatch would invalidate results/ wholesale.
+    line = json.dumps(
+        {
+            "pair_id": "p1",
+            "verdict": "approve",
+            "reason": "ok",
+            "model_id": "m",
+            "prompt_version": "v1",
+            "temperature": None,
+            "run_index": 0,
+            "reasoning_effort": None,
+        }
+    )
+    loaded = verdict_from_json_line(line)
+    assert loaded.base_url is None
+    assert loaded.config_digest is None
+    assert loaded.code_version is None
+
+
 def test_verdicts_written_before_usage_capture_still_load():
     # Every existing row in results/ predates this field. They must read as
     # "not measured" rather than raising, and must not look like a new config.

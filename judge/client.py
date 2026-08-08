@@ -6,6 +6,8 @@ only (never from config or code).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import sys
@@ -81,6 +83,39 @@ class Backend:
                 f"backend {self.name!r}: reasoning_effort must be one of {VALID_EFFORTS}, "
                 f"got {self.reasoning_effort!r}"
             )
+
+
+# Which Backend fields change the judgment, and which only change how the call
+# is scheduled or labelled. The split is the resume identity: everything in the
+# first set feeds config_digest, so a run that differs in any of them cannot
+# silently append to another run's results file (issue #13).
+#
+# Kept as literal sets rather than derived from the dataclass on purpose: a new
+# Backend field must be classified DELIBERATELY. test_every_backend_field_is_
+# classified fails until someone decides, which is the whole point — the rev 1
+# design let `api` and `structured_output` sit outside the identity unnoticed.
+VERDICT_AFFECTING_FIELDS = frozenset(
+    {"base_url", "model_id", "api", "temperature", "reasoning_effort", "structured_output"}
+)
+OPERATIONAL_FIELDS = frozenset({"name", "rpm", "eval_only", "api_key_env", "role", "timeout_s"})
+
+CONFIG_DIGEST_CHARS = 12
+
+
+def config_digest(backend: Backend, *, prompt_version: str) -> str:
+    """Fingerprint of everything about `backend` that shapes the judgment.
+
+    Recorded on every verdict row so a resume can refuse a results file built
+    under a different request configuration — including fields the row does not
+    carry by name, which is what `api` and `structured_output` are.
+
+    Sorted keys and a fixed separator: the digest must not change because a
+    dataclass reordered its fields or json changed its default spacing.
+    """
+    payload = {name: getattr(backend, name) for name in sorted(VERDICT_AFFECTING_FIELDS)}
+    payload["prompt_version"] = prompt_version
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:CONFIG_DIGEST_CHARS]
 
 
 def load_backends(path: str | Path) -> list[Backend]:
@@ -377,7 +412,18 @@ def _auth_headers(api: str, api_key: str) -> dict[str, str]:
 
 
 class JudgeClient:
-    def __init__(self, backend: Backend, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        backend: Backend,
+        transport: httpx.BaseTransport | None = None,
+        *,
+        code_version: str | None = None,
+    ) -> None:
+        # code_version is resolved ONCE per run at the entry point, where
+        # --allow-dirty lives, and handed down — not re-derived per client, so
+        # every row of a run carries one value even if the tree changes mid-run.
+        self.code_version = code_version
+        self.config_digest = config_digest(backend, prompt_version=PROMPT_VERSION)
         api_key = os.environ.get(backend.api_key_env)
         if not api_key:
             raise RuntimeError(
@@ -424,6 +470,11 @@ class JudgeClient:
             # Already in the response — capturing it costs nothing and is the
             # difference between measured and estimated cost (issue #11).
             usage=usage_from_payload(payload),
+            # Provenance (issue #13): which host answered, under which request
+            # configuration, from which code.
+            base_url=self.backend.base_url,
+            config_digest=self.config_digest,
+            code_version=self.code_version,
         )
 
     def close(self) -> None:

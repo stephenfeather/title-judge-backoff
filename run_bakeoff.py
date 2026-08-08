@@ -34,10 +34,12 @@ from judge.client import (
     JudgeClient,
     LimiterRegistry,
     RateLimiter,
+    config_digest,
     limiter_host,
     load_backends,
     rate_limit_penalty,
 )
+from judge.provenance import DirtyTree, GitUnavailable, resolve_code_version
 from judge.prompts import PROMPT_VERSION
 from judge.schema import (
     Pair,
@@ -55,6 +57,21 @@ from judge.schema import (
 DEFAULT_VOTES = 3
 
 
+def _manifest_beside(results_path: Path) -> dict | None:
+    """The sidecar manifest for a results file, or None if unusable.
+
+    Rows written before issue #13 carry no provenance, but `_write_manifest` has
+    always recorded base_url next to them. For a legacy file that sidecar is the
+    only evidence of which host produced it, and ignoring it would turn every
+    pre-existing results directory into a free pass.
+    """
+    path = results_path.with_name(results_path.stem + ".manifest.json")
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def already_judged_ids(
     results_path: Path,
     *,
@@ -62,6 +79,10 @@ def already_judged_ids(
     prompt_version: str,
     temperature: float | None,
     reasoning_effort: str | None,
+    base_url: str | None = None,
+    config_digest: str | None = None,
+    code_version: str | None = None,
+    allow_unknown_provenance: bool = False,
 ) -> set[tuple[str, int]]:
     """(pair_id, run_index) pairs already judged under the SAME run config.
 
@@ -71,16 +92,29 @@ def already_judged_ids(
     N=1.
 
     Raises ValueError if the file holds verdicts from a different model_id,
-    prompt_version, temperature, or reasoning effort — silently resuming over
-    those would mix incomparable verdicts. Note that temperature=None (field
-    omitted) and temperature=0.0 (field sent) are different configs, and that
-    effort changes the reason code the model returns. Use a fresh --out
+    prompt_version, temperature, reasoning effort, host, request configuration,
+    or code version — silently resuming over any of those mixes incomparable
+    verdicts into a file that claims to be one run. Note that temperature=None
+    (field omitted) and temperature=0.0 (field sent) are different configs, and
+    that effort changes the reason code the model returns. Use a fresh --out
     directory for a new run config.
+
+    Provenance (issue #13) is compared per field rather than as a tuple, because
+    absent must mean "unknown, do not compare" and not "mismatch": every row
+    written before #13 lacks all three, and reading those as a mismatch would
+    invalidate results/ wholesale. Unknown is then resolved against the sidecar
+    manifest, and a file that can prove nothing is refused unless the caller
+    explicitly accepts it.
+
+    The provenance arguments default to None for callers that do not track it;
+    passing None disables that field's check entirely. run_backend always passes
+    all three.
     """
     if not results_path.exists():
         return set()
     expected = (model_id, prompt_version, temperature, reasoning_effort)
     ids = set()
+    unproven = False
     for line in results_path.read_text().splitlines():
         if not line.strip():
             continue
@@ -95,8 +129,115 @@ def already_judged_ids(
                 f"temperature={temperature!r}, reasoning_effort={reasoning_effort!r}). "
                 f"Use a fresh --out directory for a new run config."
             )
+        _check_provenance(
+            results_path,
+            found_base_url=v.base_url,
+            found_config_digest=v.config_digest,
+            found_code_version=v.code_version,
+            base_url=base_url,
+            config_digest=config_digest,
+            code_version=code_version,
+        )
+        # ANY expected field the row cannot answer leaves it unproven. Requiring
+        # every field to be absent let a partially stamped row (host recorded,
+        # code version not) satisfy the guard while _check_provenance skipped
+        # the null — resuming it under different code, silently.
+        if (
+            (base_url is not None and v.base_url is None)
+            or (config_digest is not None and v.config_digest is None)
+            or (code_version is not None and v.code_version is None)
+        ):
+            unproven = True
         ids.add((v.pair_id, v.run_index))
+
+    # Only a caller that tracks provenance can be let down by its absence. When
+    # none was passed there is nothing to prove the file against, and demanding
+    # proof would break every call site that predates #13.
+    tracks_provenance = any(x is not None for x in (base_url, config_digest, code_version))
+    if unproven and tracks_provenance:
+        _resolve_unproven_file(
+            results_path,
+            base_url=base_url,
+            allow_unknown_provenance=allow_unknown_provenance,
+        )
     return ids
+
+
+def _check_provenance(
+    results_path: Path,
+    *,
+    found_base_url: str | None,
+    found_config_digest: str | None,
+    found_code_version: str | None,
+    base_url: str | None,
+    config_digest: str | None,
+    code_version: str | None,
+) -> None:
+    """Raise if a row's recorded provenance contradicts this run's.
+
+    Compared only where BOTH sides know the answer: a None on the row is a
+    legacy record, and a None in the expectation is a caller that does not
+    track provenance. Neither is evidence of a mismatch.
+    """
+    if found_base_url is not None and base_url is not None and found_base_url != base_url:
+        raise ValueError(
+            f"{results_path} contains verdicts served by a different host: "
+            f"found base_url={found_base_url!r}, expected base_url={base_url!r}. "
+            f"Two providers serving the same model_id are not one run. "
+            f"Use a fresh --out directory."
+        )
+    if found_code_version is not None and code_version is not None and found_code_version != code_version:
+        raise ValueError(
+            f"{results_path} contains verdicts produced by different code: "
+            f"found code_version={found_code_version!r}, expected code_version={code_version!r}. "
+            f"Use a fresh --out directory for a new code version."
+        )
+    if (
+        found_config_digest is not None
+        and config_digest is not None
+        and found_config_digest != config_digest
+    ):
+        raise ValueError(
+            f"{results_path} contains verdicts from a different backend configuration: "
+            f"found config_digest={found_config_digest!r}, expected config_digest={config_digest!r}. "
+            f"Every field recorded on the row matches, so the difference is one the row does not "
+            f"name — api or structured_output. Compare "
+            f"{results_path.with_name(results_path.stem + '.manifest.json').name} against the "
+            f"backend entry you are running. Use a fresh --out directory."
+        )
+
+
+def _resolve_unproven_file(
+    results_path: Path,
+    *,
+    base_url: str | None,
+    allow_unknown_provenance: bool,
+) -> None:
+    """Decide whether a file containing provenance-less rows may be resumed.
+
+    The sidecar manifest is consulted first: it records the host even for runs
+    that predate per-row provenance, so most legacy files get a real check
+    rather than a free pass. Only a file with neither row provenance nor a
+    readable manifest requires the caller to accept the risk explicitly.
+    """
+    manifest = _manifest_beside(results_path)
+    if manifest is not None and base_url is not None:
+        recorded = manifest.get("base_url")
+        if recorded is not None and recorded != base_url:
+            raise ValueError(
+                f"{results_path} holds verdicts with no recorded host, and its manifest says "
+                f"they were served by base_url={recorded!r}, not {base_url!r}. "
+                f"Use a fresh --out directory."
+            )
+        if recorded is not None:
+            return
+    if not allow_unknown_provenance:
+        raise ValueError(
+            f"{results_path} holds verdicts with no recorded host or code version, and no "
+            f"manifest beside it establishes one. Nothing can prove this file is compatible "
+            f"with the current run. Use a fresh --out directory, or pass "
+            f"--allow-unknown-provenance to resume it anyway."
+        )
 
 
 def pending_votes(
@@ -239,6 +380,8 @@ def run_manifest(
     n_pairs: int,
     sample_payload: dict,
     observed_models: set[str],
+    code_version: str | None = None,
+    config_digest: str | None = None,
     latencies: list[float] | None = None,
     errors: list[str] | None = None,
     failed_latencies: list[float] | None = None,
@@ -260,6 +403,10 @@ def run_manifest(
         "structured_output": backend.structured_output,
         "votes": votes,
         "prompt_version": prompt_version,
+        # Provenance (issue #13). base_url is above and predates this; these two
+        # are what a config_digest mismatch tells the operator to come read.
+        "code_version": code_version,
+        "config_digest": config_digest,
         "n_pairs": n_pairs,
         "request_payload": sample_payload,
         "observed_models": sorted(observed_models),
@@ -454,6 +601,8 @@ def _write_manifest(
     votes: int,
     client: JudgeClient,
     health: RunHealth,
+    code_version: str | None = None,
+    config_digest: str | None = None,
 ) -> None:
     """Record what this run actually sent, once the run is over.
 
@@ -470,6 +619,8 @@ def _write_manifest(
                 n_pairs=len(pairs),
                 sample_payload=client.request_body(pairs[0]),
                 observed_models=client.observed_models,
+                code_version=code_version,
+                config_digest=config_digest,
                 latencies=health.latencies,
                 errors=health.errors,
                 failed_latencies=health.failed_latencies,
@@ -489,7 +640,10 @@ def run_backend(
     votes: int,
     concurrency: int = 1,
     limiters: LimiterRegistry | None = None,
-    client_factory: Callable[[Backend], JudgeClient] = JudgeClient,
+    code_version: str | None = None,
+    allow_unknown_provenance: bool = False,
+    judge_client: Callable[..., JudgeClient] = JudgeClient,
+    client_factory: Callable[[Backend], JudgeClient] | None = None,
     writer_factory: Callable[[Path], ResultWriter] = ResultWriter,
 ) -> None:
     """Judge every owed vote for one backend, `concurrency` calls in flight.
@@ -497,14 +651,23 @@ def run_backend(
     At concurrency=1 this is the original serial loop: one worker consuming a
     FIFO queue in submission order, so the results file is written in exactly
     the pair-then-vote order prior runs produced.
+
+    `code_version` is resolved once for the whole sweep by the caller (see
+    main), not per backend: one run, one code version, even if the tree changes
+    while a multi-hour sweep is in flight.
     """
     results_path = out_dir / f"{backend.name}.jsonl"
+    digest = config_digest(backend, prompt_version=PROMPT_VERSION)
     judged = already_judged_ids(
         results_path,
         model_id=backend.model_id,
         prompt_version=PROMPT_VERSION,
         temperature=backend.temperature,
         reasoning_effort=backend.reasoning_effort,
+        base_url=backend.base_url,
+        config_digest=digest,
+        code_version=code_version,
+        allow_unknown_provenance=allow_unknown_provenance,
     )
     # Partitioned ONCE, before any worker starts. A worker that re-read the
     # results file could hand the same (pair_id, run_index) to two threads.
@@ -516,7 +679,11 @@ def run_backend(
     if not todo:
         return
 
-    client = client_factory(backend)
+    # The default path builds the client itself so the run's code_version cannot
+    # be left off the rows. `client_factory` stays as the full override for tests
+    # that substitute a fake; `judge_client` swaps only the class, keeping the
+    # provenance wiring intact.
+    client = client_factory(backend) if client_factory else judge_client(backend, code_version=code_version)
     limiter = (limiters or LimiterRegistry()).for_backend(backend)
     health = RunHealth()
 
@@ -568,7 +735,16 @@ def run_backend(
                 raise
             else:
                 pool.shutdown(wait=True)
-        _write_manifest(backend, pairs, out_dir, votes=votes, client=client, health=health)
+        _write_manifest(
+            backend,
+            pairs,
+            out_dir,
+            votes=votes,
+            client=client,
+            health=health,
+            code_version=code_version,
+            config_digest=digest,
+        )
     finally:
         client.close()
 
@@ -581,7 +757,9 @@ def run_slate(
     votes: int,
     concurrency: int = 1,
     limiters: LimiterRegistry | None = None,
-    client_factory: Callable[[Backend], JudgeClient] = JudgeClient,
+    code_version: str | None = None,
+    allow_unknown_provenance: bool = False,
+    client_factory: Callable[[Backend], JudgeClient] | None = None,
     on_backend_done: Callable[[str], None] | None = None,
 ) -> None:
     """Run every backend on the slate.
@@ -619,6 +797,8 @@ def run_slate(
             votes=votes,
             concurrency=concurrency,
             limiters=limiters,
+            code_version=code_version,
+            allow_unknown_provenance=allow_unknown_provenance,
             client_factory=client_factory,
         )
         if on_backend_done is not None:
@@ -674,6 +854,24 @@ def main() -> None:
         help="proceed even when some backends have no API key (default: refuse)",
     )
     parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help=(
+            "run from a working tree with uncommitted changes (default: refuse). "
+            "The verdicts are tagged with a hash of the diff so the run stays "
+            "identifiable, but it cannot be reproduced from a commit"
+        ),
+    )
+    parser.add_argument(
+        "--allow-unknown-provenance",
+        action="store_true",
+        help=(
+            "resume a results file whose rows predate provenance and that has no "
+            "manifest to establish a host (default: refuse). Nothing can prove such "
+            "a file was produced by the run you are about to continue"
+        ),
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=1,
@@ -707,6 +905,17 @@ def main() -> None:
         print(render_skip_warning(skipped), file=sys.stderr)
         raise SystemExit(2)
 
+    # Fail closed BEFORE any paid call: a run whose code cannot be identified
+    # writes rows that can never be audited, which is the defect this guards
+    # against. Resolved once for the whole sweep so every row of every backend
+    # carries one value even if the tree changes mid-run.
+    try:
+        code_version = resolve_code_version(allow_dirty=args.allow_dirty)
+    except (GitUnavailable, DirtyTree) as exc:
+        print(f"refusing to start: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    print(f"code version: {code_version}")
+
     pairs = load_pairs(args.data)
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -717,7 +926,18 @@ def main() -> None:
             continue
         runnable.append(backend)
 
-    run_slate(runnable, pairs, args.out, votes=args.votes, concurrency=args.concurrency)
+    # One resolved value feeds BOTH consumers: the guard that compares against
+    # the existing file, and the client that stamps the new rows. run_backend
+    # builds the client from this same argument, so the two cannot diverge.
+    run_slate(
+        runnable,
+        pairs,
+        args.out,
+        votes=args.votes,
+        concurrency=args.concurrency,
+        code_version=code_version,
+        allow_unknown_provenance=args.allow_unknown_provenance,
+    )
 
 
 if __name__ == "__main__":

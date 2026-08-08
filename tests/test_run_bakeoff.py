@@ -35,7 +35,15 @@ def make_pair(pair_id):
 
 
 def make_verdict(
-    pair_id, model_id="m", prompt_version="v1", temperature=0.0, run_index=0, reasoning_effort=None
+    pair_id,
+    model_id="m",
+    prompt_version="v1",
+    temperature=0.0,
+    run_index=0,
+    reasoning_effort=None,
+    base_url=None,
+    config_digest=None,
+    code_version=None,
 ):
     return Verdict(
         pair_id=pair_id,
@@ -46,10 +54,103 @@ def make_verdict(
         temperature=temperature,
         run_index=run_index,
         reasoning_effort=reasoning_effort,
+        base_url=base_url,
+        config_digest=config_digest,
+        code_version=code_version,
     )
 
 
 CONFIG = dict(model_id="m", prompt_version="v1", temperature=0.0, reasoning_effort=None)
+
+# What a provenance-aware caller (run_backend, post-#13) passes down.
+PROVENANCE = dict(
+    base_url="https://host-a.test/v1",
+    config_digest="dig000000001",
+    code_version="9b0d01a1c2d3",
+)
+FULL_CONFIG = {**CONFIG, **PROVENANCE}
+
+
+def write_manifest(results_path, **overrides):
+    """The sidecar run_manifest already written next to every results file."""
+    manifest = {"backend": "backend", "model_id": "m", "base_url": "https://host-a.test/v1"}
+    manifest.update(overrides)
+    results_path.with_name(results_path.stem + ".manifest.json").write_text(json.dumps(manifest))
+
+
+def test_already_judged_ids_resumes_when_provenance_matches(tmp_path):
+    out = tmp_path / "backend.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1", **PROVENANCE)) + "\n")
+    assert already_judged_ids(out, **FULL_CONFIG) == {("p1", 0)}
+
+
+def test_already_judged_ids_rejects_a_different_host(tmp_path):
+    # Failure 1: two providers serving one model_id string, mixed into one file.
+    out = tmp_path / "backend.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1", **PROVENANCE)) + "\n")
+    with pytest.raises(ValueError, match="base_url"):
+        already_judged_ids(out, **{**FULL_CONFIG, "base_url": "https://host-b.test/v1"})
+
+
+def test_already_judged_ids_rejects_a_different_code_version(tmp_path):
+    # Failure 2: the #10 near-miss — unmerged code appending into a main-built file.
+    out = tmp_path / "backend.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1", **PROVENANCE)) + "\n")
+    with pytest.raises(ValueError, match="code_version"):
+        already_judged_ids(out, **{**FULL_CONFIG, "code_version": "deadbeef1234"})
+
+
+def test_already_judged_ids_rejects_a_different_request_config(tmp_path):
+    # Failure 3: every named field matches, but `api` or `structured_output`
+    # differs. The row cannot name what changed, so it points at the manifest.
+    out = tmp_path / "backend.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1", **PROVENANCE)) + "\n")
+    with pytest.raises(ValueError, match="manifest"):
+        already_judged_ids(out, **{**FULL_CONFIG, "config_digest": "dig000000002"})
+
+
+def test_already_judged_ids_uses_the_manifest_for_legacy_rows(tmp_path):
+    # Rows predating #13 carry no host, but the sidecar manifest does. Using it
+    # is the difference between a real check and a free pass.
+    out = tmp_path / "backend.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1")) + "\n")
+    write_manifest(out, base_url="https://host-a.test/v1")
+    assert already_judged_ids(out, **FULL_CONFIG) == {("p1", 0)}
+
+
+def test_already_judged_ids_rejects_legacy_rows_whose_manifest_names_another_host(tmp_path):
+    out = tmp_path / "backend.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1")) + "\n")
+    write_manifest(out, base_url="https://host-b.test/v1")
+    with pytest.raises(ValueError, match="base_url"):
+        already_judged_ids(out, **FULL_CONFIG)
+
+
+def test_already_judged_ids_finds_the_manifest_for_a_dotted_backend_name(tmp_path):
+    # Real slate names carry dots: anthropic-haiku-4.5, gemini-3.6-flash. If the
+    # manifest path were derived by stripping at the first dot, every legacy file
+    # for those backends would lose its evidence and be refused.
+    out = tmp_path / "anthropic-haiku-4.5.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1")) + "\n")
+    (tmp_path / "anthropic-haiku-4.5.manifest.json").write_text(
+        json.dumps({"base_url": "https://host-a.test/v1"})
+    )
+    assert already_judged_ids(out, **FULL_CONFIG) == {("p1", 0)}
+
+
+def test_already_judged_ids_refuses_unprovable_files(tmp_path):
+    # No provenance on the rows AND no manifest: nothing can establish that this
+    # file is compatible. Refuse rather than resume on hope.
+    out = tmp_path / "backend.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1")) + "\n")
+    with pytest.raises(ValueError, match="allow-unknown-provenance"):
+        already_judged_ids(out, **FULL_CONFIG)
+
+
+def test_already_judged_ids_resumes_unprovable_files_when_explicitly_allowed(tmp_path):
+    out = tmp_path / "backend.jsonl"
+    out.write_text(verdict_to_json_line(make_verdict("p1")) + "\n")
+    assert already_judged_ids(out, **FULL_CONFIG, allow_unknown_provenance=True) == {("p1", 0)}
 
 
 def test_already_judged_ids_keys_on_pair_and_run_index(tmp_path):
@@ -66,6 +167,59 @@ def test_already_judged_ids_keys_on_pair_and_run_index(tmp_path):
         + "\n"
     )
     assert already_judged_ids(out, **CONFIG) == {("p1", 0), ("p1", 1), ("p3", 0)}
+
+
+def test_run_backend_refuses_to_resume_a_file_from_another_host(tmp_path):
+    # The guard is only worth anything if run_backend actually passes provenance
+    # down; without the wiring every unit test above passes and the sweep still
+    # mixes providers.
+    backend = Backend(
+        name="backend",
+        base_url="https://host-b.test/v1",
+        model_id="m",
+        rpm=6000,
+        eval_only=False,
+        api_key_env="NVIDIA_API_KEY",
+        temperature=0.0,
+    )
+    results = tmp_path / "backend.jsonl"
+    results.write_text(
+        verdict_to_json_line(
+            make_verdict("p1", prompt_version=PROMPT_VERSION, base_url="https://host-a.test/v1")
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="base_url"):
+        run_backend(
+            backend,
+            [make_pair("p1")],
+            tmp_path,
+            votes=1,
+            code_version="9b0d01a1c2d3",
+            client_factory=lambda b: FakeClient(b),
+        )
+
+
+def test_run_backend_records_the_code_version_in_the_manifest(tmp_path):
+    backend = Backend(
+        name="backend",
+        base_url="https://host-a.test/v1",
+        model_id="m",
+        rpm=6000,
+        eval_only=False,
+        api_key_env="NVIDIA_API_KEY",
+        temperature=0.0,
+    )
+    run_backend(
+        backend,
+        [make_pair("p1")],
+        tmp_path,
+        votes=1,
+        code_version="9b0d01a1c2d3",
+        client_factory=lambda b: FakeClient(b),
+    )
+    manifest = json.loads((tmp_path / "backend.manifest.json").read_text())
+    assert manifest["code_version"] == "9b0d01a1c2d3"
 
 
 def test_already_judged_ids_missing_file_is_empty(tmp_path):
@@ -129,6 +283,33 @@ def test_pending_votes_skips_only_the_votes_already_done():
         ("p2", 1),
         ("p2", 2),
     ]
+
+
+def test_run_manifest_records_provenance():
+    # The manifest is the human-readable expansion the row's config_digest
+    # points at, so a digest mismatch can be diagnosed instead of just refused.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=3,
+        prompt_version="v1",
+        n_pairs=200,
+        sample_payload={"model": "m"},
+        observed_models=set(),
+        code_version="9b0d01a1c2d3",
+        config_digest="dig000000001",
+    )
+    assert manifest["code_version"] == "9b0d01a1c2d3"
+    assert manifest["config_digest"] == "dig000000001"
+    # base_url was already recorded; the guard's legacy fallback depends on it.
+    assert manifest["base_url"] == "https://example.test/v1"
 
 
 def test_run_manifest_records_payload_effort_and_snapshots():
@@ -903,6 +1084,10 @@ def test_run_backend_resume_writes_no_duplicate_votes(tmp_path):
         votes=3,
         concurrency=8,
         limiters=no_sleep_limiters(),
+        # The interrupted rows above carry no provenance and have no manifest
+        # beside them, which is exactly the file #13 refuses by default. This
+        # test is about duplicate votes, so it accepts the file explicitly.
+        allow_unknown_provenance=True,
         client_factory=lambda b: client,
     )
 
@@ -1171,3 +1356,50 @@ def test_already_judged_ids_is_independent_of_line_order(tmp_path):
 
     config = {"model_id": "m", "prompt_version": "v1", "temperature": None, "reasoning_effort": None}
     assert already_judged_ids(ordered, **config) == already_judged_ids(shuffled, **config)
+
+
+def test_already_judged_ids_treats_a_partially_stamped_row_as_unproven(tmp_path):
+    # PR #28 review: a row can carry base_url and config_digest but no
+    # code_version — a caller that passed code_version to run_backend while the
+    # client went unwired. Requiring BOTH to be absent missed that row, and
+    # _check_provenance skips a null field, so a later run under different code
+    # resumed it silently. That is the exact defect #13 exists to close.
+    out = tmp_path / "backend.jsonl"
+    out.write_text(
+        verdict_to_json_line(
+            make_verdict("p1", base_url="https://host-a.test/v1", config_digest="dig000000001")
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="allow-unknown-provenance"):
+        already_judged_ids(out, **FULL_CONFIG)
+
+
+def test_run_backend_wires_the_code_version_into_the_default_client(tmp_path):
+    # The root cause of the above: run_backend built its default client without
+    # the code_version it had been given, so the value never reached the rows.
+    seen = {}
+
+    class SpyClient(FakeClient):
+        def __init__(self, backend, *, code_version=None):
+            super().__init__(backend)
+            seen["code_version"] = code_version
+
+    backend = Backend(
+        name="backend",
+        base_url="https://host-a.test/v1",
+        model_id="m",
+        rpm=6000,
+        eval_only=False,
+        api_key_env="NVIDIA_API_KEY",
+        temperature=0.0,
+    )
+    run_backend(
+        backend,
+        [make_pair("p1")],
+        tmp_path,
+        votes=1,
+        code_version="9b0d01a1c2d3",
+        judge_client=SpyClient,
+    )
+    assert seen["code_version"] == "9b0d01a1c2d3"
