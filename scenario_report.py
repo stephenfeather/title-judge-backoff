@@ -172,7 +172,13 @@ def _reason_cross_tab_sections(by_model: dict[str, list[Verdict]]) -> list[str]:
             lines.append("")
             lines.append(f"| {left} \\ {right} | Reason | Count |")
             lines.append("|---|---|---|")
-            for (lreason, rreason), count in sorted(tab.items(), key=lambda kv: -kv[1]):
+            # Total order: count descending, then the reason pair. Sorting on
+            # count alone left ties in dict insertion order, which comes from
+            # iterating a SET intersection — and Python randomizes str hashing
+            # per process, so two runs over identical data produced different
+            # files. That makes "regenerate the report and diff it" unusable as
+            # a check, which is the verification this project keeps relying on.
+            for (lreason, rreason), count in sorted(tab.items(), key=lambda kv: (-kv[1], kv[0])):
                 marker = "" if lreason == rreason else " ⟵ divergence"
                 lines.append(f"| {lreason} | {rreason} | {count}{marker} |")
             lines.append("")
@@ -192,6 +198,20 @@ def _agreement_table(by_model: dict[str, list[Verdict]]) -> list[str]:
     return lines
 
 
+def _seconds(health: dict, key: str) -> str:
+    """One latency figure, or "-" when the run never recorded it.
+
+    Module level, taking `health` as an argument, rather than a closure defined
+    inside the loop over backends. The closure form captured the loop variable
+    by reference (ruff B023): it was accidentally correct only because every
+    call happened eagerly within the same iteration, and any future change that
+    deferred one — a lazy join, a generator, reuse after the loop — would have
+    given every backend the LAST backend's latencies, silently and plausibly.
+    """
+    value = health.get(key)
+    return "-" if value is None else f"{value:.1f}"
+
+
 def _health_table(manifests: dict[str, dict]) -> list[str]:
     lines = [
         "| Backend | Effort | Temp | OK | Failed | Latency min/median/max (s) | "
@@ -200,19 +220,16 @@ def _health_table(manifests: dict[str, dict]) -> list[str]:
     ]
     for name, m in sorted(manifests.items()):
         h = m.get("health", {})
-        def fmt(key):
-            value = h.get(key)
-            return "-" if value is None else f"{value:.1f}"
         errors = h.get("error_kinds") or {}
         error_text = ", ".join(f"{k}x{v}" for k, v in sorted(errors.items())) or "none"
         lines.append(
             f"| {name} | {m.get('reasoning_effort') or 'default'} | "
             f"{'omitted' if m.get('temperature') is None else m['temperature']} | "
             f"{h.get('calls_ok', 0)} | {h.get('calls_failed', 0)} | "
-            f"{fmt('latency_min')} / {fmt('latency_median')} / {fmt('latency_max')} | "
+            f"{_seconds(h, 'latency_min')} / {_seconds(h, 'latency_median')} / {_seconds(h, 'latency_max')} | "
             # Failures are timed separately — a backend that times out on every
             # call would otherwise show no latency at all.
-            f"{fmt('failed_latency_median')} / {fmt('failed_latency_max')} | "
+            f"{_seconds(h, 'failed_latency_median')} / {_seconds(h, 'failed_latency_max')} | "
             f"{error_text} | {', '.join(m.get('observed_models') or []) or '-'} |"
         )
     return lines
