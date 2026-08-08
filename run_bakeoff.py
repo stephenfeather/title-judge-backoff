@@ -138,7 +138,15 @@ def already_judged_ids(
             config_digest=config_digest,
             code_version=code_version,
         )
-        if v.base_url is None and v.code_version is None:
+        # ANY expected field the row cannot answer leaves it unproven. Requiring
+        # every field to be absent let a partially stamped row (host recorded,
+        # code version not) satisfy the guard while _check_provenance skipped
+        # the null — resuming it under different code, silently.
+        if (
+            (base_url is not None and v.base_url is None)
+            or (config_digest is not None and v.config_digest is None)
+            or (code_version is not None and v.code_version is None)
+        ):
             unproven = True
         ids.add((v.pair_id, v.run_index))
 
@@ -634,7 +642,8 @@ def run_backend(
     limiters: LimiterRegistry | None = None,
     code_version: str | None = None,
     allow_unknown_provenance: bool = False,
-    client_factory: Callable[[Backend], JudgeClient] = JudgeClient,
+    judge_client: Callable[..., JudgeClient] = JudgeClient,
+    client_factory: Callable[[Backend], JudgeClient] | None = None,
     writer_factory: Callable[[Path], ResultWriter] = ResultWriter,
 ) -> None:
     """Judge every owed vote for one backend, `concurrency` calls in flight.
@@ -670,7 +679,11 @@ def run_backend(
     if not todo:
         return
 
-    client = client_factory(backend)
+    # The default path builds the client itself so the run's code_version cannot
+    # be left off the rows. `client_factory` stays as the full override for tests
+    # that substitute a fake; `judge_client` swaps only the class, keeping the
+    # provenance wiring intact.
+    client = client_factory(backend) if client_factory else judge_client(backend, code_version=code_version)
     limiter = (limiters or LimiterRegistry()).for_backend(backend)
     health = RunHealth()
 
@@ -746,7 +759,7 @@ def run_slate(
     limiters: LimiterRegistry | None = None,
     code_version: str | None = None,
     allow_unknown_provenance: bool = False,
-    client_factory: Callable[[Backend], JudgeClient] = JudgeClient,
+    client_factory: Callable[[Backend], JudgeClient] | None = None,
     on_backend_done: Callable[[str], None] | None = None,
 ) -> None:
     """Run every backend on the slate.
@@ -914,8 +927,8 @@ def main() -> None:
         runnable.append(backend)
 
     # One resolved value feeds BOTH consumers: the guard that compares against
-    # the existing file, and the client that stamps the new rows. Deriving them
-    # separately is how a run ends up guarding on one version and writing another.
+    # the existing file, and the client that stamps the new rows. run_backend
+    # builds the client from this same argument, so the two cannot diverge.
     run_slate(
         runnable,
         pairs,
@@ -924,7 +937,6 @@ def main() -> None:
         concurrency=args.concurrency,
         code_version=code_version,
         allow_unknown_provenance=args.allow_unknown_provenance,
-        client_factory=lambda backend: JudgeClient(backend, code_version=code_version),
     )
 
 

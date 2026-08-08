@@ -1356,3 +1356,50 @@ def test_already_judged_ids_is_independent_of_line_order(tmp_path):
 
     config = {"model_id": "m", "prompt_version": "v1", "temperature": None, "reasoning_effort": None}
     assert already_judged_ids(ordered, **config) == already_judged_ids(shuffled, **config)
+
+
+def test_already_judged_ids_treats_a_partially_stamped_row_as_unproven(tmp_path):
+    # PR #28 review: a row can carry base_url and config_digest but no
+    # code_version — a caller that passed code_version to run_backend while the
+    # client went unwired. Requiring BOTH to be absent missed that row, and
+    # _check_provenance skips a null field, so a later run under different code
+    # resumed it silently. That is the exact defect #13 exists to close.
+    out = tmp_path / "backend.jsonl"
+    out.write_text(
+        verdict_to_json_line(
+            make_verdict("p1", base_url="https://host-a.test/v1", config_digest="dig000000001")
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="allow-unknown-provenance"):
+        already_judged_ids(out, **FULL_CONFIG)
+
+
+def test_run_backend_wires_the_code_version_into_the_default_client(tmp_path):
+    # The root cause of the above: run_backend built its default client without
+    # the code_version it had been given, so the value never reached the rows.
+    seen = {}
+
+    class SpyClient(FakeClient):
+        def __init__(self, backend, *, code_version=None):
+            super().__init__(backend)
+            seen["code_version"] = code_version
+
+    backend = Backend(
+        name="backend",
+        base_url="https://host-a.test/v1",
+        model_id="m",
+        rpm=6000,
+        eval_only=False,
+        api_key_env="NVIDIA_API_KEY",
+        temperature=0.0,
+    )
+    run_backend(
+        backend,
+        [make_pair("p1")],
+        tmp_path,
+        votes=1,
+        code_version="9b0d01a1c2d3",
+        judge_client=SpyClient,
+    )
+    assert seen["code_version"] == "9b0d01a1c2d3"
