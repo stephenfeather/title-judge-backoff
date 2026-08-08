@@ -370,6 +370,91 @@ def test_judge_client_parses_chat_completion(monkeypatch):
     assert verdict.temperature == 0.0
 
 
+def test_judge_records_the_usage_the_host_reported(monkeypatch):
+    # Issue #11. The data is already in the response object — this is a
+    # capture, not an extra call — and without it cost has to be estimated.
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"verdict": "approve", "reason": "ok"}'}}],
+                "usage": {
+                    "prompt_tokens": 412,
+                    "completion_tokens": 138,
+                    "total_tokens": 550,
+                    "prompt_tokens_details": {"cached_tokens": 384},
+                    "completion_tokens_details": {"reasoning_tokens": 120},
+                },
+            },
+        )
+
+    verdict = JudgeClient(backend, transport=httpx.MockTransport(handler)).judge(PAIR)
+    assert verdict.usage.prompt_tokens == 412
+    assert verdict.usage.total_tokens == 550
+    assert verdict.usage.cached_tokens == 384
+    assert verdict.usage.reasoning_tokens == 120
+
+
+def test_judge_leaves_usage_none_when_the_host_reports_none(monkeypatch):
+    # A host that sends no usage block must not produce a row of zeros — that
+    # would read as a measured free call and understate the bill.
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-key")
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"verdict": "approve", "reason": "ok"}'}}]},
+        )
+
+    verdict = JudgeClient(backend, transport=httpx.MockTransport(handler)).judge(PAIR)
+    assert verdict.usage is None
+
+
+def test_judge_records_usage_from_the_anthropic_dialect(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    backend = Backend(
+        name="anthropic-haiku",
+        base_url="https://example.test/v1",
+        model_id="claude-haiku-4-5",
+        rpm=50,
+        eval_only=False,
+        api_key_env="ANTHROPIC_API_KEY",
+        api="anthropic",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": '{"verdict": "approve", "reason": "ok"}'}],
+                "usage": {"input_tokens": 300, "output_tokens": 20},
+            },
+        )
+
+    verdict = JudgeClient(backend, transport=httpx.MockTransport(handler)).judge(PAIR)
+    assert verdict.usage.prompt_tokens == 300
+    assert verdict.usage.completion_tokens == 20
+    assert verdict.usage.total_tokens == 320  # derived; Anthropic sends no total
+
+
 def test_judge_client_speaks_anthropic_messages_api(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     backend = Backend(

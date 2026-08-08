@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import httpx
 
 from judge.prompts import PROMPT_VERSION, build_messages, parse_judge_response
-from judge.schema import VALID_VERDICTS, Pair, ReasonCode, Verdict
+from judge.schema import VALID_VERDICTS, Pair, ReasonCode, Verdict, usage_from_payload
 
 MAX_TOKENS = 256  # a verdict object is tiny; Anthropic requires the field
 ANTHROPIC_VERSION = "2023-06-01"
@@ -421,6 +421,9 @@ class JudgeClient:
             temperature=self.backend.temperature,
             run_index=run_index,
             reasoning_effort=self.backend.reasoning_effort,
+            # Already in the response — capturing it costs nothing and is the
+            # difference between measured and estimated cost (issue #11).
+            usage=usage_from_payload(payload),
         )
 
     def close(self) -> None:
