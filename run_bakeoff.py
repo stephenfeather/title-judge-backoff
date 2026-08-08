@@ -41,6 +41,7 @@ from judge.client import (
 from judge.prompts import PROMPT_VERSION
 from judge.schema import (
     Pair,
+    Usage,
     pair_from_dict,
     verdict_from_json_line,
     verdict_to_json_line,
@@ -194,6 +195,42 @@ def _health_summary(
     }
 
 
+def _usage_summary(usages: list[Usage | None]) -> dict:
+    """What this run actually spent, summed from the per-call captures.
+
+    Measured, not estimated — before these were captured, a cost model had to
+    derive a chars/token ratio from an unrelated metering call.
+
+    Two counts guard the totals rather than decorate them:
+
+    * `calls_unmeasured` — a total summed over 2 of 600 calls is worse than no
+      total, because it looks like one. Sums stay None until something reports.
+    * `calls_with_cache_hit` — the three votes send byte-identical requests, so
+      a host serving them from cache collapses majority-of-3 to n=1 and drives
+      the flip rate to a spurious 0.0. That failure IMPROVES every metric while
+      measuring nothing, and `cached_tokens` is the only in-band tell.
+    """
+    measured = [u for u in usages if u is not None]
+
+    def total(field: str) -> int | None:
+        values = [getattr(u, field) for u in measured if getattr(u, field) is not None]
+        return sum(values) if values else None
+
+    return {
+        "calls_measured": len(measured),
+        "calls_unmeasured": len(usages) - len(measured),
+        "prompt_tokens": total("prompt_tokens"),
+        "completion_tokens": total("completion_tokens"),
+        "total_tokens": total("total_tokens"),
+        # Kept out of completion_tokens on purpose: these bill as output and
+        # roughly double a reasoning backend's real cost, and a single summed
+        # number would hide which backend carries that weight.
+        "reasoning_tokens": total("reasoning_tokens"),
+        "cached_tokens": total("cached_tokens"),
+        "calls_with_cache_hit": sum(1 for u in measured if (u.cached_tokens or 0) > 0),
+    }
+
+
 def run_manifest(
     backend: Backend,
     *,
@@ -205,6 +242,7 @@ def run_manifest(
     latencies: list[float] | None = None,
     errors: list[str] | None = None,
     failed_latencies: list[float] | None = None,
+    usages: list[Usage | None] | None = None,
 ) -> dict:
     """Everything needed to reconstruct what this run actually sent.
 
@@ -226,6 +264,7 @@ def run_manifest(
         "request_payload": sample_payload,
         "observed_models": sorted(observed_models),
         "health": _health_summary(latencies or [], errors or [], failed_latencies or []),
+        "usage": _usage_summary(usages or []),
     }
 
 
@@ -357,6 +396,7 @@ class RunHealth:
         self.latencies: list[float] = []
         self.failed_latencies: list[float] = []
         self.errors: list[str] = []
+        self.usages: list[Usage | None] = []
         self._attempts = 0
 
     def claim_attempt(self) -> int:
@@ -365,9 +405,12 @@ class RunHealth:
             self._attempts += 1
             return self._attempts
 
-    def record_ok(self, seconds: float) -> None:
+    def record_ok(self, seconds: float, usage: Usage | None = None) -> None:
         with self._lock:
             self.latencies.append(seconds)
+            # Appended even when None, so calls_unmeasured counts the calls a
+            # host stayed silent about rather than losing them entirely.
+            self.usages.append(usage)
 
     def record_failure(self, seconds: float, exc: Exception) -> None:
         with self._lock:
@@ -430,6 +473,7 @@ def _write_manifest(
                 latencies=health.latencies,
                 errors=health.errors,
                 failed_latencies=health.failed_latencies,
+                usages=health.usages,
             ),
             indent=2,
         )
@@ -492,7 +536,7 @@ def run_backend(
             health.record_failure(time.monotonic() - started, exc)
             _handle_call_failure(backend, limiter, exc, pair_id=pair.id, run_index=run_index)
             return
-        health.record_ok(time.monotonic() - started)
+        health.record_ok(time.monotonic() - started, verdict.usage)
         writer.write(verdict_to_json_line(verdict))
         if i % 20 == 0 or i == len(todo):
             print(f"[{backend.name}] {i}/{len(todo)}")

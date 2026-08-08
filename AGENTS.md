@@ -84,6 +84,33 @@ verdict, never left to a provider default.
 Stability comes from `--votes` (majority-of-N, default 3), not from sampling
 parameters. Any new metric must be reported with its spread.
 
+## Token usage is captured, never estimated
+
+Every response already carries a `usage` block. `usage_from_payload()` in
+`judge/schema.py` normalizes it across the two dialects this harness speaks —
+`/chat/completions` says `prompt_tokens`, `/messages` says `input_tokens` and
+sends no total — and it lands on the verdict row plus a per-run total in the
+manifest.
+
+- **Absent is not zero.** A host that reports nothing leaves `usage=None` and
+  increments `calls_unmeasured`. Defaulting to 0 would read as a measured free
+  call. A total summed over 2 of 600 calls is worse than no total, because it
+  looks like one.
+- **A real 0 is a measurement.** No reasoning spent at effort=none is a fact,
+  so extraction is key-presence based; `a or b` chaining would discard it.
+- **`reasoning_tokens` stays separate.** They bill as output and roughly double
+  a reasoning backend's cost; folded into `completion_tokens` nobody could see
+  which backend carries that weight.
+- **`cached_tokens` is a correctness signal, not a cost one.** The three votes
+  send byte-identical requests, so a host serving them from cache collapses
+  majority-of-3 to n=1 and drives the flip rate to a spurious 0.0 — a failure
+  that IMPROVES every metric while measuring nothing. The manifest counts
+  `calls_with_cache_hit` for exactly that reason.
+
+Usage is an observation, not run config: it is deliberately NOT part of the
+resume identity in `already_judged_ids`, and rows written before it existed
+load as `usage=None` rather than raising.
+
 ## No majority is a state, not a value
 
 `VoteResult.verdict` and `VoteResult.reason` are **`None`** when the votes

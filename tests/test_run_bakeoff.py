@@ -2,13 +2,14 @@ import json
 import random
 import threading
 import time
+from dataclasses import replace
 
 import httpx
 import pytest
 
 from judge.client import RETRY_AFTER_DEFAULT_S, Backend, LimiterRegistry
 from judge.prompts import PROMPT_VERSION
-from judge.schema import Pair, ReasonCode, Verdict, verdict_to_json_line
+from judge.schema import Pair, ReasonCode, Usage, Verdict, verdict_to_json_line
 from run_bakeoff import (
     ResultWriter,
     already_judged_ids,
@@ -301,6 +302,112 @@ def test_run_manifest_handles_a_backend_that_never_succeeded():
     health = manifest["health"]
     assert health["calls_ok"] == 0
     assert health["latency_median"] is None
+
+
+def test_manifest_totals_the_tokens_the_run_actually_spent():
+    # Issue #11: cost modelling had to ESTIMATE prompt tokens from an unrelated
+    # metering call because no run recorded a single count. The manifest is
+    # where a cost model looks, so the per-call captures are summed here.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=1,
+        prompt_version="v1",
+        n_pairs=2,
+        sample_payload={},
+        observed_models=set(),
+        usages=[
+            Usage(prompt_tokens=400, completion_tokens=20, total_tokens=420, reasoning_tokens=120),
+            Usage(prompt_tokens=410, completion_tokens=30, total_tokens=440, reasoning_tokens=100),
+        ],
+    )
+    tokens = manifest["usage"]
+    assert tokens["prompt_tokens"] == 810
+    assert tokens["completion_tokens"] == 50
+    assert tokens["total_tokens"] == 860
+    # Reasoning bills as output and roughly doubles a reasoning backend's cost,
+    # so it is reported separately rather than buried in completion_tokens.
+    assert tokens["reasoning_tokens"] == 220
+    assert tokens["calls_measured"] == 2
+    assert tokens["calls_unmeasured"] == 0
+
+
+def test_manifest_counts_calls_the_host_reported_nothing_for():
+    # A partly-instrumented host must not look fully measured — a total summed
+    # over 2 of 600 calls is worse than no total, because it looks like one.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=1,
+        prompt_version="v1",
+        n_pairs=3,
+        sample_payload={},
+        observed_models=set(),
+        usages=[Usage(prompt_tokens=400, completion_tokens=20, total_tokens=420), None, None],
+    )
+    assert manifest["usage"]["calls_measured"] == 1
+    assert manifest["usage"]["calls_unmeasured"] == 2
+
+
+def test_manifest_surfaces_cache_hits_because_they_would_fake_stability():
+    # The three votes are byte-identical requests. A host serving them from
+    # cache collapses majority-of-3 to n=1 and drives flip rate to a spurious
+    # 0.0 — metrics that IMPROVE while measuring nothing. cached_tokens is the
+    # only in-band tell, so the manifest counts the calls that had one.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=1,
+        prompt_version="v1",
+        n_pairs=3,
+        sample_payload={},
+        observed_models=set(),
+        usages=[
+            Usage(prompt_tokens=400, completion_tokens=20, total_tokens=420, cached_tokens=384),
+            Usage(prompt_tokens=400, completion_tokens=20, total_tokens=420, cached_tokens=0),
+            Usage(prompt_tokens=400, completion_tokens=20, total_tokens=420),
+        ],
+    )
+    assert manifest["usage"]["cached_tokens"] == 384
+    assert manifest["usage"]["calls_with_cache_hit"] == 1
+
+
+def test_manifest_usage_is_absent_rather_than_zeroed_when_nothing_reported():
+    # Zeros would read as a measured free run.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend, votes=1, prompt_version="v1", n_pairs=1, sample_payload={}, observed_models=set()
+    )
+    assert manifest["usage"]["total_tokens"] is None
+    assert manifest["usage"]["calls_measured"] == 0
 
 
 def test_run_manifest_omits_nothing_when_temperature_is_set():
@@ -824,6 +931,64 @@ def test_run_backend_records_every_latency_under_concurrency(tmp_path):
     assert health["calls_ok"] == 50
     assert health["calls_failed"] == 0
     assert health["latency_median"] is not None
+
+
+def test_a_run_writes_usage_to_both_the_row_and_the_manifest(tmp_path):
+    # Wiring check. Every piece can be individually correct and still not be
+    # connected: the point of #11 is that a real run leaves measured tokens on
+    # disk, so this asserts against what actually lands there.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(3)]
+
+    class MeteredClient(FakeClient):
+        def judge(self, pair, run_index=0):
+            verdict = super().judge(pair, run_index)
+            return replace(
+                verdict,
+                usage=Usage(
+                    prompt_tokens=400,
+                    completion_tokens=20,
+                    total_tokens=420,
+                    reasoning_tokens=120,
+                ),
+            )
+
+    run_backend(
+        backend,
+        pairs,
+        tmp_path,
+        votes=1,
+        concurrency=2,
+        limiters=no_sleep_limiters(),
+        client_factory=MeteredClient,
+    )
+
+    rows = read_verdicts(tmp_path / "nv.jsonl")
+    assert all(r["usage"]["prompt_tokens"] == 400 for r in rows)
+
+    usage = json.loads((tmp_path / "nv.manifest.json").read_text())["usage"]
+    assert usage["calls_measured"] == 3
+    assert usage["calls_unmeasured"] == 0
+    assert usage["total_tokens"] == 1260
+    assert usage["reasoning_tokens"] == 360
+
+
+def test_a_run_against_a_silent_host_records_no_tokens_rather_than_zero(tmp_path):
+    # FakeClient reports no usage, like a host that omits the block.
+    backend = concurrency_backend()
+    run_backend(
+        backend,
+        [make_pair("p0")],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=no_sleep_limiters(),
+        client_factory=FakeClient,
+    )
+    usage = json.loads((tmp_path / "nv.manifest.json").read_text())["usage"]
+    assert usage["calls_measured"] == 0
+    assert usage["calls_unmeasured"] == 1
+    assert usage["total_tokens"] is None
 
 
 def test_run_backend_records_failures_from_every_worker(tmp_path):
