@@ -4,6 +4,8 @@ import pytest
 
 from judge.schema import ReasonCode, Verdict, verdict_to_json_line
 from scenario_report import (
+    _health_table,
+    _reason_cross_tab_sections,
     _stability_table,
     contention_ranking,
     load_results,
@@ -138,6 +140,87 @@ def test_render_scenario_report_has_every_required_section():
     assert "ruling queue" in md.lower()
     # Health must surface the failing backend, not silently average it away.
     assert "ReadTimeout" in md
+
+
+def test_cross_tab_rows_are_totally_ordered_so_two_runs_agree():
+    """The report must be diffable. Found while verifying #18.
+
+    Rows were sorted by count alone, so ties fell back to dict insertion order
+    — which comes from iterating a SET intersection, and Python randomizes str
+    hashing per process. Two runs of identical code over identical data
+    produced 60 differing lines, all of them tied-count rows.
+
+    That is worse than untidy: "regenerate the report and diff it" is the
+    verification this project keeps relying on, and it was returning false
+    alarms. The sort needs a tiebreaker so the order is a property of the data
+    rather than of the process.
+    """
+    # Eight pairs, every cross-tab cell tied at 1, so ordering is decided
+    # entirely by the tiebreaker. Eight rather than four on purpose: with the
+    # bug, the row order is whatever the hash seed produces, and a small
+    # fixture passes by coincidence whenever that order happens to be sorted.
+    # At four rows that is 1 in 24 — measured, one seed in five slipped through.
+    # At eight it is 1 in 40320.
+    codes = ["casing_error", "meaning_change", "overcorrection", "truncation_worse"]
+    pairings = [(codes[i % 4], codes[(i + 1 + i // 4) % 4]) for i in range(8)]
+    left, right = [], []
+    for index, (lreason, rreason) in enumerate(pairings):
+        pair_id = f"p{index}"
+        left += votes("a", pair_id, [("reject", lreason)])
+        right += votes("b", pair_id, [("reject", rreason)])
+    lines = _reason_cross_tab_sections({"a": left, "b": right})
+
+    # Row shape is "| left | right | count[ ⟵ divergence] |"; the marker rides
+    # on the count cell.
+    parsed = []
+    for line in lines:
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) != 5 or cells[0] or cells[4]:
+            continue
+        count = cells[3].replace("⟵ divergence", "").strip()
+        if not count.isdigit():
+            continue  # header row
+        parsed.append((-int(count), cells[1], cells[2]))
+
+    assert len(parsed) >= 6, f"expected the tied cross-tab rows, got {parsed}"
+    assert parsed == sorted(parsed), (
+        "cross-tab rows are not totally ordered; ties fall back to dict "
+        f"insertion order and will differ between processes: {parsed}"
+    )
+
+
+def test_health_table_gives_each_backend_its_own_numbers():
+    """Issue #18, and the guard the late-binding closure needed.
+
+    `fmt` used to be defined inside the loop, closing over the rebound `h`.
+    It was accidentally correct because every call happened eagerly in the same
+    iteration — so this test PASSES against the old code too, and there was no
+    honest way to write a failing one. Its job is to make a future regression
+    loud: the moment any of these values is formatted lazily, or the helper is
+    reused after the loop, two backends start reporting the same latencies and
+    this fails.
+
+    Two backends with deliberately disjoint numbers, so a leak is unmissable.
+    """
+    lines = _health_table(
+        {
+            "alpha": {
+                "health": {"calls_ok": 1, "latency_min": 1.0, "latency_median": 1.5, "latency_max": 2.0},
+                "observed_models": ["a"],
+            },
+            "zulu": {
+                "health": {"calls_ok": 2, "latency_min": 9.0, "latency_median": 9.5, "latency_max": 9.9},
+                "observed_models": ["z"],
+            },
+        }
+    )
+    alpha = next(line for line in lines if "| alpha |" in line)
+    zulu = next(line for line in lines if "| zulu |" in line)
+    assert "1.0 / 1.5 / 2.0" in alpha
+    assert "9.0 / 9.5 / 9.9" in zulu
+    # The specific failure a loop-variable closure produces: the last
+    # iteration's values on every row.
+    assert "9.0 / 9.5 / 9.9" not in alpha
 
 
 def test_stability_table_survives_a_backend_that_judged_nothing():
