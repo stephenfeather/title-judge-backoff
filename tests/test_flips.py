@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from judge import flips
 from judge.schema import ReasonCode, Verdict
+from judge.vote import tally_votes
 
 
 def verdict(pair_id: str, value: str, reason: ReasonCode, model_id: str) -> Verdict:
@@ -125,15 +126,66 @@ def test_pane_rate_is_the_same_function_the_vote_tally_uses():
     assert stats["a"].flip_rate == flip_rate(values)
 
 
-def test_majority_tie_breaks_by_first_occurrence():
-    """Matches `judge.vote.majority` — a re-run must not relabel a split pair."""
+def test_flipstats_settled_means_the_same_thing_as_voteresult_settled():
+    """Two types, one vocabulary — a divergence here must fail, not compile.
+
+    `FlipStats.settled` originally meant "the verdict decided" while
+    `VoteResult.settled` meant "verdict AND reason decided". Same word, same
+    codebase, both consumed by ruling and scoring code. The trap was that
+    `reason_settled` already agreed across the two, so a reader who checked one
+    name and found it consistent had every reason to assume the third was too —
+    and would silently miss an unsettled REASON, which is a tie flowing through
+    as truth, the exact thing #20 and #22 exist to stop.
+    """
+    settled_verdict_tied_reason = (
+        [verdict("p", "reject", ReasonCode.OK, "m1"), verdict("p", "reject", ReasonCode.OK, "m2")]
+        + [
+            verdict("p", "reject", ReasonCode.CASING_ERROR, "m3"),
+            verdict("p", "reject", ReasonCode.CASING_ERROR, "m4"),
+        ]
+    )
+    stats = flips.flip_stats(settled_verdict_tied_reason)["p"]
+    tally = tally_votes(
+        [
+            Verdict("p", "reject", ReasonCode.OK, "m", "v1", None, run_index=0),
+            Verdict("p", "reject", ReasonCode.OK, "m", "v1", None, run_index=1),
+            Verdict("p", "reject", ReasonCode.CASING_ERROR, "m", "v1", None, run_index=2),
+            Verdict("p", "reject", ReasonCode.CASING_ERROR, "m", "v1", None, run_index=3),
+        ]
+    )[0]
+
+    for name in ("verdict_settled", "reason_settled", "settled"):
+        assert getattr(stats, name) == getattr(tally, name), f"{name} diverged"
+
+    # And specifically: a settled verdict with a tied reason is NOT settled.
+    assert stats.verdict_settled is True
+    assert stats.reason_settled is False
+    assert stats.settled is False
+
+
+def test_a_tied_pair_has_no_majority_rather_than_a_tie_broken_one():
+    """Issue #21. This card feeds the pass where GROUND TRUTH is created, so a
+    fabricated value here anchors a label nothing can later recompute."""
     stats = flips.flip_stats(
         [
             verdict("a", "reject", ReasonCode.CASING_ERROR, "m1"),
             verdict("a", "approve", ReasonCode.OK, "m2"),
         ]
     )
-    assert stats["a"].majority == "reject"
+    assert stats["a"].majority is None
+    assert stats["a"].verdict_settled is False
+
+
+def test_a_clear_pair_still_reports_its_majority():
+    stats = flips.flip_stats(
+        [
+            verdict("a", "approve", ReasonCode.OK, "m1"),
+            verdict("a", "approve", ReasonCode.OK, "m2"),
+            verdict("a", "reject", ReasonCode.CASING_ERROR, "m3"),
+        ]
+    )
+    assert stats["a"].majority == "approve"
+    assert stats["a"].verdict_settled is True
 
 
 def test_repeat_verdicts_from_one_model_count_as_repeats():
@@ -358,3 +410,100 @@ def test_render_flip_pane_counts_votes_and_models_separately():
 
 def test_render_flip_pane_without_stats_is_empty():
     assert flips.render_flip_pane(None) == ""
+
+
+# --- undecided must be unmissable (issue #21) -------------------------------
+#
+# Synthetic pairs covering the three tie shapes that occur in practice. Ids and
+# counts are invented; only the SHAPES are drawn from experience, because those
+# are what the rendering has to handle:
+#
+#   e10-tie1  verdict tied, deep and well sampled — the hard case
+#   e10-tie2  verdict unanimous, reason tied — the common case
+#   e10-tie3  reason tied with a third code also present, so a tie is not the
+#             same as "only two codes appeared"
+#
+# Per AGENTS.md: synthetic fixtures only. Real pair ids and their measured vote
+# distributions are calibration data and do not belong in a repo that may go
+# public — an earlier version of these tests copied both.
+
+
+MODELS = 8  # the slate size; the real run is 8 backends at ~4 votes each
+
+
+def split_verdicts(pair_id, approve, reject):
+    """`approve` + `reject` judgments spread over MODELS backends.
+
+    Votes are dealt round-robin across a FIXED set of model ids rather than one
+    id per judgment. An earlier version gave every judgment its own model, so a
+    fixture claiming to reproduce "32 judgments from eight models" built 32
+    models — and `render_flip_pane` prints that count, so the test exercised a
+    shape the sweep cannot produce. Majority-of-N means votes always outnumber
+    models; a fixture where they are equal is not modelling this system.
+    """
+    return [
+        verdict(pair_id, "approve", ReasonCode.OK, f"m{i % MODELS}") for i in range(approve)
+    ] + [
+        verdict(pair_id, "reject", ReasonCode.CASING_ERROR, f"m{(approve + i) % MODELS}")
+        for i in range(reject)
+    ]
+
+
+def test_pane_says_undecided_when_the_verdict_is_tied():
+    # e10-tie1: 16-16 across 32 judgments from eight models. Not a coin
+    # flip on thin data — deep, well-sampled disagreement, and the single pair
+    # an operator most needs flagged rather than summarised.
+    stats = flips.flip_stats(split_verdicts("e10-tie1", 16, 16))["e10-tie1"]
+    # Pin the shape the comment claims. The pane PRINTS the model count, so a
+    # fixture that drifts from the real data renders a case the sweep cannot
+    # produce — and this comment's "eight models" was quoted onward once
+    # already, off a fixture that actually built 32.
+    assert (stats.n, len(stats.models)) == (32, 8)
+
+    pane = flips.render_flip_pane(stats)
+    assert "UNDECIDED" in pane
+    assert "from 8 models" in pane
+    # The counts must still be there — the flag explains them, it does not
+    # replace them.
+    assert "approve 16" in pane and "reject 16" in pane
+
+
+def test_pane_does_not_cry_undecided_when_the_judges_agreed():
+    # A 17-15 split is contested but decided. Flagging it too would make the
+    # marker noise, and a marker that fires on everything flags nothing.
+    stats = flips.flip_stats(split_verdicts("clear", 17, 15))
+    pane = flips.render_flip_pane(stats["clear"])
+    assert "UNDECIDED" not in pane
+
+
+def test_pane_flags_a_tied_reason_even_when_the_verdict_settled():
+    # e10-tie2: every judge said reject, but ok 14 / casing_error 14 on
+    # WHY. The verdict is real; the reason is not, and the reason is what the
+    # per-reason confusion matrix will score once rulings exist.
+    verdicts = (
+        [verdict("e10-tie2", "reject", ReasonCode.OK, f"a{i}") for i in range(14)]
+        + [
+            verdict("e10-tie2", "reject", ReasonCode.CASING_ERROR, f"b{i}")
+            for i in range(14)
+        ]
+        + [
+            verdict("e10-tie2", "reject", ReasonCode.OVERCORRECTION, f"c{i}")
+            for i in range(5)
+        ]
+    )
+    pane = flips.render_flip_pane(flips.flip_stats(verdicts)["e10-tie2"])
+    banner = pane.splitlines()[0]
+    assert "UNDECIDED" in banner
+    # Specifically the REASON, not the verdict — asserting the bare word
+    # "reason" would pass off the reasons breakdown line and prove nothing.
+    assert "reason (" in banner
+    assert "verdict (" not in banner
+    assert "ok 14 = casing_error 14" in banner or "casing_error 14 = ok 14" in banner
+
+
+def test_undecided_marker_is_on_the_headline_line():
+    # A marker buried under the reason breakdown is a marker an operator
+    # scanning a 200-row pass will miss, which is the whole failure mode.
+    stats = flips.flip_stats(split_verdicts("tied", 16, 16))
+    pane = flips.render_flip_pane(stats["tied"])
+    assert "UNDECIDED" in pane.splitlines()[0]

@@ -135,7 +135,7 @@ def test_settled_majority_rejects_empty_naming_itself():
 
 
 def test_tally_marks_a_three_way_reason_split_unsettled():
-    # deepseek e10-4fd6ba61ea52: verdict settled 3-0, reason split 1-1-1. The
+    # The common production shape: verdict settled 3-0, reason split 1-1-1. The
     # verdict is real; the reason was invented by the tie-break.
     verdicts = [
         make_verdict("p1", "reject", ReasonCode.MEANING_CHANGE, 0),

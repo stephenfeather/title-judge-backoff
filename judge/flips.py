@@ -59,8 +59,36 @@ class FlipStats:
     verdicts: dict[str, int]
     reasons: dict[str, int]
     models: list[str]
-    majority: str
+    majority: str | None  # None when the judges tied — see `settled`
     flip_rate: float
+    reason_majority: str | None = None  # None when the REASON codes tied
+
+    # These three mirror `judge.vote.VoteResult` EXACTLY — same names, same
+    # meanings. Both types reach ruling and scoring code, so one vocabulary is
+    # not tidiness: `settled` previously meant verdict-only here and
+    # verdict-AND-reason there, while `reason_settled` already agreed. Partial
+    # alignment is the dangerous kind — a reader who checks one name, finds it
+    # consistent, and assumes the third silently misses an unsettled REASON,
+    # which is a tie flowing through as truth.
+
+    @property
+    def verdict_settled(self) -> bool:
+        """False when no verdict holds the top count on its own.
+
+        This card feeds the pass where ground truth is CREATED. Everywhere else
+        a fabricated tie-break produces a wrong number that re-scoring can fix;
+        here it anchors an operator, and the label they write becomes the truth
+        every future kappa is measured against. There is nothing to re-run.
+        """
+        return self.majority is not None
+
+    @property
+    def reason_settled(self) -> bool:
+        return self.reason_majority is not None
+
+    @property
+    def settled(self) -> bool:
+        return self.verdict_settled and self.reason_settled
 
 
 class VerdictLike(Protocol):
@@ -108,8 +136,11 @@ def _stats_for(pair_id: str, group: Sequence[VerdictLike]) -> FlipStats:
         verdicts=dict(counts),
         reasons=dict(Counter(_reason_of(v) for v in group)),
         models=sorted({v.model_id for v in group}),
-        majority=vote.majority(values),
+        # settled_majority, not majority: a tie must surface as undecided
+        # rather than as whichever value the tie-break happens to land on.
+        majority=vote.settled_majority(values),
         flip_rate=vote.flip_rate(values),
+        reason_majority=vote.settled_majority([_reason_of(v) for v in group]),
     )
 
 
@@ -180,8 +211,33 @@ def render_flip_pane(stats: FlipStats | None) -> str:
     split = "  ".join(f"{verdict} {count}" for verdict, count in sorted(stats.verdicts.items()))
     reasons = "  ".join(f"{reason} {count}" for reason, count in sorted(stats.reasons.items()))
     models = len(stats.models)
-    return (
+
+    # The marker goes on the HEADLINE line, before the counts. An operator
+    # working a 200-row pass scans; a flag under the reason breakdown is a flag
+    # they will miss, and missing it is the entire failure this guards against.
+    #
+    # Naming the tied side matters too. "UNDECIDED" alone invites the operator
+    # to go hunting for why; saying which values tied answers it in place.
+    flags = []
+    if not stats.verdict_settled:
+        flags.append(f"verdict ({_tied_values(stats.verdicts)})")
+    if not stats.reason_settled:
+        flags.append(f"reason ({_tied_values(stats.reasons)})")
+
+    lines = []
+    if flags:
+        lines.append(f"  ⚠ UNDECIDED — no majority on {', '.join(flags)}")
+    lines.append(
         f"  sweep: flip {stats.flip_rate:.0%} over {stats.n} votes "
-        f"from {models} model{'' if models == 1 else 's'}   {split}\n"
-        f"         reasons: {reasons}"
+        f"from {models} model{'' if models == 1 else 's'}   {split}"
     )
+    lines.append(f"         reasons: {reasons}")
+    return "\n".join(lines)
+
+
+def _tied_values(counts: dict[str, int]) -> str:
+    """The values sharing the top count, e.g. "approve 16 = reject 16"."""
+    if not counts:
+        return "no votes"
+    best = max(counts.values())
+    return " = ".join(f"{value} {best}" for value in sorted(counts) if counts[value] == best)
