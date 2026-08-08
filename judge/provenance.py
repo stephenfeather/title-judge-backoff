@@ -61,20 +61,26 @@ class ProvenanceAudit:
     config_digests: tuple[str, ...]
     base_urls: tuple[str, ...]
     rows_without_provenance: int
+    malformed_rows: int
     total_rows: int
 
     @property
     def is_mixed(self) -> bool:
-        """True if this file cannot be one coherent run.
+        """True if this file cannot be shown to be one coherent run.
 
         Two known values of anything is a mixture. So is one known value beside
         rows that predate provenance — treating unknown as "probably the same"
-        is what let the #10 near-miss look clean. A file that is UNIFORMLY
-        unknown is merely unauditable, which `rows_without_provenance` reports
-        on its own.
+        is what let the #10 near-miss look clean. A row that will not parse
+        counts the same way: its provenance is unreadable, not absent, so a
+        damaged file must never come back looking coherent.
+
+        A file that is UNIFORMLY unknown is merely unauditable, which
+        `rows_without_provenance` reports on its own.
         """
         distinct = max(len(self.code_versions), len(self.config_digests), len(self.base_urls))
         if distinct > 1:
+            return True
+        if self.malformed_rows > 0 and distinct > 0:
             return True
         return distinct == 1 and self.rows_without_provenance > 0
 
@@ -88,6 +94,7 @@ def audit_results_file(path: Path | str) -> ProvenanceAudit:
     """
     seen: dict[str, set[str]] = {"code_version": set(), "config_digest": set(), "base_url": set()}
     unknown = 0
+    malformed = 0
     total = 0
     for line in Path(path).read_text().splitlines():
         if not line.strip():
@@ -96,6 +103,10 @@ def audit_results_file(path: Path | str) -> ProvenanceAudit:
         try:
             record = json.loads(line)
         except ValueError:
+            # Counted, never skipped silently: an unreadable row is provenance
+            # we cannot check, and dropping it would let a damaged file report
+            # as coherent.
+            malformed += 1
             continue
         for field, values in seen.items():
             if (value := record.get(field)) is not None:
@@ -107,6 +118,7 @@ def audit_results_file(path: Path | str) -> ProvenanceAudit:
         config_digests=tuple(sorted(seen["config_digest"])),
         base_urls=tuple(sorted(seen["base_url"])),
         rows_without_provenance=unknown,
+        malformed_rows=malformed,
         total_rows=total,
     )
 

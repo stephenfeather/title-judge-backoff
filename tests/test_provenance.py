@@ -51,6 +51,23 @@ def test_audit_of_an_all_legacy_file_is_not_mixed(tmp_path):
     assert not audit.is_mixed
 
 
+def test_audit_counts_malformed_rows(tmp_path):
+    # PR #28 review: a truncated or corrupt row was counted in total_rows and
+    # then dropped, so a damaged file with otherwise uniform provenance reported
+    # is_mixed=False — telling a consumer an unauditable file is coherent.
+    path = tmp_path / "backend.jsonl"
+    path.write_text(json.dumps(row(code_version="aaa")) + "\n{not valid json\n")
+    audit = audit_results_file(path)
+    assert audit.malformed_rows == 1
+    assert audit.total_rows == 2
+
+
+def test_audit_of_a_damaged_file_is_never_reported_coherent(tmp_path):
+    path = tmp_path / "backend.jsonl"
+    path.write_text(json.dumps(row(code_version="aaa")) + "\n{truncated\n")
+    assert audit_results_file(path).is_mixed
+
+
 def test_audit_reports_distinct_hosts_and_digests(tmp_path):
     path = tmp_path / "backend.jsonl"
     write_rows(
