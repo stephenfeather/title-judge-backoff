@@ -773,6 +773,60 @@ def test_load_backends_defaults_temperature_to_omitted(tmp_path):
     assert load_backends(path)[0].temperature is None
 
 
+def https_backend(**overrides):
+    base = dict(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=False,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    base.update(overrides)
+    return base
+
+
+def test_backend_rejects_a_cleartext_base_url():
+    # The API key rides on every request as Authorization: Bearer / x-api-key.
+    # Over http:// that is a live paid credential in the clear, and the run
+    # would succeed silently, which is why nothing would ever notice.
+    with pytest.raises(ValueError, match="https"):
+        Backend(**https_backend(base_url="http://example.test/v1"))
+
+
+def test_backend_rejects_a_schemeless_base_url():
+    # urlparse puts a schemeless string entirely in `path`, so this would become
+    # a relative URL rather than an implicit https.
+    with pytest.raises(ValueError, match="https"):
+        Backend(**https_backend(base_url="example.test/v1"))
+
+
+def test_backend_rejection_names_the_offending_backend():
+    with pytest.raises(ValueError, match="deepinfra-llama"):
+        Backend(**https_backend(name="deepinfra-llama", base_url="http://example.test/v1"))
+
+
+def test_backend_accepts_https():
+    assert Backend(**https_backend()).base_url == "https://example.test/v1"
+
+
+def test_load_backends_rejects_a_cleartext_base_url(tmp_path):
+    path = tmp_path / "backends.toml"
+    path.write_text(
+        '[[backends]]\nname = "nv"\nbase_url = "http://example.test/v1"\n'
+        'model_id = "m"\nrpm = 40\neval_only = false\n'
+    )
+    with pytest.raises(ValueError, match="https"):
+        load_backends(path)
+
+
+def test_the_real_slate_still_loads():
+    # The rejection must not break the shipped configuration.
+    backends = load_backends("backends.toml")
+    assert backends
+    assert all(b.base_url.startswith("https://") for b in backends)
+
+
 def test_every_backend_field_is_classified():
     # The guard against issue #13 failure 3: a new Backend field that shapes the
     # request must not slip outside the resume identity by default. This fails

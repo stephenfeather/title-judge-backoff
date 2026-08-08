@@ -74,6 +74,17 @@ class Backend:
     structured_output: bool = False  # strict json_schema; not every endpoint implements it
 
     def __post_init__(self) -> None:
+        # The API key is attached to every request as a credential header, so a
+        # non-HTTPS base_url puts a live paid key on the wire in the clear. The
+        # run would succeed normally, which is exactly why nobody would notice.
+        # No escape hatch: a local mock should inject `transport=` instead.
+        if urlparse(self.base_url).scheme != "https":
+            raise ValueError(
+                f"backend {self.name!r}: base_url must use https, got {self.base_url!r}. "
+                f"API keys are sent as credentials on every request and would be exposed "
+                f"in cleartext. A schemeless URL is rejected too — it parses as a relative "
+                f"path, not as an implicit https."
+            )
         if self.api not in VALID_APIS:
             raise ValueError(f"backend {self.name!r}: api must be one of {VALID_APIS}, got {self.api!r}")
         if self.role not in VALID_ROLES:
