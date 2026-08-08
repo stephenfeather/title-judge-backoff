@@ -182,6 +182,14 @@ class Verdict:
     reasoning_effort: str | None = None
     usage: Usage | None = None  # None = the host reported nothing, see Usage
 
+    # Provenance (issue #13): where this row came from, not just what it says.
+    # None on all three means ONLY "written before provenance existed" — the
+    # write path refuses to produce a row it cannot identify, so a null here is
+    # always a legacy row and never a live unknown.
+    base_url: str | None = None  # the host that served the call
+    config_digest: str | None = None  # see judge.client.config_digest
+    code_version: str | None = None  # see judge.provenance.code_version
+
     def __post_init__(self) -> None:
         _check_verdict(self.verdict)
 
@@ -217,6 +225,9 @@ def verdict_from_json_line(line: str) -> Verdict:
     # so old result directories stay readable instead of raising.
     record.setdefault("run_index", 0)
     record.setdefault("reasoning_effort", None)
+    # Provenance predates none of results/: every existing row lacks all three.
+    for field in ("base_url", "config_digest", "code_version"):
+        record.setdefault(field, None)
     # Same for usage: every row written before it was captured has no key, and
     # must load as "not measured" rather than raising.
     usage = record.get("usage")

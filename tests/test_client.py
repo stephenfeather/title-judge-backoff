@@ -1,21 +1,26 @@
 import json
 import threading
 import time
+from dataclasses import fields
 
 import httpx
 import pytest
 
 from judge.client import (
     MAX_BACKOFF_S,
+    OPERATIONAL_FIELDS,
     RETRY_AFTER_DEFAULT_S,
+    VERDICT_AFFECTING_FIELDS,
     Backend,
     JudgeClient,
     LimiterRegistry,
     RateLimiter,
+    config_digest,
     limiter_host,
     load_backends,
     rate_limit_penalty,
 )
+from judge.prompts import PROMPT_VERSION
 from judge.schema import Pair, ReasonCode
 
 BACKENDS_TOML = """\
@@ -530,6 +535,36 @@ def capture_body(backend, response_json=None):
     return captured, verdict, client
 
 
+def test_judge_stamps_the_host_that_served_the_call(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    _, verdict, _ = capture_body(openai_backend(base_url="https://host-a.test/v1"))
+    assert verdict.base_url == "https://host-a.test/v1"
+
+
+def test_judge_stamps_the_config_digest(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    backend = openai_backend()
+    _, verdict, _ = capture_body(backend)
+    assert verdict.config_digest == config_digest(backend, prompt_version=PROMPT_VERSION)
+
+
+def test_judge_stamps_the_code_version_it_was_given(monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"verdict": "approve", "reason": "ok"}'}}]},
+        )
+
+    client = JudgeClient(
+        openai_backend(),
+        transport=httpx.MockTransport(handler),
+        code_version="9b0d01a1c2d3",
+    )
+    assert client.judge(PAIR).code_version == "9b0d01a1c2d3"
+
+
 def test_openai_request_omits_temperature_by_default(monkeypatch):
     # R2: gpt-5.6 rejects temperature=0 at any reasoning effort above `none`,
     # and sending 1.0 to claim "the default" is a lie the results would carry.
@@ -736,6 +771,71 @@ def test_load_backends_defaults_temperature_to_omitted(tmp_path):
     path = tmp_path / "backends.toml"
     path.write_text(BACKENDS_TOML)
     assert load_backends(path)[0].temperature is None
+
+
+def test_every_backend_field_is_classified():
+    # The guard against issue #13 failure 3: a new Backend field that shapes the
+    # request must not slip outside the resume identity by default. This fails
+    # the moment someone adds a field without deciding which set it belongs to.
+    classified = VERDICT_AFFECTING_FIELDS | OPERATIONAL_FIELDS
+    actual = {f.name for f in fields(Backend)}
+    assert classified == actual
+
+
+def test_verdict_affecting_and_operational_fields_are_disjoint():
+    assert not (VERDICT_AFFECTING_FIELDS & OPERATIONAL_FIELDS)
+
+
+def test_request_shaping_fields_are_verdict_affecting():
+    # api selects the wire protocol and the response-extraction path;
+    # structured_output toggles strict json_schema. Both change the judgment.
+    assert {"base_url", "model_id", "api", "temperature", "reasoning_effort", "structured_output"} <= (
+        VERDICT_AFFECTING_FIELDS
+    )
+
+
+def test_scheduling_fields_are_operational():
+    # These change how calls are scheduled or labelled, never what is asked.
+    assert {"name", "rpm", "eval_only", "api_key_env", "role", "timeout_s"} <= OPERATIONAL_FIELDS
+
+
+def test_config_digest_is_stable_for_the_same_config():
+    a = openai_backend()
+    b = openai_backend()
+    assert config_digest(a, prompt_version="v1") == config_digest(b, prompt_version="v1")
+
+
+def test_config_digest_is_twelve_hex_chars():
+    digest = config_digest(openai_backend(), prompt_version="v1")
+    assert len(digest) == 12
+    assert all(c in "0123456789abcdef" for c in digest)
+
+
+def test_config_digest_changes_when_api_dialect_changes():
+    # The hole rev 1 left open: same model, same host, same sha, different wire
+    # protocol and response-extraction path.
+    openai = config_digest(openai_backend(api="openai"), prompt_version="v1")
+    anthropic = config_digest(openai_backend(api="anthropic"), prompt_version="v1")
+    assert openai != anthropic
+
+
+def test_config_digest_changes_when_structured_output_changes():
+    off = config_digest(openai_backend(structured_output=False), prompt_version="v1")
+    on = config_digest(openai_backend(structured_output=True), prompt_version="v1")
+    assert off != on
+
+
+def test_config_digest_changes_when_prompt_version_changes():
+    backend = openai_backend()
+    assert config_digest(backend, prompt_version="v1") != config_digest(backend, prompt_version="v2")
+
+
+def test_config_digest_ignores_operational_fields():
+    # Re-tuning rpm or renaming a backend must NOT invalidate a results file:
+    # neither changes what the model was asked.
+    base = config_digest(openai_backend(), prompt_version="v1")
+    retuned = config_digest(openai_backend(rpm=999, name="renamed", timeout_s=1.0), prompt_version="v1")
+    assert base == retuned
 
 
 def test_judge_client_requires_api_key(monkeypatch):
