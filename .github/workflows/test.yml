@@ -74,6 +74,31 @@ jobs:
           fi
           echo "No API keys in the environment, as intended."
 
+      - name: Cleartext base_url gate
+        run: |
+          # Backend.__post_init__ already refuses a non-HTTPS base_url, but it
+          # only sees backend files the runner actually loads. This catches one
+          # committed into any TOML in the tree before it is ever run.
+          #
+          # Scoped to *.toml on purpose: that is where a real credential leak
+          # would live, and it lets the test suite keep http:// fixtures for the
+          # rejection tests. Anchored to a base_url assignment rather than a
+          # bare http:// so schema URLs and XML namespaces do not trip it.
+          # `http://` cannot match inside `https://` — the literal requires the
+          # colon straight after http.
+          hits=$(grep -rInE 'base_url.{0,6}http://' \
+              --include='*.toml' \
+              --exclude-dir='.git' \
+              --exclude-dir='.venv' . || true)
+          if [ -n "$hits" ]; then
+            while IFS=: read -r file line _; do
+              printf '::error file=%s,line=%s::Cleartext base_url: API keys are sent as credentials on every request and would be exposed\n' "${file#./}" "$line"
+            done <<< "$hits"
+            echo "$hits"
+            exit 1
+          fi
+          echo "No cleartext base_url in any TOML, as intended."
+
       - name: Install uv
         # v5 still targets Node 20, which GitHub deprecated and now force-runs
         # on Node 24. Note setup-uv stopped publishing moving major tags after
