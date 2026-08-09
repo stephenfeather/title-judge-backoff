@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from judge.agreement import agreement_matrix, reason_cross_tab, reason_distribution
+from judge.cache_collapse import cache_findings, render_cache_warning
 from judge.schema import Verdict, verdict_from_json_line
 from judge.vote import tally_votes
 
@@ -337,6 +338,11 @@ def render_scenario_report(
         "below is measurable without ground truth. Nothing here says which judge",
         "is *correct* — only which are stable and where they disagree.",
         "",
+        # Above the stability table deliberately: these findings say the numbers
+        # below them may be measuring nothing, and a caching collapse makes them
+        # look BETTER rather than worse. A warning printed afterwards arrives
+        # once the reader has already believed the table (issue #15).
+        *render_cache_warning(cache_findings(by_model, manifests)),
         "## Stability (within-model, across repeated votes)",
         "",
         "Verdict and reason flips are tracked separately: a model can be perfectly",
