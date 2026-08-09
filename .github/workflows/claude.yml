@@ -58,7 +58,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           allowed_bots: "submission-agent,submission-agent[bot]"
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Surface SDK errors in the job log; the 2026-08-03 failures ended in
           # "is_error: true" with the output hidden, which was undiagnosable.
           show_full_output: true
