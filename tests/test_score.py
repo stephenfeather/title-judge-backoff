@@ -1,5 +1,7 @@
 import random
 
+from dataclasses import replace
+
 import pytest
 
 from judge.schema import Pair, ReasonCode, Verdict, verdict_to_json_line
@@ -54,6 +56,67 @@ def test_cohens_kappa_chance_agreement_is_zero():
     truth = ["approve", "approve", "reject", "reject"]
     pred = ["approve", "reject", "approve", "reject"]
     assert cohens_kappa(truth, pred) == 0.0
+
+
+def test_score_model_refuses_a_file_holding_two_models():
+    # Issue #16: model_id was taken from known[0], so a results file produced by
+    # concatenating two backends' shards — a merge tool, a `cat` of two files, a
+    # recovery script — scored fine and was labelled with whichever row sorted
+    # first. already_judged_ids guards the WRITER; nothing guarded the reader.
+    verdicts = [
+        make_verdict("p1", "approve", "ok", model_id="model-a"),
+        make_verdict("p2", "reject", "overcorrection", model_id="model-b"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    # Naming both is the point: "two models" alone does not say which file to fix.
+    assert "model-a" in str(exc.value)
+    assert "model-b" in str(exc.value)
+
+
+def test_score_model_names_every_model_it_found_not_just_two():
+    verdicts = [
+        make_verdict("p1", "approve", "ok", model_id="model-a"),
+        make_verdict("p2", "reject", "overcorrection", model_id="model-b"),
+        make_verdict("p3", "reject", "meaning_change", model_id="model-c"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    assert all(m in str(exc.value) for m in ("model-a", "model-b", "model-c"))
+
+
+def test_score_model_refuses_a_file_mixing_prompt_versions():
+    # The same defect for a sibling field, and live as of #14: results/ holds v1
+    # files and new runs write v2, so a stitched-together file mixing them is a
+    # real possibility now. Averaging two prompts is averaging two instruments.
+    verdicts = [
+        replace(make_verdict("p1", "approve", "ok"), prompt_version="v1"),
+        replace(make_verdict("p2", "reject", "overcorrection"), prompt_version="v2"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    assert "prompt_version" in str(exc.value)
+    assert "v1" in str(exc.value) and "v2" in str(exc.value)
+
+
+def test_score_model_refuses_a_file_mixing_reasoning_effort():
+    # Effort changes the reason code the model returns, so two efforts in one
+    # file are two different judges sharing a filename.
+    verdicts = [
+        replace(make_verdict("p1", "approve", "ok"), reasoning_effort="none"),
+        replace(make_verdict("p2", "reject", "overcorrection"), reasoning_effort="medium"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    assert "reasoning_effort" in str(exc.value)
+
+
+def test_score_model_is_unchanged_for_a_normal_single_model_file():
+    verdicts = [
+        make_verdict("p1", "approve", "ok"),
+        make_verdict("p2", "reject", "overcorrection"),
+    ]
+    assert score_model(PAIRS, verdicts).model_id == "model-a"
 
 
 def test_score_model_metrics():
