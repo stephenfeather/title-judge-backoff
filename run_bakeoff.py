@@ -382,6 +382,7 @@ def run_manifest(
     observed_models: set[str],
     code_version: str | None = None,
     config_digest: str | None = None,
+    attributes_supplied: dict[str, int] | None = None,
     latencies: list[float] | None = None,
     errors: list[str] | None = None,
     failed_latencies: list[float] | None = None,
@@ -407,6 +408,11 @@ def run_manifest(
         # are what a config_digest mismatch tells the operator to come read.
         "code_version": code_version,
         "config_digest": config_digest,
+        # How many pairs carried each optional attribute. Since prompt v2 the
+        # system prompt describes only the fields a pair actually has, so on a
+        # mixed corpus request_payload (which samples pairs[0]) cannot show the
+        # mix. These counts can. See issue #14.
+        "attributes_supplied": attributes_supplied or {},
         "n_pairs": n_pairs,
         "request_payload": sample_payload,
         "observed_models": sorted(observed_models),
@@ -621,6 +627,10 @@ def _write_manifest(
                 observed_models=client.observed_models,
                 code_version=code_version,
                 config_digest=config_digest,
+                attributes_supplied={
+                    "brand": sum(1 for p in pairs if p.brand),
+                    "mpn": sum(1 for p in pairs if p.mpn),
+                },
                 latencies=health.latencies,
                 errors=health.errors,
                 failed_latencies=health.failed_latencies,

@@ -312,6 +312,30 @@ def test_run_manifest_records_provenance():
     assert manifest["base_url"] == "https://example.test/v1"
 
 
+def test_run_manifest_records_how_many_pairs_carried_each_attribute():
+    # Under issue #14's fix the system prompt varies with the attributes a pair
+    # carries, and request_payload only samples pairs[0]. On a mixed corpus that
+    # sample cannot show the mix, so record the counts that can.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=1,
+        prompt_version="v2",
+        n_pairs=3,
+        sample_payload={"model": "m"},
+        observed_models=set(),
+        attributes_supplied={"brand": 2, "mpn": 0},
+    )
+    assert manifest["attributes_supplied"] == {"brand": 2, "mpn": 0}
+
+
 def test_run_manifest_records_payload_effort_and_snapshots():
     # R7: Responses has no system_fingerprint, so the manifest is the only
     # record of what was actually sent and which snapshot answered.
