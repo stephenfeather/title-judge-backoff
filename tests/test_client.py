@@ -371,7 +371,9 @@ def test_judge_client_parses_chat_completion(monkeypatch):
     assert verdict.verdict == "reject"
     assert verdict.reason == ReasonCode.CASING_ERROR
     assert verdict.model_id == "meta/llama-3.1-8b-instruct"
-    assert verdict.prompt_version == "v1"
+    # The point is that the verdict records the live prompt version, not which
+    # version that happens to be — pinning the value belongs in test_prompts.
+    assert verdict.prompt_version == PROMPT_VERSION
     assert verdict.temperature == 0.0
 
 
