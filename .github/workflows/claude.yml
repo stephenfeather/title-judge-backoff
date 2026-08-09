@@ -17,17 +17,18 @@ jobs:
   claude:
     # WHO may spend tokens, then WHAT counts as a request. Both must hold.
     #
-    # Without the actor allowlist any GitHub user could run this job — and bill
-    # it — just by writing "@claude" in a comment on a public repo. The trigger
-    # events (issue_comment, issues) fire for anyone, not only collaborators.
+    # Without the actor check any GitHub user could start a billed Claude run
+    # just by writing "@claude" in a comment: issue_comment and issues fire for
+    # anyone on a public repo, not only collaborators.
     #
-    # The list is an allowlist, not `== 'stephenfeather'`, because the bot that
-    # files this repo's issues is `submission-agent[bot]` and it is deliberately
-    # trusted below via allowed_bots. A bare owner check would silently kill
-    # that path. Actor names came from the real run history, so the [bot] suffix
-    # is what GitHub actually reports, not a guess.
+    # This gate governs ONLY whether this job runs. It has no bearing on what
+    # any other account can do in the repo — the issue-filing bot reaches the
+    # API with its own credentials and never depends on this workflow. Its runs
+    # appear in the history only because opening an issue triggers the workflow,
+    # and all of them skipped: the job has never executed for anyone but the
+    # owner.
     if: |
-      contains(fromJSON('["stephenfeather", "submission-agent[bot]"]'), github.actor) && (
+      github.actor == 'stephenfeather' && (
         (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
