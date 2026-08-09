@@ -1,8 +1,9 @@
 import json
+from dataclasses import replace
 
 import pytest
 
-from judge.schema import ReasonCode, Verdict, verdict_to_json_line
+from judge.schema import ReasonCode, Usage, Verdict, verdict_to_json_line
 from scenario_report import (
     _health_table,
     _reason_cross_tab_sections,
@@ -142,39 +143,47 @@ def test_render_scenario_report_has_every_required_section():
     assert "ReadTimeout" in md
 
 
+def cached_votes(model_id, pair_id, rulings, cached=90):
+    """Votes carrying per-call usage — where the cache evidence now comes from.
+
+    The manifest is rewritten per launch while verdict rows accumulate across
+    resumes, so the check reads the rows (issue #15 review).
+    """
+    return [
+        replace(
+            v,
+            usage=Usage(prompt_tokens=100, completion_tokens=10, total_tokens=110, cached_tokens=cached),
+        )
+        for v in votes(model_id, pair_id, rulings)
+    ]
+
+
 def test_report_warns_when_a_cache_hit_coincides_with_a_flat_flip_rate():
     # Issue #15 acceptance: the harness correlates cache hits with a flat flip
     # rate itself, rather than leaving a reader to spot it across two sections.
-    by_model = {"nv": votes("nv", "p1", [("approve", "ok")] * 3)}
-    manifests = {
-        "nv": {"usage": {"calls_measured": 3, "calls_unmeasured": 0, "calls_with_cache_hit": 3}}
-    }
-    md = render_scenario_report(by_model, manifests)
+    md = render_scenario_report({"nv": cached_votes("nv", "p1", [("approve", "ok")] * 3)}, {})
     assert "Vote independence" in md
     assert "collapsed majority" in md.lower()
 
 
 def test_the_cache_warning_precedes_the_stability_table_it_undermines():
     # A warning printed after the numbers has already let them be believed.
-    by_model = {"nv": votes("nv", "p1", [("approve", "ok")] * 3)}
-    manifests = {
-        "nv": {"usage": {"calls_measured": 3, "calls_unmeasured": 0, "calls_with_cache_hit": 3}}
-    }
-    md = render_scenario_report(by_model, manifests)
+    md = render_scenario_report({"nv": cached_votes("nv", "p1", [("approve", "ok")] * 3)}, {})
     assert md.index("Vote independence") < md.index("## Stability")
 
 
-def test_report_is_quiet_when_flips_prove_the_responses_differed():
-    by_model = {"nv": votes("nv", "p1", [("approve", "ok"), ("reject", "ok"), ("approve", "ok")])}
-    manifests = {
-        "nv": {"usage": {"calls_measured": 3, "calls_unmeasured": 0, "calls_with_cache_hit": 3}}
-    }
-    assert "Vote independence" not in render_scenario_report(by_model, manifests)
+def test_report_raises_no_alarm_when_flips_prove_the_responses_differed():
+    flipping = [("approve", "ok"), ("reject", "ok"), ("approve", "ok")]
+    md = render_scenario_report({"nv": cached_votes("nv", "p1", flipping)}, {})
+    # The section still reports that it checked (silence would be indistinguishable
+    # from the check not existing), but raises no alarm.
+    assert "collapsed majority" not in md.lower()
+    assert "clear" in md.lower()
 
 
 def test_report_flags_a_flat_backend_with_no_usage_data_as_unverifiable():
     by_model = {"nv": votes("nv", "p1", [("approve", "ok")] * 3)}
-    md = render_scenario_report(by_model, {"nv": {}})
+    md = render_scenario_report(by_model, {})
     assert "Vote independence" in md
     assert "not checkable" in md.lower()
 

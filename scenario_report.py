@@ -342,7 +342,7 @@ def render_scenario_report(
         # below them may be measuring nothing, and a caching collapse makes them
         # look BETTER rather than worse. A warning printed afterwards arrives
         # once the reader has already believed the table (issue #15).
-        *render_cache_warning(cache_findings(by_model, manifests)),
+        *render_cache_warning(cache_findings(by_model)),
         "## Stability (within-model, across repeated votes)",
         "",
         "Verdict and reason flips are tracked separately: a model can be perfectly",
