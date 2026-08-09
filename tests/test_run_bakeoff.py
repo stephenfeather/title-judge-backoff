@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from judge.client import RETRY_AFTER_DEFAULT_S, Backend, LimiterRegistry
-from judge.prompts import PROMPT_VERSION
+from judge.prompts import PROMPT_VERSION, prompt_variant_counts
 from judge.schema import Pair, ReasonCode, Usage, Verdict, verdict_to_json_line
 from run_bakeoff import (
     ResultWriter,
@@ -312,10 +312,43 @@ def test_run_manifest_records_provenance():
     assert manifest["base_url"] == "https://example.test/v1"
 
 
-def test_run_manifest_records_how_many_pairs_carried_each_attribute():
-    # Under issue #14's fix the system prompt varies with the attributes a pair
-    # carries, and request_payload only samples pairs[0]. On a mixed corpus that
-    # sample cannot show the mix, so record the counts that can.
+def test_run_manifest_distinguishes_one_pair_with_both_from_two_pairs_with_one_each():
+    # PR #32 review: marginal counts cannot identify the prompt variants sent.
+    # brand=1, mpn=1 means either ONE pair carrying both (one variant) or TWO
+    # pairs carrying one each (two different variants). v2 renders a different
+    # system prompt for each, and request_payload samples only pairs[0], so
+    # marginals cannot reconstruct the mix the manifest claims to expose.
+    both = replace(make_pair("p1"), brand="Acme", mpn="W-1")
+    brand_only = replace(make_pair("p2"), brand="Acme", mpn=None)
+    mpn_only = replace(make_pair("p3"), brand=None, mpn="W-1")
+
+    one_pair_with_both = prompt_variant_counts([both])
+    two_pairs_one_each = prompt_variant_counts([brand_only, mpn_only])
+
+    # Identical marginals: brand=1, mpn=1 in both cases.
+    assert sum(v for k, v in one_pair_with_both.items() if "brand" in k) == 1
+    assert sum(v for k, v in two_pairs_one_each.items() if "brand" in k) == 1
+    # ...but they are NOT the same prompt mix, and the manifest must say so.
+    assert one_pair_with_both != two_pairs_one_each
+
+
+def test_prompt_variant_counts_covers_all_four_combinations():
+    pairs = [
+        replace(make_pair("p1"), brand=None, mpn=None),
+        replace(make_pair("p2"), brand="Acme", mpn=None),
+        replace(make_pair("p3"), brand=None, mpn="W-1"),
+        replace(make_pair("p4"), brand="Acme", mpn="W-1"),
+        replace(make_pair("p5"), brand="Acme", mpn="W-2"),
+    ]
+    assert prompt_variant_counts(pairs) == {
+        "none": 1,
+        "brand": 1,
+        "mpn": 1,
+        "brand+mpn": 2,
+    }
+
+
+def test_run_manifest_records_the_prompt_variant_histogram():
     backend = Backend(
         name="nv",
         base_url="https://example.test/v1",
@@ -331,9 +364,9 @@ def test_run_manifest_records_how_many_pairs_carried_each_attribute():
         n_pairs=3,
         sample_payload={"model": "m"},
         observed_models=set(),
-        attributes_supplied={"brand": 2, "mpn": 0},
+        prompt_variants={"none": 1, "brand+mpn": 2},
     )
-    assert manifest["attributes_supplied"] == {"brand": 2, "mpn": 0}
+    assert manifest["prompt_variants"] == {"none": 1, "brand+mpn": 2}
 
 
 def test_run_manifest_records_payload_effort_and_snapshots():

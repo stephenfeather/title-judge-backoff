@@ -69,6 +69,31 @@ def _supplied_attributes(pair) -> list[str]:
     return supplied
 
 
+def prompt_variant(pair) -> str:
+    """Which system-prompt variant this pair renders: the manifest's unit.
+
+    Derived from `_supplied_attributes`, so it names the variant that was
+    actually sent rather than a separate description that could drift from it.
+    """
+    return "+".join(label.lower() for label in _supplied_attributes(pair)) or "none"
+
+
+def prompt_variant_counts(pairs) -> dict[str, int]:
+    """How many pairs render each system-prompt variant.
+
+    JOINT counts, not per-attribute marginals. Marginals cannot identify the
+    prompt mix: brand=1, mpn=1 is either one pair carrying both (one variant) or
+    two pairs carrying one each (two variants), and v2 renders a different
+    prompt for each. Since the manifest's request_payload samples only pairs[0],
+    this histogram is the only thing that can reconstruct what was sent.
+    """
+    counts: dict[str, int] = {}
+    for pair in pairs:
+        variant = prompt_variant(pair)
+        counts[variant] = counts.get(variant, 0) + 1
+    return counts
+
+
 def build_system_prompt(pair) -> str:
     """The system prompt for one pair, describing only the inputs it will get."""
     supplied = _supplied_attributes(pair)

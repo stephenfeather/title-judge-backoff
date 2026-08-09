@@ -40,7 +40,7 @@ from judge.client import (
     rate_limit_penalty,
 )
 from judge.provenance import DirtyTree, GitUnavailable, resolve_code_version
-from judge.prompts import PROMPT_VERSION
+from judge.prompts import PROMPT_VERSION, prompt_variant_counts
 from judge.schema import (
     Pair,
     Usage,
@@ -382,7 +382,7 @@ def run_manifest(
     observed_models: set[str],
     code_version: str | None = None,
     config_digest: str | None = None,
-    attributes_supplied: dict[str, int] | None = None,
+    prompt_variants: dict[str, int] | None = None,
     latencies: list[float] | None = None,
     errors: list[str] | None = None,
     failed_latencies: list[float] | None = None,
@@ -408,11 +408,13 @@ def run_manifest(
         # are what a config_digest mismatch tells the operator to come read.
         "code_version": code_version,
         "config_digest": config_digest,
-        # How many pairs carried each optional attribute. Since prompt v2 the
-        # system prompt describes only the fields a pair actually has, so on a
-        # mixed corpus request_payload (which samples pairs[0]) cannot show the
-        # mix. These counts can. See issue #14.
-        "attributes_supplied": attributes_supplied or {},
+        # How many pairs rendered each system-prompt variant. Since prompt v2
+        # the system prompt describes only the fields a pair actually has, and
+        # request_payload samples only pairs[0], so on a mixed corpus this
+        # histogram is the only record of what was sent. Joint, not marginal:
+        # per-attribute counts cannot tell one pair carrying both fields from
+        # two pairs carrying one each. See issue #14.
+        "prompt_variants": prompt_variants or {},
         "n_pairs": n_pairs,
         "request_payload": sample_payload,
         "observed_models": sorted(observed_models),
@@ -627,10 +629,7 @@ def _write_manifest(
                 observed_models=client.observed_models,
                 code_version=code_version,
                 config_digest=config_digest,
-                attributes_supplied={
-                    "brand": sum(1 for p in pairs if p.brand),
-                    "mpn": sum(1 for p in pairs if p.mpn),
-                },
+                prompt_variants=prompt_variant_counts(pairs),
                 latencies=health.latencies,
                 errors=health.errors,
                 failed_latencies=health.failed_latencies,
