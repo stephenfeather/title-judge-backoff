@@ -15,11 +15,24 @@ on:
 
 jobs:
   claude:
+    # WHO may spend tokens, then WHAT counts as a request. Both must hold.
+    #
+    # Without the actor allowlist any GitHub user could run this job — and bill
+    # it — just by writing "@claude" in a comment on a public repo. The trigger
+    # events (issue_comment, issues) fire for anyone, not only collaborators.
+    #
+    # The list is an allowlist, not `== 'stephenfeather'`, because the bot that
+    # files this repo's issues is `submission-agent[bot]` and it is deliberately
+    # trusted below via allowed_bots. A bare owner check would silently kill
+    # that path. Actor names came from the real run history, so the [bot] suffix
+    # is what GitHub actually reports, not a guess.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      contains(fromJSON('["stephenfeather", "submission-agent[bot]"]'), github.actor) && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
