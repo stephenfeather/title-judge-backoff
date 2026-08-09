@@ -15,11 +15,25 @@ on:
 
 jobs:
   claude:
+    # WHO may spend tokens, then WHAT counts as a request. Both must hold.
+    #
+    # Without the actor check any GitHub user could start a billed Claude run
+    # just by writing "@claude" in a comment: issue_comment and issues fire for
+    # anyone on a public repo, not only collaborators.
+    #
+    # This gate governs ONLY whether this job runs. It has no bearing on what
+    # any other account can do in the repo — the issue-filing bot reaches the
+    # API with its own credentials and never depends on this workflow. Its runs
+    # appear in the history only because opening an issue triggers the workflow,
+    # and all of them skipped: the job has never executed for anyone but the
+    # owner.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      github.actor == 'stephenfeather' && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
