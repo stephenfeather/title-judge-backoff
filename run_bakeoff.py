@@ -16,6 +16,7 @@ rate-limited per backend's rpm. API keys are read from the environment only
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import queue
 import statistics
@@ -24,7 +25,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Self
 
@@ -723,9 +724,38 @@ def run_backend(
                 max_workers=concurrency, thread_name_prefix=f"judge-{backend.name}"
             )
             try:
-                futures = [pool.submit(judge_one, item, writer) for item in todo]
-                for future in futures:
-                    future.result()  # surface anything judge_one did not catch
+                # Submit a sliding window rather than the whole todo list.
+                # One Future per pending vote is 120,000 of them per backend at
+                # the 40k-pair scale #9 exists to serve, each holding a lock, a
+                # condition variable, a callback list and its closure arguments
+                # until the backend finishes (issue #17). The window is sized by
+                # `concurrency`, so the pending set no longer grows with the
+                # work list.
+                #
+                # 2x concurrency, not 1x: a worker that finishes finds queued
+                # work already waiting instead of idling until the main thread
+                # wakes up to submit more.
+                #
+                # Order is unchanged at concurrency=1. The executor's queue is
+                # FIFO and there is a single worker, so tasks still run in
+                # submission order and the results file is written in the same
+                # pair-then-vote order as before.
+                queued = iter(todo)
+                window = 2 * concurrency
+                pending = {
+                    pool.submit(judge_one, item, writer)
+                    for item in itertools.islice(queued, window)
+                }
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        future.result()  # surface anything judge_one did not catch
+                    # Top back up to the window. When `queued` is exhausted this
+                    # adds nothing and the loop drains what is still in flight.
+                    pending |= {
+                        pool.submit(judge_one, item, writer)
+                        for item in itertools.islice(queued, len(done))
+                    }
             except BaseException:
                 # Every vote is submitted up front, so a plain
                 # shutdown(wait=True) would keep sending the REMAINING paid
