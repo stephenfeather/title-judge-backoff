@@ -2,6 +2,7 @@ import json
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import httpx
@@ -668,6 +669,64 @@ def test_run_manifest_omits_nothing_when_temperature_is_set():
 # --------------------------------------------------------------------------
 # Concurrency (issue #9)
 # --------------------------------------------------------------------------
+
+
+class CountingPool(ThreadPoolExecutor):
+    """A real pool that records how many Futures were outstanding at once.
+
+    Outstanding = submitted but not yet completed, which is exactly the memory
+    issue #17 is about: each Future carries a lock, a condition variable, a
+    callback list and its closure arguments until it is released.
+    """
+
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._outstanding = 0
+        self.max_outstanding = 0
+        self._counter_lock = threading.Lock()
+        CountingPool.instances.append(self)
+
+    def submit(self, fn, /, *args, **kwargs):
+        with self._counter_lock:
+            self._outstanding += 1
+            self.max_outstanding = max(self.max_outstanding, self._outstanding)
+        future = super().submit(fn, *args, **kwargs)
+        future.add_done_callback(self._released)
+        return future
+
+    def _released(self, _future):
+        with self._counter_lock:
+            self._outstanding -= 1
+
+
+def peak_outstanding(monkeypatch, tmp_path, n_pairs, *, votes=3, concurrency=4):
+    """Run a backend over n_pairs and return the pool's peak Future count."""
+    CountingPool.instances.clear()
+    monkeypatch.setattr("run_bakeoff.ThreadPoolExecutor", CountingPool)
+    out = tmp_path / f"n{n_pairs}"
+    out.mkdir()
+    run_backend(
+        concurrency_backend(),
+        [make_pair(f"p{i}") for i in range(n_pairs)],
+        out,
+        votes=votes,
+        concurrency=concurrency,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: FakeClient(b),
+    )
+    return max(p.max_outstanding for p in CountingPool.instances)
+
+
+def test_pending_work_is_bounded_independently_of_todo_size(monkeypatch, tmp_path):
+    # Issue #17: every vote was submitted up front, so the pending set was
+    # len(todo) — 120,000 Futures per backend at the 40k-pair scale #9 exists to
+    # serve. The bound must come from `concurrency`, not from the work list.
+    small = peak_outstanding(monkeypatch, tmp_path, 40)  # 120 votes
+    large = peak_outstanding(monkeypatch, tmp_path, 400)  # 1200 votes, 10x
+    assert large == small, f"pending set grew with todo: {small} -> {large}"
+    assert large < 40, f"pending set is not bounded by concurrency: {large}"
 
 
 def concurrency_backend(name="nv", base_url="https://integrate.api.nvidia.com/v1", rpm=6000):
