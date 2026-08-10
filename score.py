@@ -112,6 +112,59 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     if not known:
         raise ValueError("no verdicts matched any ground-truth pair")
 
+    # Assert the one-model invariant instead of assuming it. `already_judged_ids`
+    # refuses to RESUME a file whose rows carry a different model_id, but that
+    # guards the writer — nothing stops a file being produced by concatenating
+    # two backends' shards (a merge tool, a `cat` of two files, a recovery
+    # script stitching a partial run back together). Such a file used to score
+    # cleanly and be labelled with whichever row happened to sort first, which
+    # is the reader-side counterpart of the provenance gap in issue #13.
+    #
+    # Every other ordering dependency here was removed deliberately (#10) so a
+    # reported number cannot depend on the order concurrent workers wrote rows.
+    # This was the last one.
+    # The fields checked are exactly the run config `already_judged_ids` refuses
+    # to resume across, because that is what "one run" means. prompt_version is
+    # live rather than hypothetical since #14: results/ holds v1 files and new
+    # runs write v2, so a stitched file mixing them is a real possibility, and
+    # averaging two prompts averages two instruments.
+    # Two groups, because `None` means OPPOSITE things in them.
+    #
+    # Config fields: None is a real value. temperature=None means the field was
+    # omitted from the request, which already_judged_ids treats as a different
+    # config from temperature=0.0 — skipping it as "unknown" would erase a
+    # distinction the writer guard deliberately enforces.
+    #
+    # Provenance fields: None means "unknown, do not compare" (#13). Every row
+    # written before that issue lacks all three, and a run resumed across the
+    # boundary legitimately holds both kinds, so only rows that DO know are
+    # compared. Shards can otherwise agree on model, prompt, temperature and
+    # effort while differing in host or code — and config_digest is the only
+    # field that distinguishes `api` and `structured_output` at all.
+    mixed = {}
+    for field in ("model_id", "prompt_version", "temperature", "reasoning_effort"):
+        values = sorted({str(getattr(v, field)) for v in known})
+        if len(values) > 1:
+            mixed[field] = values
+    for field in ("base_url", "config_digest", "code_version"):
+        values = sorted({getattr(v, field) for v in known if getattr(v, field) is not None})
+        if len(values) > 1:
+            mixed[field] = values
+    if mixed:
+        detail = "; ".join(f"{f}: {', '.join(repr(v) for v in vs)}" for f, vs in mixed.items())
+        hint = (
+            " A config_digest difference is one no other column names — compare the "
+            "`api` and `structured_output` settings in each run's manifest."
+            if "config_digest" in mixed
+            else ""
+        )
+        raise ValueError(
+            f"results hold verdicts from more than one run config ({detail}), so there is "
+            f"no single model to score. This file was most likely produced by "
+            f"concatenating separate runs. Score each run's results file on its own.{hint}"
+        )
+    model_ids = sorted({v.model_id for v in known})
+
     # Ordered by the PAIRS file, not by first appearance in the results file.
     # bootstrap_ci resamples this sequence from a fixed seed, so ordering it by
     # the results file would make the reported CI depend on the order verdicts
@@ -169,7 +222,9 @@ def score_model(pairs: list[Pair], verdicts: list[Verdict]) -> ModelScore:
     )
 
     return ModelScore(
-        model_id=known[0].model_id,
+        # From the asserted set, not from whichever row sorted first: the
+        # ordering dependency is removed rather than merely guarded.
+        model_id=model_ids[0],
         n=n,
         # Coverage answers "did this backend judge the whole set", which is a
         # different question from "did its votes decide". Computed over JUDGED
