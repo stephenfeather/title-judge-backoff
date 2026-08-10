@@ -50,6 +50,7 @@ uv run pytest -x -q                         # stop on first failure, quiet
 | `judge/rulings.py` (ruling journal) | `tests/test_rulings.py` |
 | `judge/flips.py` (per-pair flip stats) | `tests/test_flips.py` |
 | `judge/cache_collapse.py` (response-cache collapse detector) | `tests/test_cache_collapse.py` |
+| `judge/deadlocks.py` (per-backend deadlock audit records) | `tests/test_deadlocks.py` |
 | `rule.py` (ruling TUI) | `tests/test_rule.py` |
 | `judge/stats.py` (spread, bootstrap) | `tests/test_stats.py` |
 | `judge/check.py` | `tests/test_check_backends.py` |

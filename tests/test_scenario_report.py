@@ -188,6 +188,32 @@ def test_report_flags_a_flat_backend_with_no_usage_data_as_unverifiable():
     assert "not checkable" in md.lower()
 
 
+def test_report_surfaces_a_backend_that_deadlocked_alone(tmp_path):
+    # #23: one backend ties 1-1 while two others agree. Pooled by pair_id the
+    # tie vanishes into a settled majority; the report must still show it.
+    by_model = {
+        "tied": votes("tied", "p1", [("approve", "ok"), ("reject", "ok")]),
+        "agree-a": votes("agree-a", "p1", [("approve", "ok")] * 3),
+        "agree-b": votes("agree-b", "p1", [("approve", "ok")] * 3),
+    }
+    md = render_scenario_report(by_model, {}, leg="s1")
+    assert "Backend-level deadlocks" in md
+    assert "tied" in md
+
+
+def test_report_deadlock_section_is_absent_when_every_backend_settled():
+    by_model = {"nv": votes("nv", "p1", [("approve", "ok")] * 3)}
+    assert "Backend-level deadlocks" not in render_scenario_report(by_model, {}, leg="s1")
+
+
+def test_deadlock_section_does_not_claim_the_slate_deadlocked():
+    # UNDECIDED on the card means the slate deadlocked, and its worth is that it
+    # is rare. This section must read as a different, quieter claim.
+    by_model = {"nv": votes("nv", "p1", [("approve", "ok"), ("reject", "ok")])}
+    md = render_scenario_report(by_model, {}, leg="s1").lower()
+    assert "one backend" in md
+
+
 def test_cross_tab_rows_are_totally_ordered_so_two_runs_agree():
     """The report must be diffable. Found while verifying #18.
 
