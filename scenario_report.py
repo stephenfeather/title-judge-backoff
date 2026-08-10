@@ -30,6 +30,7 @@ from pathlib import Path
 
 from judge.agreement import agreement_matrix, reason_cross_tab, reason_distribution
 from judge.cache_collapse import cache_findings, render_cache_warning
+from judge.deadlocks import backend_deadlocks, deadlock_records, render_deadlock_section
 from judge.schema import Verdict, verdict_from_json_line
 from judge.vote import tally_votes
 
@@ -325,7 +326,11 @@ def _caveats_section(by_model: dict[str, list[Verdict]], manifests: dict[str, di
 
 
 def render_scenario_report(
-    by_model: dict[str, list[Verdict]], manifests: dict[str, dict], *, queue_size: int = 40
+    by_model: dict[str, list[Verdict]],
+    manifests: dict[str, dict],
+    *,
+    queue_size: int = 40,
+    leg: str = "",
 ) -> str:
     ranking = contention_ranking(by_model)
     contested = [r for r in ranking if r.contention > 0]
@@ -343,6 +348,11 @@ def render_scenario_report(
         # look BETTER rather than worse. A warning printed afterwards arrives
         # once the reader has already believed the table (issue #15).
         *render_cache_warning(cache_findings(by_model)),
+        # Per-backend deadlocks, which the pooled ruling card cannot show: it
+        # groups by pair_id, so one judge's tie is absorbed into the slate's
+        # majority. Deliberately quieter than the card's UNDECIDED marker,
+        # which means the whole slate deadlocked (issue #23).
+        *render_deadlock_section(backend_deadlocks(by_model, leg=leg)),
         "## Stability (within-model, across repeated votes)",
         "",
         "Verdict and reason flips are tracked separately: a model can be perfectly",
@@ -434,8 +444,23 @@ def main() -> None:
     if not by_model:
         parser.error(f"no verdict files found in {args.results}")
     manifests = load_manifests(args.results)
-    args.out.write_text(render_scenario_report(by_model, manifests, queue_size=args.queue_size))
+    # The leg is the results directory: scenario_report is invoked once per leg,
+    # and the same backend runs in s1 and in each s2-* leg. Recording it keeps
+    # those four populations apart in the audit trail (issue #23).
+    leg = args.results.resolve().name
+    args.out.write_text(
+        render_scenario_report(by_model, manifests, queue_size=args.queue_size, leg=leg)
+    )
     print(f"wrote {args.out} ({len(by_model)} backends)")
+
+    # The audit trail, written BESIDE the report rather than into --results:
+    # load_results globs *.jsonl there and would try to parse these records as
+    # verdicts. Named from the report so two legs cannot overwrite each other.
+    records = deadlock_records(backend_deadlocks(by_model, leg=leg))
+    if records:
+        audit_path = args.out.with_name(f"{args.out.stem}.deadlocks.jsonl")
+        audit_path.write_text(records)
+        print(f"wrote {audit_path} ({len(records.splitlines())} backend-level deadlocks)")
 
 
 if __name__ == "__main__":
