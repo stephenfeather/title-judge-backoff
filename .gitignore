@@ -23,3 +23,14 @@ data/*.jsonl
 *.jsonl
 results/
 leaderboard.md
+
+# Sweep logs — the console transcript of a run: per-backend progress, and
+# tracebacks carrying absolute local paths. A run artifact tied to one
+# machine and one launch, superseded by the manifest, so never committed.
+sweep.log
+*.sweep.log
+
+# Auto-extracted session handoffs — a machine dump of every file path and
+# shell command a session touched, including absolute local paths. Hand-written
+# handoffs under thoughts/shared/handoffs/main/ ARE committed; these are not.
+thoughts/shared/handoffs/auto/
