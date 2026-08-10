@@ -111,6 +111,86 @@ def test_score_model_refuses_a_file_mixing_reasoning_effort():
     assert "reasoning_effort" in str(exc.value)
 
 
+def test_score_model_refuses_shards_served_by_different_hosts():
+    # Codex P1 on #35: shards can agree on model, prompt, temperature and effort
+    # while differing in provenance. already_judged_ids treats those as part of
+    # run identity, so the reader-side guard must too.
+    verdicts = [
+        replace(make_verdict("p1", "approve", "ok"), base_url="https://host-a.test/v1"),
+        replace(make_verdict("p2", "reject", "overcorrection"), base_url="https://host-b.test/v1"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    assert "base_url" in str(exc.value)
+
+
+def test_score_model_refuses_shards_produced_by_different_code():
+    verdicts = [
+        replace(make_verdict("p1", "approve", "ok"), code_version="aaaaaaaaaaaa"),
+        replace(make_verdict("p2", "reject", "overcorrection"), code_version="bbbbbbbbbbbb"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    assert "code_version" in str(exc.value)
+
+
+def test_score_model_refuses_shards_with_different_request_configs():
+    # config_digest is the only field that distinguishes `api` and
+    # `structured_output`, which no other column names.
+    verdicts = [
+        replace(make_verdict("p1", "approve", "ok"), config_digest="dig000000001"),
+        replace(make_verdict("p2", "reject", "overcorrection"), config_digest="dig000000002"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    assert "config_digest" in str(exc.value)
+
+
+def test_score_model_still_scores_legacy_rows_with_no_provenance():
+    # Every row in results/ predates #13. Absent provenance means "unknown", not
+    # a distinct value — reading it as one would refuse the entire corpus.
+    verdicts = [
+        make_verdict("p1", "approve", "ok"),
+        make_verdict("p2", "reject", "overcorrection"),
+    ]
+    assert score_model(PAIRS, verdicts).model_id == "model-a"
+
+
+def test_score_model_accepts_a_file_resumed_across_the_provenance_boundary():
+    # One run whose early rows predate #13 and whose later rows carry it. The
+    # known values agree, so there is one run here, not two.
+    verdicts = [
+        make_verdict("p1", "approve", "ok"),
+        replace(make_verdict("p2", "reject", "overcorrection"), base_url="https://host-a.test/v1"),
+    ]
+    assert score_model(PAIRS, verdicts).model_id == "model-a"
+
+
+def test_score_model_refuses_when_the_known_provenance_values_disagree():
+    # Unknown rows are skipped, but two rows that DO know and disagree are two runs.
+    verdicts = [
+        make_verdict("p1", "approve", "ok"),
+        replace(make_verdict("p2", "reject", "overcorrection"), base_url="https://host-a.test/v1"),
+        replace(make_verdict("p3", "reject", "meaning_change"), base_url="https://host-b.test/v1"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    assert "base_url" in str(exc.value)
+
+
+def test_score_model_still_treats_an_omitted_temperature_as_a_real_config():
+    # The opposite None rule: temperature=None (field omitted) is a genuine
+    # config distinct from 0.0, per already_judged_ids. It must NOT be skipped
+    # as "unknown" the way provenance is.
+    verdicts = [
+        replace(make_verdict("p1", "approve", "ok"), temperature=None),
+        replace(make_verdict("p2", "reject", "overcorrection"), temperature=0.0),
+    ]
+    with pytest.raises(ValueError) as exc:
+        score_model(PAIRS, verdicts)
+    assert "temperature" in str(exc.value)
+
+
 def test_score_model_is_unchanged_for_a_normal_single_model_file():
     verdicts = [
         make_verdict("p1", "approve", "ok"),
