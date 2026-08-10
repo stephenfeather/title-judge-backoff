@@ -1,0 +1,105 @@
+root_span_id: d85af490-31a7-4c0d-89d2-d45baaa1631b
+turn_span_id: 
+session_id: d85af490-31a7-4c0d-89d2-d45baaa1631b
+---
+session: main
+session_uuid: d85af490-31a7-4c0d-89d2-d45baaa1631b
+date: 2026-08-07
+status: complete
+outcome: PARTIAL_PLUS
+---
+
+goal: Shipped 6 PRs — concurrency (#10), line-order independence, no-majority representability (#12/#20), undecided ruling card (#21/#22), usage capture (#11/#24), late-binding closure + report determinism (#18/#25), CI workflow (#26)
+now: Ask Stephen for the pair-id scrub ruling — real calibration pair ids sit in PUBLIC issues #12, #21 and merged PR bodies #20, #22; nothing may be edited until he answers
+test: uv run pytest -q   # 365 passing on main @ 9b0d01a
+
+done_this_session:
+  - task: "#9 concurrency — --concurrency N, host-keyed rate limiter, single writer thread, 429 host backoff, cancel-on-interrupt"
+    files: [run_bakeoff.py, judge/client.py, tests/test_run_bakeoff.py, tests/test_client.py]
+  - task: "Line-order independence in scoring — tally_votes sorts by run_index, score_model orders by the pairs file"
+    files: [judge/vote.py, score.py, tests/test_score.py]
+  - task: "#12 no majority is a state — VoteResult.verdict/reason are None on a tie; every consumer decides explicitly"
+    files: [judge/vote.py, judge/agreement.py, score.py, scenario_report.py]
+  - task: "#21 ruling card shows UNDECIDED prominently; queue ranks undecided pairs first"
+    files: [judge/flips.py, rule.py, tests/test_flips.py, tests/test_rule.py]
+  - task: "#11 capture the usage block — per-row Usage + per-run manifest totals + cache-hit count"
+    files: [judge/schema.py, judge/client.py, run_bakeoff.py]
+  - task: "#18 hoist the health formatter out of the loop; fix scenario report nondeterminism found while verifying it"
+    files: [scenario_report.py, tests/test_scenario_report.py]
+  - task: "Filed 9 follow-up issues (#12-#18, #21, #23); 3 now closed by merges"
+    files: []
+  - task: "Committed the Claude Code GitHub workflow that was sitting untracked"
+    files: [.github/workflows/claude.yml]
+
+blockers: []
+
+questions:
+  - "Pair-id scrub: real calibration pair ids are in PUBLIC issues #12, #21 and merged PR bodies #20, #22. Stephen's call. If scrub: one pass over all four, each annotated that ONLY ids were removed, so a reader who saw the original can tell the numbers did not move."
+  - "#23 (pooling absorbs a backend deadlock) is unassigned and needs a design decision, not a bug fix."
+  - "Does claude-code-action require write access for human @claude commenters? Repo is public; unverified. Failure mode is a stranger spending tokens."
+
+decisions:
+  - rate_limit_keys_on_host: "Six nvidia-* backends share one endpoint and one quota. LimiterRegistry keys on urlparse(base_url).netloc, at the LOWEST rpm any backend on that host declares, and only ever tightens so registration order cannot matter."
+  - sleep_inside_the_limiter_lock: "Deliberate. Releasing first lets every waiting thread read the same _last and fire together — that IS the 503 storm. Only admission is serialized; the HTTP call runs outside the lock."
+  - none_not_a_sentinel: "VoteResult/FlipStats use None for no-majority so a consumer that ignores it gets AttributeError, not a plausible wrong number. This is how agreement_matrix and contention_ranking were found — both crashed on real data the moment the type changed."
+  - exclude_unsettled_but_count_it: "kappa/accuracy/false_approve_rate exclude unsettled-verdict pairs; reason_confusion excludes unsettled-reason pairs. false_approve_rate is the sharpest case — it is a SAFETY metric, so a coin flip recorded as an approve corrupts the number governing deployment risk."
+  - coverage_deliberately_unchanged: "Coverage stays on judged pairs, not scored pairs. Basing it on the new n would drop it below 1.0 for one contested pair and the leaderboard's partial-coverage gate would silently remove that model from the ranking — worse than the bug."
+  - usage_is_observation_not_config: "Token usage is NOT part of already_judged_ids identity, so capturing it invalidates no existing result file and forces no re-judging."
+  - absent_is_not_zero: "A host reporting no usage leaves usage=None and increments calls_unmeasured; sums stay null. A total summed over 2 of 600 calls is worse than no total because it looks like one."
+
+findings:
+  - resume_breaks_file_order_without_concurrency: "A failed vote is retried on the NEXT launch and appends at the end of the file. Measured across S1: deepseek 47 pairs out of run_index order, inkling 33, the other six clean. So the order-dependence bug was already live in committed data; concurrency only widens it."
+  - scenario_report_was_nondeterministic: "Two runs of identical code over identical data produced 60 differing lines. Cross-tab rows sorted on count alone, ties fell back to dict insertion order from iterating a SET, and Python randomizes str hashing per process. Confirmed by pinning PYTHONHASHSEED. THIS UNDERCUT 'regenerate and diff', the verification used for #10 and #12 — those conclusions hold only because the real differences dwarfed the noise and the diffs were read line by line, not because the method was sound."
+  - fabricated_tie_breaks_ordered_human_review: "contention_ranking scored pairs partly on the tie-broken value, so a coin flip decided which pairs an operator saw FIRST. Not a wrong cell — wrong prioritisation of human review."
+  - usage_makes_15_detectable: "cached_tokens is the in-band tell for a caching host collapsing majority-of-3 to n=1. That failure IMPROVES every metric while measuring nothing. #24 converts #15 from a known risk into a detectable one — but a cache hit alone is not a collapse (prompt-prefix caching is normal); the signal is cache hits AND a flat flip rate."
+  - repo_is_already_public: "AGENTS.md said 'may go public'; agent-gh repo view returns PUBLIC. That stale wording is why real pair ids reached tests AND four public artifacts. Corrected in AGENTS.md, scope extended to issue bodies, PR descriptions and commit messages."
+  - no_ground_truth_exists_yet: "data/ holds only README.md. score.py cannot run and kappa is uncomputable until Stephen's 200-row ruling pass happens. scenario_report.py is the only S1 artifact, and results/ is gitignored so it is never committable."
+
+worked:
+  - "Cannot write a failing test for a concurrency bug → use a REAL clock plus a threading.Barrier. The limiter red read '6 calls released within 0.002s of each other' — the 503 storm reproduced as a unit test."
+  - "Suspect a test is a formality → mutation-check it. Forcing max_workers=1 failed exactly the two parallelism tests; reverting the tiebreaker failed 8/8 seeds. This habit caught three separate weak tests."
+  - "New test might pass by luck → size the fixture against the odds. Four tied rows let one hash seed in five pass against broken code (~1 in 24); eight rows makes it 1 in 40320."
+  - "Report diff shows changes after a refactor → check whether the tool is deterministic BEFORE blaming the change. Two runs of untouched code differed; PYTHONHASHSEED=0 made them identical, converting a suspicion into a controlled experiment."
+  - "Claim about API response shape → look it up via context7 rather than guessing. /chat/completions and /messages differ more than expected (prompt_tokens vs input_tokens, and Anthropic sends NO total); wrong names would have silently recorded nulls that read as an unsupportive host."
+  - "Verifying a claim about code at another ref → git show <ref>:<path> or git grep <pattern> <ref>. Never check out; the lead checked out main in the shared tree while a feature branch was live."
+
+failed:
+  - "Asserting 'provable no-op' from reasoning → WRONG. Scoring the real deepseek file showed 2 reason rulings and the kappa CI moved. Retracted."
+  - "Asserting flips.py pooling is 'more tie-prone' than per-model → BACKWARDS. Pooling makes exact ties RARER; measured 3 ties across the pooled run, not more than 11."
+  - "Asserting the ruling card DISPLAYS a fabricated majority → it never did. render_flip_pane does not read .majority. Wrote the issue on an unverified premise and had to restate it."
+  - "Reading an aggregate table as conclusive → the one low-flip pair that looked like a masked deadlock had NO backend-level verdict tie at all. Only the drill-down settled it."
+  - "git checkout -b as the first line of a multi-line Bash call → a later line tripped a hook, the whole invocation was rejected, the branch was never created, and 20 minutes of edits landed on main. Check git branch --show-current after any switch sharing an invocation."
+  - "Test asserting a bare substring ('cross-tab' not in md) → broke when unrelated prose used the word. Assert against the specific section, not the document."
+
+next:
+  - "Get the pair-id scrub ruling from Stephen; if scrub, one annotated pass over issues #12, #21 and merged PR bodies #20, #22"
+  - "#14 is the highest-value remaining issue — all 4,974 S1 judgments were made under a prompt promising BRAND/MPN the corpus never sends. Fixing it bumps PROMPT_VERSION, invalidates resume, and needs a re-run decision + budget from Stephen"
+  - "#16 is the smallest remaining unblocked item: assert one model_id per results file instead of trusting known[0]"
+  - "#13 (verdict provenance: host + code version) — needed before any cross-host migration to DeepInfra"
+  - "Regenerate results/2026-08-06/scenario-report.md under current main; the on-disk copy predates #20/#22/#25 and results/ is gitignored so it lives only on this machine"
+  - "429 backoff has NOT been exercised against a live provider; the #9 speedup is proven only against a fake client with injected latency"
+
+files:
+  created:
+    - .github/workflows/claude.yml
+  modified:
+    - run_bakeoff.py
+    - judge/client.py
+    - judge/schema.py
+    - judge/vote.py
+    - judge/agreement.py
+    - judge/flips.py
+    - score.py
+    - scenario_report.py
+    - rule.py
+    - AGENTS.md
+    - README.md
+    - tests/test_run_bakeoff.py
+    - tests/test_client.py
+    - tests/test_schema.py
+    - tests/test_vote.py
+    - tests/test_score.py
+    - tests/test_agreement.py
+    - tests/test_scenario_report.py
+    - tests/test_flips.py
+    - tests/test_rule.py
