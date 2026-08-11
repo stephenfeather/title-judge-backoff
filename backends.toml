@@ -35,25 +35,84 @@
 # guard treats an omitted temperature as a different config from 0.0.
 # ---------------------------------------------------------------------------
 
-[[backends]]
-name = "nvidia-deepseek-v4-flash"
-base_url = "https://integrate.api.nvidia.com/v1"
-model_id = "deepseek-ai/deepseek-v4-flash"
-rpm = 40
-eval_only = true
-role = "contender"
-api_key_env = "NVIDIA_API_KEY"
-temperature = 0.0
+# REMOVED (2026-08-10): BOTH DeepSeek backends. NVIDIA end-of-lifed the family;
+# `--ping` returns 410 Gone, and for v4-flash the body carries the date:
+#
+#   "The model 'deepseek-ai/deepseek-v4-flash' has reached its end of life on
+#    2026-08-07T09:00:00Z and is no longer available."
+#
+# That is the day AFTER the 2026-08-06 S1 sweep, which is why S1 has a complete
+# 600-row deepseek-v4-flash file and nothing after it ever will.
+#
+# 410 is a FOURTH failure mode, distinct from the three below: withdrawn, not a
+# provisioning gap (404) and not a sick worker (500). Re-pinging cannot bring it
+# back, so unlike inkling there is no reason to leave these entries in the slate
+# burning calls.
+#
+# DeepSeek is re-added below from DeepInfra, which is where the family moved.
 
+# ---------------------------------------------------------------------------
+# DeepInfra (2026-08-10). The successor host after NVIDIA's EOL. All entries
+# below reported [reachable] on --ping before being added — catalog presence is
+# not entitlement, as kimi on NVIDIA proved.
+#
+# api_key_env is set explicitly because the name-derivation default would ask
+# for DEEPINFRA_DEEPSEEK_V4_FLASH_API_KEY (it is built from the BACKEND name,
+# not the host). DEEPINFRA_TOKEN also exists in the environment and works, but
+# DEEPINFRA_API_KEY is what every other backend here follows.
+#
+# rpm 60 is a placeholder, not a measurement: DeepInfra sends no rate-limit
+# headers at all (see README), so there is nothing to read headroom from. Lower
+# it if 429s appear — the limiter keys per HOST, so all four share one budget.
+#
+# temperature is omitted per the rule above: it is opt-in and unproven here.
+# ---------------------------------------------------------------------------
+
+# Replaces the EOL'd nvidia-deepseek-v4-flash. NOT a like-for-like restoration:
+# the id carries an explicit `-0731` snapshot where NVIDIA's did not, so this is
+# a different serving of the family and possibly different weights. A v2-vs-S1
+# reason-distribution diff on DeepSeek therefore mixes a prompt change with a
+# host-and-snapshot change, and cannot be read as prompt-only.
 [[backends]]
-name = "nvidia-deepseek-v4-pro"
-base_url = "https://integrate.api.nvidia.com/v1"
-model_id = "deepseek-ai/deepseek-v4-pro"
-rpm = 40
-eval_only = true
+name = "deepinfra-deepseek-v4-flash"
+base_url = "https://api.deepinfra.com/v1/openai"
+model_id = "deepseek-ai/DeepSeek-V4-Flash-0731"
+rpm = 60
+eval_only = false
 role = "contender"
-api_key_env = "NVIDIA_API_KEY"
-temperature = 0.0
+api_key_env = "DEEPINFRA_API_KEY"
+
+# Rescues a model NVIDIA never let this account invoke (404 entitlement gap,
+# five days unfixed). DeepInfra serves it, so the capability arrives here.
+[[backends]]
+name = "deepinfra-kimi-k2.6"
+base_url = "https://api.deepinfra.com/v1/openai"
+model_id = "moonshotai/Kimi-K2.6"
+rpm = 60
+eval_only = false
+role = "contender"
+api_key_env = "DEEPINFRA_API_KEY"
+
+# New contender, no S1 baseline — it can be scored but not compared backwards.
+[[backends]]
+name = "deepinfra-kimi-k3"
+base_url = "https://api.deepinfra.com/v1/openai"
+model_id = "moonshotai/Kimi-K3"
+rpm = 60
+eval_only = false
+role = "contender"
+api_key_env = "DEEPINFRA_API_KEY"
+
+# NOT ADDED, deliberately — DeepInfra also serves these two, both verified
+# [reachable] on 2026-08-10:
+#
+#   thinkingmachines/Inkling
+#   nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+#
+# Both already run on NVIDIA and ping reachable there, so adding them here would
+# judge the same model twice per sweep for no new information, at double cost.
+# Recorded because NVIDIA has now EOL'd one family without warning: when inkling
+# or nemotron goes the same way, the replacement is one entry, already proven.
 
 # NOTE (2026-08-05): advertised by GET /v1/models and on the public model page,
 # but chat/completions returns 404 with:
@@ -61,21 +120,17 @@ temperature = 0.0
 # That is an ACCOUNT ENTITLEMENT gap, not a wrong call shape — the NIM function
 # behind this model is not provisioned for our account. Re-request shape changes
 # nothing; the model needs enabling for the account (some NIMs require explicit
-# access/terms acceptance). Left in place so a later --ping re-tests it; treat
-# its results as absent until a ping reports [reachable].
+# access/terms acceptance).
 #
 # nvidia/llama-3.1-nemotron-ultra-253b-v1 fails the same way — catalog listing
 # does NOT imply the account can invoke it. Ping every new id before trusting it.
-[[backends]]
-name = "nvidia-kimi-k2.6"
-base_url = "https://integrate.api.nvidia.com/v1"
-model_id = "moonshotai/kimi-k2.6"
-rpm = 40
-eval_only = true
-role = "contender"
-api_key_env = "NVIDIA_API_KEY"
-temperature = 0.0
-
+#
+# REMOVED FROM THE SLATE (2026-08-10): still 404 on re-ping, five days on. It was
+# left in so a later --ping would re-test it, but a slate entry is the wrong
+# place to park that: it costs 600 failing calls per sweep (200 pairs x 3 votes)
+# and drags every run's wall time. Re-test it from a throwaway probe slate
+# instead — one entry in a scratch .toml plus `--check-backends --ping` — and
+# re-add here only once that reports [reachable].
 [[backends]]
 name = "nvidia-nemotron-3-ultra"
 base_url = "https://integrate.api.nvidia.com/v1"
@@ -126,19 +181,37 @@ temperature = 0.0
 # `temperature = 0.0` on any backend once a --ping confirms it is accepted.
 # ---------------------------------------------------------------------------
 
+# REVERTED (2026-08-10): these two were `gemini-2.5-pro` and `grok-4.1-fast`,
+# and both failed every call of the v2 sweep on the MODEL ID, not the endpoint:
+#
+#   gemini-2.5-pro   404: "models/gemini-2.5-pro is no longer available to new
+#                          users. Please update your code to use a newer model."
+#   grok-4.1-fast    400: {"code":"invalid-argument",
+#                          "error":"Model not found: grok-4.1-fast"}
+#
+# Note xAI answers an unknown model with 400, not 404 — so a 400 here does NOT
+# imply "endpoint resolved, request shape rejected". Only the response body
+# separates the two, which is what --ping exists to show.
+#
+# Restored to the ids the 2026-08-06 S1 manifests prove were reachable; both
+# re-pinged [reachable] on 2026-08-10. `grok-4.5-fast` and `gemini-3.6-pro` were
+# probed as upgrades and neither exists. Keeping the S1 ids has a second payoff:
+# these two stay directly comparable to the S1 baseline, which a model swap
+# would have destroyed (a prompt change and a model change are indistinguishable
+# in a reason-distribution diff).
 [[backends]]
-name = "gemini-2.5-pro"
+name = "gemini-3.6-flash"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-model_id = "gemini-2.5-pro"
+model_id = "gemini-3.6-flash"
 rpm = 60
 eval_only = false
 role = "contender"
 api_key_env = "GEMINI_API_KEY"
 
 [[backends]]
-name = "xai-grok-4.1-fast"
+name = "xai-grok-4.5"
 base_url = "https://api.x.ai/v1"
-model_id = "grok-4.1-fast"
+model_id = "grok-4.5"
 rpm = 60
 eval_only = false
 role = "contender"
