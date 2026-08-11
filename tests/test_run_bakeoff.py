@@ -370,6 +370,102 @@ def test_run_manifest_records_the_prompt_variant_histogram():
     assert manifest["prompt_variants"] == {"none": 1, "brand+mpn": 2}
 
 
+def test_a_manifest_failure_on_the_success_path_is_not_swallowed(tmp_path):
+    # PR #47 review: suppressing the manifest error unconditionally let a run
+    # that never persisted its audit metadata exit 0, so automation would treat
+    # it as complete. Suppression belongs only where another exception is
+    # already unwinding.
+    backend = concurrency_backend()
+
+    def exploding_manifest(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("run_bakeoff._write_manifest", exploding_manifest)
+    try:
+        with pytest.raises(OSError, match="no space left"):
+            run_backend(
+                backend,
+                [make_pair("p1")],
+                tmp_path,
+                votes=1,
+                limiters=no_sleep_limiters(),
+                client_factory=lambda b: FakeClient(b),
+            )
+    finally:
+        monkey.undo()
+
+
+def test_a_manifest_failure_never_masks_the_error_that_stopped_the_run(tmp_path):
+    # The other half: when the run is ALREADY failing, a manifest problem must
+    # not replace the traceback explaining why.
+    backend = concurrency_backend()
+
+    class Interrupting(FakeClient):
+        def judge(self, pair, run_index=0):
+            raise KeyboardInterrupt("operator stopped the run")
+
+    def exploding_manifest(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("run_bakeoff._write_manifest", exploding_manifest)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_backend(
+                backend,
+                [make_pair("p1")],
+                tmp_path,
+                votes=1,
+                limiters=no_sleep_limiters(),
+                client_factory=lambda b: Interrupting(b),
+            )
+    finally:
+        monkey.undo()
+
+
+def test_an_interrupted_backend_still_writes_its_manifest(tmp_path):
+    # Issue #40's second half: _write_manifest ran only after the pool completed
+    # normally, so a killed backend recorded NOTHING. In the 2026-08-11 run the
+    # one backend whose failures mattered most was the one with no manifest.
+    backend = concurrency_backend()
+
+    class Interrupting(FakeClient):
+        def judge(self, pair, run_index=0):
+            raise KeyboardInterrupt("operator stopped the run")
+
+    with pytest.raises(BaseException):
+        run_backend(
+            backend,
+            [make_pair(f"p{i}") for i in range(3)],
+            tmp_path,
+            votes=1,
+            limiters=no_sleep_limiters(),
+            client_factory=lambda b: Interrupting(b),
+        )
+    manifest = tmp_path / "nv.manifest.json"
+    assert manifest.exists(), "an interrupted backend must still record what it learned"
+
+
+def test_a_resumed_backend_accumulates_its_failure_history(tmp_path):
+    # Two launches: the first fails every call, the second succeeds. The
+    # surviving manifest must not claim the run was clean.
+    backend = concurrency_backend()
+    pairs = [make_pair(f"p{i}") for i in range(4)]
+
+    run_backend(backend, pairs, tmp_path, votes=1, limiters=no_sleep_limiters(),
+                client_factory=lambda b: FakeClient(b, fail_pair_ids=[p.id for p in pairs]))
+    run_backend(backend, pairs, tmp_path, votes=1, limiters=no_sleep_limiters(),
+                client_factory=lambda b: FakeClient(b))
+
+    manifest = json.loads((tmp_path / "nv.manifest.json").read_text())
+    assert manifest["cumulative"]["launches"] == 2
+    assert manifest["cumulative"]["calls_failed"] == 4, "the first launch's failures survived"
+    assert manifest["cumulative"]["calls_ok"] == 4
+    # The latest launch is still reported as-is, for readers that want it.
+    assert manifest["health"]["calls_failed"] == 0
+
+
 def test_run_manifest_records_payload_effort_and_snapshots():
     # R7: Responses has no system_fingerprint, so the manifest is the only
     # record of what was actually sent and which snapshot answered.

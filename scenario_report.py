@@ -334,10 +334,13 @@ def _compliance_caveat(manifests: dict[str, dict]) -> list[str]:
     """
     offenders = []
     for name, m in sorted(manifests.items()):
-        health = m.get("health") or {}
-        violations = (health.get("error_kinds") or {}).get(CONTRACT_FAILURE, 0)
+        # Prefer the cumulative block: it survives resume, where `health`
+        # describes only the last launch and would report a clean run for a
+        # backend that failed hundreds of calls earlier (issue #40).
+        counts = m.get("cumulative") or m.get("health") or {}
+        violations = (counts.get("error_kinds") or {}).get(CONTRACT_FAILURE, 0)
         if violations:
-            attempted = health.get("calls_ok", 0) + health.get("calls_failed", 0)
+            attempted = counts.get("calls_ok", 0) + counts.get("calls_failed", 0)
             offenders.append((name, violations, attempted))
     if not offenders:
         return []
@@ -361,9 +364,8 @@ def _compliance_caveat(manifests: dict[str, dict]) -> list[str]:
         lines.append(f"| {name} | {violations} | {attempted or 'unknown'} |")
     lines += [
         "",
-        "Counts come from the manifest, which records only the LAST launch, so a",
-        "resumed run under-reports them — see the completion caveat above. The",
-        "durable fix is issue #40.",
+        "Counts are cumulative across every launch of this run, falling back to the",
+        "last launch for a manifest written before launch history existed.",
         "",
     ]
     return lines
