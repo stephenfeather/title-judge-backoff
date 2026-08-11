@@ -214,6 +214,44 @@ def test_deadlock_section_does_not_claim_the_slate_deadlocked():
     assert "one backend" in md
 
 
+def test_host_concentration_is_read_from_the_slate_not_hardcoded():
+    # The prose version of this caveat named six backends on integrate.api.nvidia.com
+    # long after the slate had moved off that host entirely. A caveat that needs
+    # hand-editing to stay true eventually reads as false.
+    by_model = {"a": votes("a", "p1", [("approve", "ok")]), "b": votes("b", "p1", [("approve", "ok")]),
+                "c": votes("c", "p1", [("approve", "ok")])}
+    manifests = {
+        "a": {"base_url": "https://api.deepinfra.com/v1/openai"},
+        "b": {"base_url": "https://api.deepinfra.com/v1/openai"},
+        "c": {"base_url": "https://api.openai.com/v1"},
+    }
+    md = render_scenario_report(by_model, manifests)
+    assert "2 of 3 share `api.deepinfra.com`" in md
+    assert "nvidia" not in md.lower()
+
+
+def test_host_concentration_counts_a_backend_with_no_manifest():
+    # A killed backend writes no manifest (#40), so a manifest-only count makes
+    # it vanish. Its verdict rows carry base_url and survive, so it must still
+    # be counted — this undercounted the real 2026-08-11 run by one backend.
+    rows = [replace(v, base_url="https://api.deepinfra.com/v1/openai")
+            for v in votes("killed", "p1", [("approve", "ok")])]
+    by_model = {"killed": rows, "finished": votes("finished", "p1", [("approve", "ok")])}
+    manifests = {"finished": {"base_url": "https://api.deepinfra.com/v1/openai"}}
+    md = render_scenario_report(by_model, manifests)
+    assert "2 of 2 share `api.deepinfra.com`" in md
+
+
+def test_host_concentration_says_so_when_nothing_is_shared():
+    by_model = {"a": votes("a", "p1", [("approve", "ok")]), "b": votes("b", "p1", [("approve", "ok")])}
+    manifests = {
+        "a": {"base_url": "https://api.openai.com/v1"},
+        "b": {"base_url": "https://api.anthropic.com/v1"},
+    }
+    md = render_scenario_report(by_model, manifests)
+    assert "No two backends in this run shared a host." in md
+
+
 def test_cross_tab_rows_are_totally_ordered_so_two_runs_agree():
     """The report must be diffable. Found while verifying #18.
 

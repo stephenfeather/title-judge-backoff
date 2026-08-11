@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -311,17 +312,70 @@ def _caveats_section(by_model: dict[str, list[Verdict]], manifests: dict[str, di
             lines.append(f"- **{name}**: {', '.join(fabricated[name])}")
     else:
         lines.append("- None in this run.")
-    lines += [
+    lines += ["", *_host_concentration_caveat(by_model, manifests), ""]
+    return lines
+
+
+def _host_concentration_caveat(
+    by_model: dict[str, list[Verdict]], manifests: dict[str, dict]
+) -> list[str]:
+    """How much of this run sat behind one rate-limit bucket.
+
+    Derived from the manifests rather than written down, because the prose
+    version went stale: it named six backends on a host the slate no longer
+    uses at all, while the real concentration had moved elsewhere and grown.
+    A caveat that has to be hand-edited to stay true will eventually be false.
+    """
+    # Read the host from the VERDICT ROWS first, falling back to the manifest.
+    # Rows carry base_url since #13 and survive an interrupted run; the manifest
+    # is only written when a backend completes, so a backend that was killed is
+    # invisible to a manifest-only count. That undercounted this very report by
+    # one backend before the fallback was added (see #40).
+    hosts: dict[str, list[str]] = {}
+    for name in sorted(set(by_model) | set(manifests)):
+        rows = by_model.get(name) or []
+        base_url = next((r.base_url for r in rows if r.base_url), None)
+        if base_url is None:
+            base_url = manifests.get(name, {}).get("base_url")
+        if base_url:
+            # netloc, not judge.client.limiter_host: this script declares
+            # dependencies = [] and importing that module pulls in httpx.
+            # The schemeless fallback there is dead anyway — Backend refuses
+            # a non-HTTPS base_url at load since #27, so netloc is always set.
+            hosts.setdefault(urlparse(base_url).netloc, []).append(name)
+    if not hosts:
+        # Absent, not "nothing shared" — the same distinction the cache and
+        # deadlock sections draw. Silence here would read as "hosts checked,
+        # none shared", which is a stronger claim than no manifest supports.
+        return [
+            "### Cross-host parallelism is unknown for this run",
+            "",
+            "No manifest recorded a base_url, so how many backends shared a rate-limit",
+            "bucket cannot be determined. That is not the same as no host being shared.",
+            "",
+        ]
+
+    top, shared = max(hosts.items(), key=lambda kv: len(kv[1]))
+    total = sum(len(v) for v in hosts.values())
+    lines = [
+        "### Cross-host parallelism buys less than the backend count suggests",
         "",
-        "### Throughput claims are unverified against a live provider",
-        "",
-        "The concurrency work in PR #10 proves its speedup against a fake client with",
-        "injected latency. No live provider has been measured, so the projected",
-        "wall-clock figures in issue #9 remain projections. Six of the ten configured",
-        "backends also share `integrate.api.nvidia.com`, and therefore one rate-limit",
-        "bucket, so cross-host parallelism buys less than a full slate suggests.",
+        f"This run used {total} backend(s) across {len(hosts)} host(s). Rate limits are",
+        "enforced per HOST, so backends sharing one endpoint share one bucket and do",
+        "not run independently no matter how high `--concurrency` goes.",
         "",
     ]
+    if len(shared) > 1:
+        lines += [
+            f"**{len(shared)} of {total} share `{top}`**: "
+            + ", ".join(f"`{n}`" for n in sorted(shared)) + ".",
+            "",
+            "A 429 from any one of them slows all of them, and a slow model on that",
+            "host delays its neighbours rather than only itself.",
+            "",
+        ]
+    else:
+        lines += ["No two backends in this run shared a host.", ""]
     return lines
 
 

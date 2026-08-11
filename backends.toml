@@ -101,23 +101,26 @@ eval_only = false
 role = "contender"
 api_key_env = "DEEPINFRA_API_KEY"
 
-# NOT IN THE SLATE (2026-08-11): moonshotai/Kimi-K3 on DeepInfra is REACHABLE
-# BUT UNRELIABLE. Six --ping attempts at trivial load: 3 [reachable], 1 HTTP 500,
-# 2 read timeouts. Roughly half, and the timeouts each burn the full 180s
-# REQUEST_TIMEOUT_S before failing.
+# NOT IN THE SLATE (2026-08-11): moonshotai/Kimi-K3 on DeepInfra is RATE
+# LIMITED for this account, not broken. Measured on 8 real corpus pairs, one at
+# a time: 8 of 8 returned HTTP 429 Too Many Requests, each failing in ~0.25s.
 #
-# A single ping is not enough to qualify a backend — the first two attempts both
-# passed, and only repeating it exposed the failure rate. Ping new ids more than
-# once before trusting them.
+# An earlier note here called it "reachable but unreliable" on the strength of
+# trivial pings that returned a mix of 500s and timeouts. That was the wrong
+# mechanism. 429 is a quota decision, so this is a billing/tier question rather
+# than an engineering one — K3 may be perfectly usable on a plan that permits it.
 #
-# Why not keep it and let resume cover the gaps: at 200 pairs x 3 votes that is
-# ~300 failures per sweep, most of them 180s stalls, and score.py would exclude
-# the backend from the ranking under the coverage gate anyway — so the cost is
-# real and the result unusable. It is also the one candidate with no S1 baseline,
-# so it contributes least to the issue #14 comparison.
+# The 429s also penalise the SHARED host limiter (30s per hit, see
+# rate_limit_penalty), so an over-quota backend throttles every other DeepInfra
+# backend beside it. That is a reason to keep it out of the slate until the
+# quota is resolved, independent of whether K3 itself is any good.
 #
-# Kimi-K2.6 was clean across every attempt, so this is K3 specifically, not the
-# family or the host. Re-test from a throwaway probe slate before re-adding.
+# Two lessons worth keeping:
+#   * A single --ping does not qualify a backend. K3's first two pings passed.
+#   * Pings use PING_PAIR, a 43-char synthetic input. It is a LIVENESS check and
+#     nothing more. Kimi-K2.6 passes pings and still fails on real corpus pairs
+#     (108s median against a 180s ceiling), so ping latency does not predict
+#     sweep latency. Measure on real inputs before trusting a backend at volume.
 
 # Migrated off NVIDIA (2026-08-11), not because these two failed — both still
 # pinged reachable there — but because NVIDIA EOL'd the DeepSeek family with no
