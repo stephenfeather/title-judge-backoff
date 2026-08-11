@@ -370,6 +370,57 @@ def test_run_manifest_records_the_prompt_variant_histogram():
     assert manifest["prompt_variants"] == {"none": 1, "brand+mpn": 2}
 
 
+def test_a_stopped_backend_spends_nothing(tmp_path):
+    # The stop signal must be checked BEFORE the call, not after: the point is
+    # to stop spending, and a check that runs afterwards has already paid.
+    stop = threading.Event()
+    stop.set()
+    client = FakeClient(concurrency_backend())
+    run_backend(
+        concurrency_backend(),
+        [make_pair(f"p{i}") for i in range(10)],
+        tmp_path,
+        votes=3,
+        limiters=no_sleep_limiters(),
+        stop=stop,
+        client_factory=lambda b: client,
+    )
+    assert client.calls == [], "a stopped run must not spend a single call"
+
+
+def test_an_interrupt_stops_the_backends_that_are_already_running(tmp_path):
+    # Issue #42. cancel_futures alone only drops backends that have not STARTED;
+    # at --concurrency 8 eight are already inside their own pools and would keep
+    # judging for hours. KeyboardInterrupt reaches only the main thread, so the
+    # workers need to be told.
+    pairs = [make_pair(f"p{i}") for i in range(40)]
+    running = FakeClient(concurrency_backend(name="slow"), delay=0.002)
+
+    class Boom(FakeClient):
+        def judge(self, pair, run_index=0):
+            raise KeyboardInterrupt("operator stopped the run")
+
+    def client_for(backend):
+        return Boom(backend) if backend.name == "boom" else running
+
+    with pytest.raises(BaseException):
+        run_slate(
+            [concurrency_backend(name="boom"), concurrency_backend(name="slow")],
+            pairs,
+            tmp_path,
+            votes=3,
+            concurrency=4,
+            limiters=no_sleep_limiters(),
+            client_factory=client_for,
+        )
+
+    # 40 pairs x 3 votes = 120 owed. Without a cooperative stop the surviving
+    # backend runs every one of them while the main thread blocks in join().
+    assert len(running.calls) < 120, (
+        f"the running backend kept judging after the interrupt: {len(running.calls)}/120 calls"
+    )
+
+
 def test_a_manifest_failure_on_the_success_path_is_not_swallowed(tmp_path):
     # PR #47 review: suppressing the manifest error unconditionally let a run
     # that never persisted its audit metadata exit 0, so automation would treat

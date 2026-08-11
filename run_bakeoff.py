@@ -25,7 +25,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Self
 
@@ -744,6 +744,7 @@ def run_backend(
     limiters: LimiterRegistry | None = None,
     code_version: str | None = None,
     allow_unknown_provenance: bool = False,
+    stop: threading.Event | None = None,
     judge_client: Callable[..., JudgeClient] = JudgeClient,
     client_factory: Callable[[Backend], JudgeClient] | None = None,
     writer_factory: Callable[[Path], ResultWriter] = ResultWriter,
@@ -791,6 +792,19 @@ def run_backend(
 
     def judge_one(item: tuple[Pair, int], writer: ResultWriter) -> None:
         pair, run_index = item
+        # The slate has been told to stop. Checked HERE, on the worker thread,
+        # because that is the only place the decision reaches a running backend:
+        # KeyboardInterrupt is delivered to the main thread alone, and
+        # cancel_futures only drops tasks that have not started yet. At
+        # --concurrency 8 every backend is already inside its own pool, so
+        # without this check they keep judging — and keep spending — for as long
+        # as their work lists last.
+        #
+        # Returning rather than raising: a stop is an operator decision, not a
+        # backend failure, and recording it in error_kinds would put an
+        # operator's Ctrl-C on a model's reliability record.
+        if stop is not None and stop.is_set():
+            return
         # Never spend a paid call we cannot persist. Checked before the limiter
         # so a dead writer stops the run in the time it takes the in-flight
         # calls to land, rather than at the end of a multi-hour sweep.
@@ -844,6 +858,13 @@ def run_backend(
                         future.result()  # surface anything judge_one did not catch
                     # Top back up to the window. When `queued` is exhausted this
                     # adds nothing and the loop drains what is still in flight.
+                    #
+                    # A set stop drains rather than tops up. judge_one's own
+                    # check is what makes the stop correct — this only keeps a
+                    # stopped backend from submitting the remaining 120,000
+                    # tasks just to have each one return immediately.
+                    if stop is not None and stop.is_set():
+                        continue
                     pending |= {
                         pool.submit(judge_one, item, writer)
                         for item in itertools.islice(queued, len(done))
@@ -931,6 +952,11 @@ def run_slate(
     for backend in backends:
         limiters.for_backend(backend)
 
+    # Set once, read by every backend's workers. This is the slate's only way to
+    # reach a backend that is already running: the interrupt lands on the main
+    # thread, and the backends are elsewhere.
+    stop = threading.Event()
+
     def run_one(backend: Backend) -> None:
         run_backend(
             backend,
@@ -941,6 +967,7 @@ def run_slate(
             limiters=limiters,
             code_version=code_version,
             allow_unknown_provenance=allow_unknown_provenance,
+            stop=stop,
             client_factory=client_factory,
         )
         if on_backend_done is not None:
@@ -951,15 +978,33 @@ def run_slate(
             run_one(backend)
         return
 
-    with ThreadPoolExecutor(max_workers=len(backends), thread_name_prefix="backend") as pool:
+    pool = ThreadPoolExecutor(max_workers=len(backends), thread_name_prefix="backend")
+    failures = []
+    try:
         futures = {pool.submit(run_one, backend): backend for backend in backends}
-        failures = []
-        for future, backend in futures.items():
+        # as_completed, not futures.items(): a backend that dies must be seen
+        # when it dies. Iterating in slate order blocks on the FIRST backend, so
+        # an in-worker BaseException from any other one would not be noticed —
+        # and the stop not set — until the slowest backend ahead of it finished.
+        for future in as_completed(futures):
+            backend = futures[future]
             try:
                 future.result()
             except Exception as exc:  # noqa: BLE001 - report all, not just the first
                 print(f"[{backend.name}] FAILED: {exc}", file=sys.stderr)
                 failures.append(f"{backend.name}: {exc}")
+    except BaseException:
+        # A Ctrl-C, or a BaseException raised inside a backend. Previously the
+        # `with` block's __exit__ ran shutdown(wait=True) with no cancellation,
+        # so an operator's interrupt bought them a wait for the ENTIRE slate to
+        # finish paying for itself. Set the stop FIRST — the running backends
+        # are what the money is going to; cancel_futures only helps the ones
+        # still queued behind them.
+        stop.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
     if failures:
         raise RuntimeError(
             f"{len(failures)} backend(s) failed: " + "; ".join(failures)
