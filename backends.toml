@@ -26,13 +26,21 @@
 #                is opt-in per backend rather than on by default.
 
 # ---------------------------------------------------------------------------
-# NVIDIA build.nvidia.com — free tier, EVALUATION ONLY per ToS.
-# One NVIDIA_API_KEY covers every model on this endpoint.
+# NVIDIA build.nvidia.com — NO LONGER USED as of 2026-08-11. Every backend has
+# moved to DeepInfra; NVIDIA_API_KEY is no longer read by this slate.
 #
-# temperature = 0.0 is declared on these because this endpoint is PROVEN to
-# accept it — the llama-3.1-8b floor completed a 5/5 smoke run at temperature 0.
-# Keeping the value also keeps existing results/ resumable, since the run-config
-# guard treats an omitted temperature as a different config from 0.0.
+# The exit was not a preference. NVIDIA end-of-lifed the DeepSeek family on
+# 2026-08-07 with a day's notice (see below) and had already left kimi
+# unentitled for five days. Depending on a free evaluation tier for a
+# calibration baseline means the baseline can vanish between sweeps.
+#
+# Historical note, since it explains an absence: entries here declared
+# `temperature = 0.0` because that endpoint was PROVEN to accept it. The
+# DeepInfra entries below declare no temperature — unproven there, and the file
+# rule is that it stays opt-in until a --ping says otherwise. That is a real
+# config change, so DeepInfra results are not resumable against NVIDIA ones
+# regardless of host: the run-config guard treats an omitted temperature as
+# different from 0.0 (issue #13).
 # ---------------------------------------------------------------------------
 
 # REMOVED (2026-08-10): BOTH DeepSeek backends. NVIDIA end-of-lifed the family;
@@ -160,15 +168,26 @@ api_key_env = "DEEPINFRA_API_KEY"
 
 # Degenerate-judge floor: proved kappa catches a constant-reject predictor
 # (5/5 rejects, accuracy 0.800, kappa 0.000 on the smoke set). Not a contender.
+#
+# Moved off NVIDIA 2026-08-11 with the rest, completing the exit — leaving the
+# floor alone on a host that EOLs models without warning would mean losing the
+# BASELINE mid-experiment, which is worse than losing a contender: every kappa
+# is read against it.
+#
+# `-Turbo` is a quantized serving, so this is not bit-identical to the NVIDIA
+# `meta/llama-3.1-8b-instruct` S1 used. That is acceptable here and nowhere else
+# in the slate: this backend exists to be BAD in a known way, and quantization
+# cannot make a constant-reject predictor more or less degenerate. The plain
+# `meta-llama/Meta-Llama-3.1-8B-Instruct` also pings reachable if a closer match
+# to S1's floor is ever wanted.
 [[backends]]
-name = "nvidia-llama31-8b-floor"
-base_url = "https://integrate.api.nvidia.com/v1"
-model_id = "meta/llama-3.1-8b-instruct"
-rpm = 40
-eval_only = true
+name = "deepinfra-llama31-8b-floor"
+base_url = "https://api.deepinfra.com/v1/openai"
+model_id = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+rpm = 60
+eval_only = false
 role = "floor"
-api_key_env = "NVIDIA_API_KEY"
-temperature = 0.0
+api_key_env = "DEEPINFRA_API_KEY"
 
 # ---------------------------------------------------------------------------
 # Paid provider APIs. Each is skipped unless its key is present in the env.
