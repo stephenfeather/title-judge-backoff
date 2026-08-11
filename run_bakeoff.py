@@ -305,6 +305,45 @@ def render_skip_warning(names: list[str]) -> str:
     )
 
 
+def accumulate_launches(previous: dict | None, health: dict) -> tuple[list[dict], dict]:
+    """Fold this launch's health into the history from previous launches.
+
+    Resume is the NORMAL way a run completes here, and the manifest used to be
+    rewritten wholesale each time — so the surviving record described only the
+    final, smallest launch. A backend that lost 50 calls in its first launch
+    reported `calls_failed: 0` once a 47-call resume finished (issue #40).
+
+    Counts are summed; LATENCY IS NOT. A median cannot be merged with another
+    median — combining them needs the raw samples, and a median-of-medians is
+    simply a wrong number. So each launch keeps its own distribution, where it
+    is meaningful, and only the summable fields appear in the cumulative view.
+    That is also the honest shape: 1.5s over a 47-call resume is not comparable
+    to 12s over a 600-call run, and averaging them would imply it is.
+
+    A manifest written before this existed carries its one launch in `health`;
+    that is adopted as the first entry rather than discarded, because it is the
+    only record of that launch.
+    """
+    previous = previous or {}
+    launches = list(previous.get("launches") or [])
+    if not launches and previous.get("health"):
+        launches = [previous["health"]]
+    launches.append(health)
+
+    error_kinds: Counter[str] = Counter()
+    for entry in launches:
+        error_kinds.update(entry.get("error_kinds") or {})
+    return launches, {
+        "launches": len(launches),
+        "calls_ok": sum(e.get("calls_ok", 0) for e in launches),
+        "calls_failed": sum(e.get("calls_failed", 0) for e in launches),
+        # Sorted for the same reason the per-launch block is: dict order from a
+        # Counter follows arrival, which concurrency makes arbitrary, and the
+        # manifest must diff cleanly between runs.
+        "error_kinds": dict(sorted(error_kinds.items())),
+    }
+
+
 def _health_summary(
     latencies: list[float], errors: list[str], failed_latencies: list[float] | None = None
 ) -> dict:
@@ -619,27 +658,32 @@ def _write_manifest(
     answered, including a provider swapping the model mid-run.
     """
     manifest_path = out_dir / f"{backend.name}.manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            run_manifest(
-                backend,
-                votes=votes,
-                prompt_version=PROMPT_VERSION,
-                n_pairs=len(pairs),
-                sample_payload=client.request_body(pairs[0]),
-                observed_models=client.observed_models,
-                code_version=code_version,
-                config_digest=config_digest,
-                prompt_variants=prompt_variant_counts(pairs),
-                latencies=health.latencies,
-                errors=health.errors,
-                failed_latencies=health.failed_latencies,
-                usages=health.usages,
-            ),
-            indent=2,
-        )
-        + "\n"
+    manifest = run_manifest(
+        backend,
+        votes=votes,
+        prompt_version=PROMPT_VERSION,
+        n_pairs=len(pairs),
+        sample_payload=client.request_body(pairs[0]),
+        observed_models=client.observed_models,
+        code_version=code_version,
+        config_digest=config_digest,
+        prompt_variants=prompt_variant_counts(pairs),
+        latencies=health.latencies,
+        errors=health.errors,
+        failed_latencies=health.failed_latencies,
+        usages=health.usages,
     )
+    # Fold this launch into the history rather than replacing it. `health` stays
+    # the LATEST launch so existing readers are unaffected; `launches` and
+    # `cumulative` are what survive a resume (issue #40).
+    try:
+        previous = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        previous = None
+    manifest["launches"], manifest["cumulative"] = accumulate_launches(
+        previous, manifest["health"]
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 def run_backend(
@@ -774,17 +818,26 @@ def run_backend(
                 raise
             else:
                 pool.shutdown(wait=True)
-        _write_manifest(
-            backend,
-            pairs,
-            out_dir,
-            votes=votes,
-            client=client,
-            health=health,
-            code_version=code_version,
-            config_digest=digest,
-        )
     finally:
+        # Written in `finally`, not after the pool: a backend that was killed or
+        # raised recorded NOTHING before, so the one whose failures mattered
+        # most left the least evidence (issue #40). Its calls were still made
+        # and still cost money; what it learned is worth keeping.
+        try:
+            _write_manifest(
+                backend,
+                pairs,
+                out_dir,
+                votes=votes,
+                client=client,
+                health=health,
+                code_version=code_version,
+                config_digest=digest,
+            )
+        except Exception as exc:  # noqa: BLE001 - never mask the real failure
+            # A manifest that cannot be written must not replace the traceback
+            # explaining why the run stopped. Report and carry on unwinding.
+            print(f"[{backend.name}] could not write manifest: {exc!r}", file=sys.stderr)
         client.close()
 
 

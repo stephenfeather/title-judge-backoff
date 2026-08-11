@@ -236,6 +236,28 @@ def test_report_separates_model_failures_from_transport_failures():
     assert "contract" in md.lower()
 
 
+def test_compliance_prefers_cumulative_counts_over_the_last_launch():
+    # #40: the last launch of a resumed run is typically small and clean, so
+    # reading `health` alone reports a flawless backend that failed hundreds of
+    # calls earlier. The cumulative block is what survives.
+    by_model = {"nv": votes("nv", "p1", [("approve", "ok")] * 3)}
+    manifests = {
+        "nv": {
+            "base_url": "https://api.openai.com/v1",
+            "health": {"calls_ok": 47, "calls_failed": 0, "error_kinds": {}},
+            "cumulative": {
+                "launches": 2,
+                "calls_ok": 550,
+                "calls_failed": 50,
+                "error_kinds": {"JudgeResponseError": 50},
+            },
+        }
+    }
+    md = render_scenario_report(by_model, manifests)
+    assert "Output-contract compliance" in md
+    assert "50" in md
+
+
 def test_compliance_section_is_absent_when_no_backend_violated_the_contract():
     by_model = {"nv": votes("nv", "p1", [("approve", "ok")] * 3)}
     manifests = {
