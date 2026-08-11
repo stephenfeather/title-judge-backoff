@@ -103,16 +103,32 @@ eval_only = false
 role = "contender"
 api_key_env = "DEEPINFRA_API_KEY"
 
-# NOT ADDED, deliberately — DeepInfra also serves these two, both verified
-# [reachable] on 2026-08-10:
+# Migrated off NVIDIA (2026-08-11), not because these two failed — both still
+# pinged reachable there — but because NVIDIA EOL'd the DeepSeek family with no
+# warning and a day's notice. Staying on a host that does that, for models we
+# depend on, is the exposure. Both verified [reachable] on DeepInfra first.
 #
-#   thinkingmachines/Inkling
-#   nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
-#
-# Both already run on NVIDIA and ping reachable there, so adding them here would
-# judge the same model twice per sweep for no new information, at double cost.
-# Recorded because NVIDIA has now EOL'd one family without warning: when inkling
-# or nemotron goes the same way, the replacement is one entry, already proven.
+# This costs S1 comparability: a different host is a different config_digest and
+# possibly different weights, so inkling and nemotron can be scored in v2 but a
+# reason-distribution diff against S1 for them mixes a prompt change with a host
+# change. That trade was made deliberately — availability over comparability.
+[[backends]]
+name = "deepinfra-inkling"
+base_url = "https://api.deepinfra.com/v1/openai"
+model_id = "thinkingmachines/Inkling"
+rpm = 60
+eval_only = false
+role = "contender"
+api_key_env = "DEEPINFRA_API_KEY"
+
+[[backends]]
+name = "deepinfra-nemotron-3-ultra"
+base_url = "https://api.deepinfra.com/v1/openai"
+model_id = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B"
+rpm = 60
+eval_only = false
+role = "contender"
+api_key_env = "DEEPINFRA_API_KEY"
 
 # NOTE (2026-08-05): advertised by GET /v1/models and on the public model page,
 # but chat/completions returns 404 with:
@@ -131,33 +147,16 @@ api_key_env = "DEEPINFRA_API_KEY"
 # and drags every run's wall time. Re-test it from a throwaway probe slate
 # instead — one entry in a scratch .toml plus `--check-backends --ping` — and
 # re-add here only once that reports [reachable].
-[[backends]]
-name = "nvidia-nemotron-3-ultra"
-base_url = "https://integrate.api.nvidia.com/v1"
-model_id = "nvidia/nemotron-3-ultra-550b-a55b"
-rpm = 40
-eval_only = true
-role = "contender"
-api_key_env = "NVIDIA_API_KEY"
-temperature = 0.0
-
-# NOTE (2026-08-05): in the catalog and routed to a worker (no 404), but
-# inference itself fails — HTTP 500 after ~79s:
+# HISTORY, kept because it explains a constant elsewhere: NVIDIA-served inkling
+# was in the catalog and routed to a worker (no 404), but inference itself failed
+# with HTTP 500 after ~79 SECONDS:
 #   {"type":"urn:nvcf-worker-service:problem-details:internal-server-error",
 #    "title":"Internal Server Error","status":500,
 #    "detail":"Internal error while making inference request"}
-# A THIRD failure mode, distinct from Kimi's 404 entitlement gap: entitled and
-# routed, but the backing worker errors. Likely transient/capacity — re-ping
-# periodically. Its 79s latency is why REQUEST_TIMEOUT_S is 180s, not 60s.
-[[backends]]
-name = "nvidia-inkling"
-base_url = "https://integrate.api.nvidia.com/v1"
-model_id = "thinkingmachines/inkling"
-rpm = 40
-eval_only = true
-role = "contender"
-api_key_env = "NVIDIA_API_KEY"
-temperature = 0.0
+# That 79s is why REQUEST_TIMEOUT_S is 180s and not 60s — a shorter timeout
+# reported "unreachable" for a host that was merely very slow to fail, which is
+# a wrong diagnosis rather than a slow one. Keep the timeout even though this
+# particular backend has moved to DeepInfra.
 
 # Degenerate-judge floor: proved kappa catches a constant-reject predictor
 # (5/5 rejects, accuracy 0.800, kappa 0.000 on the smoke set). Not a contender.
