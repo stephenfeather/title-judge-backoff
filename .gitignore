@@ -23,6 +23,11 @@ data/*.jsonl
 *.jsonl
 results/
 leaderboard.md
+# Same reason as leaderboard.md, and easier to miss: the scenario report's
+# ruling queue and deadlock tables list REAL pair ids by design. This repo is
+# public, so one `git add .` would publish them.
+scenario-report.md
+*-report.md
 
 # Sweep logs — the console transcript of a run: per-backend progress, and
 # tracebacks carrying absolute local paths. A run artifact tied to one
@@ -34,3 +39,11 @@ sweep.log
 # shell command a session touched, including absolute local paths. Hand-written
 # handoffs under thoughts/shared/handoffs/main/ ARE committed; these are not.
 thoughts/shared/handoffs/auto/
+
+# Per-developer tool config. These are machine- and preference-specific, and
+# several carry absolute local paths. Nothing here affects how the harness runs.
+.cursor/
+.gemini/
+.mcp.json
+GEMINI.md
+opencode.jsonc
