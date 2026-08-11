@@ -214,6 +214,39 @@ def test_deadlock_section_does_not_claim_the_slate_deadlocked():
     assert "one backend" in md
 
 
+def test_report_separates_model_failures_from_transport_failures():
+    # Issue #41: a model that cannot follow the output contract must not be
+    # indistinguishable from a connection that dropped. Coverage merges them;
+    # this section must not.
+    by_model = {"nv": votes("nv", "p1", [("approve", "ok")] * 3)}
+    manifests = {
+        "nv": {
+            "base_url": "https://api.deepinfra.com/v1/openai",
+            "health": {
+                "calls_ok": 90,
+                "calls_failed": 10,
+                "error_kinds": {"JudgeResponseError": 7, "ReadTimeout": 3},
+            },
+        }
+    }
+    md = render_scenario_report(by_model, manifests)
+    assert "Output-contract compliance" in md
+    # The finding is the 7 the model got wrong, not the 3 the network lost.
+    assert "7" in md
+    assert "contract" in md.lower()
+
+
+def test_compliance_section_is_absent_when_no_backend_violated_the_contract():
+    by_model = {"nv": votes("nv", "p1", [("approve", "ok")] * 3)}
+    manifests = {
+        "nv": {
+            "base_url": "https://api.openai.com/v1",
+            "health": {"calls_ok": 100, "calls_failed": 3, "error_kinds": {"ReadTimeout": 3}},
+        }
+    }
+    assert "Output-contract compliance" not in render_scenario_report(by_model, manifests)
+
+
 def test_host_concentration_is_read_from_the_slate_not_hardcoded():
     # The prose version of this caveat named six backends on integrate.api.nvidia.com
     # long after the slate had moved off that host entirely. A caveat that needs
