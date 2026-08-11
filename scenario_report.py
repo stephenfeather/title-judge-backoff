@@ -312,7 +312,60 @@ def _caveats_section(by_model: dict[str, list[Verdict]], manifests: dict[str, di
             lines.append(f"- **{name}**: {', '.join(fabricated[name])}")
     else:
         lines.append("- None in this run.")
+    lines += ["", *_compliance_caveat(manifests)]
     lines += ["", *_host_concentration_caveat(by_model, manifests), ""]
+    return lines
+
+
+#: The exception `judge.prompts.parse_judge_response` raises when a model answers
+#: in the wrong shape. Named here rather than imported: this script declares
+#: dependencies = [] and judge.prompts pulls in judge.schema.
+CONTRACT_FAILURE = "JudgeResponseError"
+
+
+def _compliance_caveat(manifests: dict[str, dict]) -> list[str]:
+    """Backends that answered, but not in the shape the contract requires.
+
+    Separated from transport failures on purpose (issue #41). A dropped
+    connection says nothing about a model; returning a reason code in the
+    verdict field says a great deal. Coverage merges the two, and the merge
+    flatters the non-compliant model: its fumbled pairs vanish from its own
+    accuracy and kappa, which are then computed over the subset it managed.
+    """
+    offenders = []
+    for name, m in sorted(manifests.items()):
+        health = m.get("health") or {}
+        violations = (health.get("error_kinds") or {}).get(CONTRACT_FAILURE, 0)
+        if violations:
+            attempted = health.get("calls_ok", 0) + health.get("calls_failed", 0)
+            offenders.append((name, violations, attempted))
+    if not offenders:
+        return []
+
+    lines = [
+        "### Output-contract compliance",
+        "",
+        "These backends ANSWERED but not in the required shape — a reason code in",
+        "the verdict field, unparseable JSON, an unknown reason. That is evidence",
+        "about the model, not about the network, and it is counted separately for",
+        "that reason.",
+        "",
+        "Such calls write no verdict row, so the pairs simply vanish from the",
+        "backend's accuracy and kappa rather than counting against them. Read a",
+        "high violation count as a quality finding, not merely as lost coverage.",
+        "",
+        "| Backend | Contract failures | Calls attempted (this launch) |",
+        "|---|---|---|",
+    ]
+    for name, violations, attempted in offenders:
+        lines.append(f"| {name} | {violations} | {attempted or 'unknown'} |")
+    lines += [
+        "",
+        "Counts come from the manifest, which records only the LAST launch, so a",
+        "resumed run under-reports them — see the completion caveat above. The",
+        "durable fix is issue #40.",
+        "",
+    ]
     return lines
 
 

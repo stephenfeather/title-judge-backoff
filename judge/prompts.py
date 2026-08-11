@@ -118,19 +118,50 @@ def build_messages(pair) -> list[dict[str, str]]:
     ]
 
 
+class JudgeResponseError(ValueError):
+    """The model answered, but not in the shape the contract requires.
+
+    Deliberately its own type, because `RunHealth.record_failure` counts
+    failures by `type(exc).__name__`. A bare ValueError lands in `error_kinds`
+    under a name that says nothing about the cause and collides with any other
+    ValueError raised anywhere in the call path.
+
+    The distinction is not cosmetic (issue #41). A transport failure says
+    nothing about the model — the connection dropped. THIS says the model was
+    asked for `{"verdict": "approve"|"reject", "reason": ...}` and returned
+    something else, which is evidence about its fitness as a judge. Merging the
+    two means a model that cannot follow the output contract looks merely
+    unlucky, and its failed pairs vanish from its own scores.
+
+    Subclasses ValueError so existing callers that catch ValueError keep
+    working.
+    """
+
+
 def parse_judge_response(text: str) -> tuple[str, ReasonCode]:
     """Extract (verdict, reason) from a judge reply.
 
-    Tolerates surrounding prose and markdown code fences; raises ValueError if
-    no well-formed verdict object can be found.
+    Tolerates surrounding prose and markdown code fences; raises
+    JudgeResponseError if no well-formed verdict object can be found.
+
+    All four failure shapes — no JSON, malformed JSON, a non-verdict in the
+    verdict field, an unknown reason code — raise the SAME type. They are one
+    finding: the model did not honour the contract. Splitting them across
+    different exception names would scatter one compliance rate across several
+    rows of error_kinds.
     """
     match = _JSON_OBJECT_RE.search(text)
     if match is None:
-        raise ValueError(f"no JSON object in judge response: {text!r}")
+        raise JudgeResponseError(f"no JSON object in judge response: {text!r}")
     try:
         record = json.loads(match.group(0))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"malformed JSON in judge response: {text!r}") from exc
-    verdict = _check_verdict(record.get("verdict"))
-    reason = ReasonCode(record.get("reason"))
+        raise JudgeResponseError(f"malformed JSON in judge response: {text!r}") from exc
+    try:
+        verdict = _check_verdict(record.get("verdict"))
+        reason = ReasonCode(record.get("reason"))
+    except ValueError as exc:
+        # _check_verdict and ReasonCode() both raise plain ValueError. Re-raise
+        # under this type so the count lands with the other contract failures.
+        raise JudgeResponseError(f"{exc} (in judge response: {text!r})") from exc
     return verdict, reason

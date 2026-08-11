@@ -2,7 +2,12 @@ from dataclasses import replace
 
 import pytest
 
-from judge.prompts import PROMPT_VERSION, build_messages, parse_judge_response
+from judge.prompts import (
+    PROMPT_VERSION,
+    JudgeResponseError,
+    build_messages,
+    parse_judge_response,
+)
 from judge.schema import Pair, ReasonCode
 
 
@@ -114,6 +119,35 @@ def test_build_messages_omits_brand_and_mpn_lines_when_absent():
     assert "MPN:" not in user
     assert "ORIGINAL: acme widget 3000 blk" in user
     assert "ENRICHED: Acme Widget 3000, Black" in user
+
+
+def test_a_schema_violation_raises_a_named_error_not_a_bare_ValueError():
+    # Issue #41: health.error_kinds keys on type(exc).__name__, so a bare
+    # ValueError is counted under a name that says nothing about the cause and
+    # collides with any other ValueError. A model that answered in the wrong
+    # shape is EVIDENCE ABOUT THE MODEL and must be distinguishable from a
+    # connection that dropped.
+    with pytest.raises(JudgeResponseError):
+        parse_judge_response('{"verdict": "ok", "reason": "ok"}')
+
+
+def test_every_malformed_reply_raises_the_same_named_error():
+    # All four failure shapes are the same finding: the model did not honour the
+    # contract. They must not land under different names in error_kinds.
+    for reply in (
+        "I approve of this title.",                      # no JSON at all
+        '{"verdict": "approve", "reason":}',             # malformed JSON
+        '{"verdict": "ok", "reason": "ok"}',             # reason code in verdict
+        '{"verdict": "approve", "reason": "vibes"}',     # unknown reason code
+    ):
+        with pytest.raises(JudgeResponseError):
+            parse_judge_response(reply)
+
+
+def test_the_named_error_is_still_a_ValueError():
+    # Existing callers and tests catch ValueError; narrowing the type must not
+    # break them.
+    assert issubclass(JudgeResponseError, ValueError)
 
 
 def test_parse_judge_response_plain_json():
