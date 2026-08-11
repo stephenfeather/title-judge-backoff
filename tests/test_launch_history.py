@@ -71,6 +71,54 @@ def test_an_unreadable_previous_manifest_starts_a_fresh_history():
     assert cumulative["launches"] == 1
 
 
+IDENTITY = {"model_id": "m", "base_url": "https://a.test/v1", "prompt_version": "v2",
+            "temperature": None, "reasoning_effort": None,
+            "config_digest": "dig1", "code_version": "aaa"}
+
+
+def test_history_from_a_different_config_is_not_adopted():
+    # PR #47 review: an all-failure launch writes a manifest but NO verdict
+    # rows, so the row-based resume guard has nothing to compare and cannot
+    # fire. Adopting that manifest after the model or host changed would file
+    # the old provider's failures under the new one.
+    previous = {**IDENTITY, "model_id": "OTHER", "launches": [L1]}
+    launches, cumulative = accumulate_launches(previous, L2, identity=IDENTITY)
+    assert launches == [L2], "the other model's launches must not be inherited"
+    assert cumulative["calls_failed"] == 0
+
+
+def test_history_from_the_same_config_is_adopted():
+    previous = {**IDENTITY, "launches": [L1]}
+    launches, cumulative = accumulate_launches(previous, L2, identity=IDENTITY)
+    assert launches == [L1, L2]
+    assert cumulative["calls_failed"] == 50
+
+
+def test_discarding_a_history_is_recorded_rather_than_silent():
+    # Dropping the prior launches is correct — they describe a different
+    # configuration — but it is still the loss of a failure record, which is
+    # the thing #40 exists to prevent. Say so.
+    previous = {**IDENTITY, "code_version": "bbb", "launches": [L1, L2]}
+    _, cumulative = accumulate_launches(previous, L2, identity=IDENTITY)
+    assert cumulative["discarded_prior_launches"] == 2
+
+
+def test_no_identity_given_adopts_the_history_unchanged():
+    # Callers that do not track identity keep the previous behaviour, the same
+    # concession already made for provenance in already_judged_ids.
+    previous = {"launches": [L1]}
+    launches, _ = accumulate_launches(previous, L2)
+    assert launches == [L1, L2]
+
+
+def test_a_legacy_manifest_with_no_identity_is_adopted():
+    # Manifests predating provenance carry no config_digest or code_version.
+    # Absent is unknown, not a mismatch — the same rule the resume guard uses.
+    previous = {"model_id": "m", "base_url": "https://a.test/v1", "launches": [L1]}
+    launches, _ = accumulate_launches(previous, L2, identity=IDENTITY)
+    assert launches == [L1, L2]
+
+
 def test_a_legacy_manifest_with_no_health_contributes_nothing():
     launches, cumulative = accumulate_launches({"backend": "nv"}, L2)
     assert launches == [L2]

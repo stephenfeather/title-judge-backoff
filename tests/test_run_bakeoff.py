@@ -370,6 +370,60 @@ def test_run_manifest_records_the_prompt_variant_histogram():
     assert manifest["prompt_variants"] == {"none": 1, "brand+mpn": 2}
 
 
+def test_a_manifest_failure_on_the_success_path_is_not_swallowed(tmp_path):
+    # PR #47 review: suppressing the manifest error unconditionally let a run
+    # that never persisted its audit metadata exit 0, so automation would treat
+    # it as complete. Suppression belongs only where another exception is
+    # already unwinding.
+    backend = concurrency_backend()
+
+    def exploding_manifest(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("run_bakeoff._write_manifest", exploding_manifest)
+    try:
+        with pytest.raises(OSError, match="no space left"):
+            run_backend(
+                backend,
+                [make_pair("p1")],
+                tmp_path,
+                votes=1,
+                limiters=no_sleep_limiters(),
+                client_factory=lambda b: FakeClient(b),
+            )
+    finally:
+        monkey.undo()
+
+
+def test_a_manifest_failure_never_masks_the_error_that_stopped_the_run(tmp_path):
+    # The other half: when the run is ALREADY failing, a manifest problem must
+    # not replace the traceback explaining why.
+    backend = concurrency_backend()
+
+    class Interrupting(FakeClient):
+        def judge(self, pair, run_index=0):
+            raise KeyboardInterrupt("operator stopped the run")
+
+    def exploding_manifest(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("run_bakeoff._write_manifest", exploding_manifest)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_backend(
+                backend,
+                [make_pair("p1")],
+                tmp_path,
+                votes=1,
+                limiters=no_sleep_limiters(),
+                client_factory=lambda b: Interrupting(b),
+            )
+    finally:
+        monkey.undo()
+
+
 def test_an_interrupted_backend_still_writes_its_manifest(tmp_path):
     # Issue #40's second half: _write_manifest ran only after the pool completed
     # normally, so a killed backend recorded NOTHING. In the 2026-08-11 run the

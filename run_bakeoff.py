@@ -305,7 +305,38 @@ def render_skip_warning(names: list[str]) -> str:
     )
 
 
-def accumulate_launches(previous: dict | None, health: dict) -> tuple[list[dict], dict]:
+#: What makes two launches the same run. Deliberately the fields the row-based
+#: resume guard compares in `already_judged_ids` — the manifest history has to
+#: mean the same thing "one run" means everywhere else.
+LAUNCH_IDENTITY_FIELDS = (
+    "model_id",
+    "base_url",
+    "prompt_version",
+    "temperature",
+    "reasoning_effort",
+    "config_digest",
+    "code_version",
+)
+
+
+def _same_run(previous: dict, identity: dict) -> bool:
+    """Whether a prior manifest describes the same configuration as this launch.
+
+    Absent on either side means UNKNOWN, not different — manifests written
+    before provenance existed carry no config_digest or code_version, and
+    treating that as a mismatch would discard every legacy history. Same rule
+    the resume guard uses for provenance on a row.
+    """
+    for field in LAUNCH_IDENTITY_FIELDS:
+        before, now = previous.get(field), identity.get(field)
+        if before is not None and now is not None and before != now:
+            return False
+    return True
+
+
+def accumulate_launches(
+    previous: dict | None, health: dict, identity: dict | None = None
+) -> tuple[list[dict], dict]:
     """Fold this launch's health into the history from previous launches.
 
     Resume is the NORMAL way a run completes here, and the manifest used to be
@@ -325,6 +356,20 @@ def accumulate_launches(previous: dict | None, health: dict) -> tuple[list[dict]
     only record of that launch.
     """
     previous = previous or {}
+    discarded = 0
+    if identity is not None and previous and not _same_run(previous, identity):
+        # A launch that failed every call writes a manifest but NO verdict rows,
+        # so the row-based guard has nothing to compare and cannot fire. Without
+        # this check the old configuration's failures would be filed under the
+        # new one — the wrong provider blamed for another's timeouts.
+        #
+        # Dropped rather than refused: with no rows there is nothing to protect,
+        # so blocking a legitimate retry after a config fix would be
+        # disproportionate. Counted, because silently losing a failure record is
+        # the thing this function exists to prevent.
+        discarded = len(previous.get("launches") or ([previous["health"]] if previous.get("health") else []))
+        previous = {}
+
     launches = list(previous.get("launches") or [])
     if not launches and previous.get("health"):
         launches = [previous["health"]]
@@ -333,7 +378,7 @@ def accumulate_launches(previous: dict | None, health: dict) -> tuple[list[dict]
     error_kinds: Counter[str] = Counter()
     for entry in launches:
         error_kinds.update(entry.get("error_kinds") or {})
-    return launches, {
+    cumulative = {
         "launches": len(launches),
         "calls_ok": sum(e.get("calls_ok", 0) for e in launches),
         "calls_failed": sum(e.get("calls_failed", 0) for e in launches),
@@ -342,6 +387,9 @@ def accumulate_launches(previous: dict | None, health: dict) -> tuple[list[dict]
         # manifest must diff cleanly between runs.
         "error_kinds": dict(sorted(error_kinds.items())),
     }
+    if discarded:
+        cumulative["discarded_prior_launches"] = discarded
+    return launches, cumulative
 
 
 def _health_summary(
@@ -681,7 +729,7 @@ def _write_manifest(
     except (OSError, ValueError):
         previous = None
     manifest["launches"], manifest["cumulative"] = accumulate_launches(
-        previous, manifest["health"]
+        previous, manifest["health"], identity=manifest
     )
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -818,26 +866,28 @@ def run_backend(
                 raise
             else:
                 pool.shutdown(wait=True)
-    finally:
-        # Written in `finally`, not after the pool: a backend that was killed or
-        # raised recorded NOTHING before, so the one whose failures mattered
-        # most left the least evidence (issue #40). Its calls were still made
-        # and still cost money; what it learned is worth keeping.
+    except BaseException:
+        # Already failing. Record what this launch learned — a backend that was
+        # killed used to leave NO manifest at all, so the one whose failures
+        # mattered most left the least evidence (issue #40) — but never let a
+        # manifest problem replace the traceback explaining why the run stopped.
         try:
             _write_manifest(
-                backend,
-                pairs,
-                out_dir,
-                votes=votes,
-                client=client,
-                health=health,
-                code_version=code_version,
-                config_digest=digest,
+                backend, pairs, out_dir, votes=votes, client=client, health=health,
+                code_version=code_version, config_digest=digest,
             )
-        except Exception as exc:  # noqa: BLE001 - never mask the real failure
-            # A manifest that cannot be written must not replace the traceback
-            # explaining why the run stopped. Report and carry on unwinding.
+        except Exception as exc:  # noqa: BLE001 - the original failure wins
             print(f"[{backend.name}] could not write manifest: {exc!r}", file=sys.stderr)
+        raise
+    else:
+        # Succeeded, so a manifest failure is THE failure. Suppressing it here
+        # would let a run whose audit metadata and usage totals never reached
+        # disk exit 0, and automation would read that as complete.
+        _write_manifest(
+            backend, pairs, out_dir, votes=votes, client=client, health=health,
+            code_version=code_version, config_digest=digest,
+        )
+    finally:
         client.close()
 
 
