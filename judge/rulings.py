@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from judge.schema import VALID_VERDICTS, ReasonCode
+from judge.schema import ACTIVE_REASON_CODES, VALID_VERDICTS, ReasonCode
 
 ACTION_RULE = "rule"
 ACTION_SKIP = "skip"
@@ -80,13 +80,19 @@ def allocate_keys(codes: Sequence) -> dict[str, object]:
 
 
 def reason_keymap() -> dict[str, ReasonCode]:
-    """Key -> reason code, generated from the schema enum's own order."""
-    return allocate_keys(list(ReasonCode))  # type: ignore[return-value]
+    """Key -> reason code, generated from the schema's ACTIVE codes in order.
+
+    Retired codes are excluded rather than filtered at the call site. Presenting
+    a code an operator cannot legitimately choose invites a mis-ruling under
+    fatigue, and every such ruling would land as a systematic miss against
+    models that were never offered the code (issue #44).
+    """
+    return allocate_keys(list(ACTIVE_REASON_CODES))  # type: ignore[return-value]
 
 
 def reject_reason_keymap() -> dict[str, ReasonCode]:
-    """The submenu offered after `r`: every code except the approval one."""
-    codes = [code for code in ReasonCode if code is not _APPROVE_REASON]
+    """The submenu offered after `r`: every active code except the approval one."""
+    codes = [code for code in ACTIVE_REASON_CODES if code is not _APPROVE_REASON]
     return allocate_keys(codes)  # type: ignore[return-value]
 
 

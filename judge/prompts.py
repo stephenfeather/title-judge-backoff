@@ -1,8 +1,24 @@
 """Versioned judge prompts and response parsing.
 
-Prompt v2: the judge sees an original title, the enriched replacement, and the
+Prompt v3: the judge sees an original title, the enriched replacement, and the
 known brand/MPN WHEN THE PAIR CARRIES THEM, then must approve or reject the
 change with a reason code.
+
+v3 withdrew `truncation_worse` from the rubric (issue #44). It fired 4 times in
+~13,800 votes across two prompt versions, 3 of them from the degenerate floor
+model that picks reason codes close to randomly, and an audit of the corpus
+found no genuine truncation for it to describe — see RETIRED_REASON_CODES in
+judge/schema.py for the evidence. A code no model emits and no operator can
+legitimately choose is a permanently empty row and column in score.py's
+confusion matrix; worse, if an operator DID rule some pairs that way, every one
+would be a systematic miss attributed to the model rather than to a rubric the
+data cannot exercise.
+
+Withdrawing it changes what the judge is asked, so PROMPT_VERSION moved to v3
+and v2 verdicts are not resumable against it. That is deliberate: the reason
+distribution is the thing under measurement, and silently mixing a run that
+offered five codes with one that offered four would corrupt exactly the number
+this change exists to clean up.
 
 v1 promised brand and MPN unconditionally while `build_messages` only sent them
 when the pair had them. The calibration corpus has neither field, so all 4,974
@@ -21,9 +37,9 @@ from __future__ import annotations
 import json
 import re
 
-from judge.schema import ReasonCode, _check_verdict
+from judge.schema import ACTIVE_REASON_CODES, ReasonCode, _check_verdict
 
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
 
 _INTRO = "You are a strict quality-control judge for e-commerce product titles.\n"
 
@@ -42,13 +58,12 @@ Reject the change if any of these apply, and pick the single best reason code:
 - overcorrection: the rewrite changed things that were already correct, or scrubbed useful detail
 - meaning_change: the enriched title describes a different product, spec, or attribute than the original
 - casing_error: brand or model casing is wrong in the enriched title
-- truncation_worse: the enriched title dropped identifying information the original had
 
 If the change is acceptable, approve with reason code:
 - ok: the enriched title is a faithful improvement
 
 Respond with ONLY a JSON object, no other text:
-{"verdict": "approve" | "reject", "reason": "overcorrection" | "meaning_change" | "casing_error" | "truncation_worse" | "ok"}
+{"verdict": "approve" | "reject", "reason": "overcorrection" | "meaning_change" | "casing_error" | "ok"}
 """
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -144,9 +159,14 @@ def parse_judge_response(text: str) -> tuple[str, ReasonCode]:
     Tolerates surrounding prose and markdown code fences; raises
     JudgeResponseError if no well-formed verdict object can be found.
 
-    All four failure shapes — no JSON, malformed JSON, a non-verdict in the
-    verdict field, an unknown reason code — raise the SAME type. They are one
-    finding: the model did not honour the contract. Splitting them across
+    All five failure shapes — no JSON, malformed JSON, a non-verdict in the
+    verdict field, an unknown reason code, a RETIRED reason code — raise the
+    SAME type. They are one finding: the model did not honour the contract it
+    was given. The prompt does not offer retired codes, so a reply carrying
+    one is not a historical row to preserve (those never pass through here) —
+    it is a live contract breach, and must count with the others in
+    error_kinds rather than enter the v3 reason distribution as a code the
+    model was never offered (issue #44). Splitting any of these across
     different exception names would scatter one compliance rate across several
     rows of error_kinds.
     """
@@ -160,6 +180,8 @@ def parse_judge_response(text: str) -> tuple[str, ReasonCode]:
     try:
         verdict = _check_verdict(record.get("verdict"))
         reason = ReasonCode(record.get("reason"))
+        if reason not in ACTIVE_REASON_CODES:
+            raise ValueError(f"reason code {reason.value!r} is retired and not offered")
     except ValueError as exc:
         # _check_verdict and ReasonCode() both raise plain ValueError. Re-raise
         # under this type so the count lands with the other contract failures.

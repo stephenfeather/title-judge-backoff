@@ -8,7 +8,7 @@ from judge.prompts import (
     build_messages,
     parse_judge_response,
 )
-from judge.schema import Pair, ReasonCode
+from judge.schema import ACTIVE_REASON_CODES, RETIRED_REASON_CODES, Pair, ReasonCode
 
 
 PAIR = Pair(
@@ -33,10 +33,13 @@ BARE_PAIR = Pair(
 )
 
 
-def test_prompt_version_is_v2():
-    # Bumped for the issue #14 fix. This correctly invalidates resume against
-    # every result file produced under v1, which is the #13 guard working.
-    assert PROMPT_VERSION == "v2"
+def test_prompt_version_is_v3():
+    # v2 fixed the issue #14 prompt/message disagreement; v3 withdrew
+    # truncation_worse from the rubric (#44). Each correctly invalidates resume
+    # against every result file produced under the previous one, which is the
+    # #13 guard working — the reason distribution is the measurement, so mixing
+    # a five-code run with a four-code one would corrupt it.
+    assert PROMPT_VERSION == "v3"
 
 
 def test_system_prompt_does_not_promise_brand_or_mpn_when_the_pair_has_neither():
@@ -98,10 +101,20 @@ def test_build_messages_shape_and_content():
         assert value in user
 
 
-def test_build_messages_system_prompt_names_all_reason_codes():
+def test_build_messages_system_prompt_names_every_active_reason_code():
     system = build_messages(PAIR)[0]["content"]
-    for code in ReasonCode:
+    for code in ACTIVE_REASON_CODES:
         assert code.value in system
+
+
+def test_build_messages_system_prompt_never_offers_a_retired_reason_code():
+    # The guard against half a retirement (issue #44). Withdrawing a code from
+    # the rubric while the prompt still lists it would leave models emitting a
+    # code the ruling TUI no longer offers, which is the asymmetric failure the
+    # issue warns about — every such pair becomes a systematic miss.
+    system = build_messages(PAIR)[0]["content"]
+    for code in RETIRED_REASON_CODES:
+        assert code.value not in system
 
 
 def test_build_messages_omits_brand_and_mpn_lines_when_absent():
@@ -171,3 +184,15 @@ def test_parse_judge_response_rejects_garbage():
 def test_parse_judge_response_rejects_unknown_reason():
     with pytest.raises(ValueError):
         parse_judge_response('{"verdict": "approve", "reason": "vibes"}')
+
+
+def test_parse_judge_response_refuses_a_retired_reason_code():
+    # Issue #44. A retired code is still a valid ENUM member — verdict rows on
+    # disk carry it and must keep loading — but the v3 prompt does not offer
+    # it, so a live reply carrying it did not honour the contract it was
+    # given. That is the same finding as any other unknown reason, and must
+    # count with them in error_kinds rather than enter the v3 reason
+    # distribution as a code the model was never offered.
+    for code in RETIRED_REASON_CODES:
+        with pytest.raises(JudgeResponseError):
+            parse_judge_response(f'{{"verdict": "reject", "reason": "{code.value}"}}')

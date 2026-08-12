@@ -3,6 +3,8 @@ import json
 import pytest
 
 from judge.schema import (
+    ACTIVE_REASON_CODES,
+    RETIRED_REASON_CODES,
     Pair,
     ReasonCode,
     Usage,
@@ -100,6 +102,29 @@ def test_reason_code_members():
         "truncation_worse",
         "ok",
     }
+
+
+def test_active_codes_are_the_enum_minus_the_retired_ones():
+    assert set(ACTIVE_REASON_CODES) == set(ReasonCode) - RETIRED_REASON_CODES
+    assert ReasonCode.TRUNCATION_WORSE not in ACTIVE_REASON_CODES
+
+
+def test_a_retired_code_stays_readable_on_disk():
+    # THE reason the member survives retirement (issue #44). Four verdict rows
+    # in results/ carry truncation_worse; deleting the enum member would make
+    # verdict_from_json_line raise on them, so every historical run — including
+    # the S1 baseline the v2 comparison rests on — would stop loading.
+    line = verdict_to_json_line(
+        Verdict(
+            pair_id="p1",
+            verdict="reject",
+            reason=ReasonCode.TRUNCATION_WORSE,
+            model_id="m",
+            prompt_version="v2",
+            temperature=0.0,
+        )
+    )
+    assert verdict_from_json_line(line).reason is ReasonCode.TRUNCATION_WORSE
 
 
 def test_pair_from_dict():

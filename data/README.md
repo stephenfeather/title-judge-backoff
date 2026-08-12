@@ -27,7 +27,7 @@ One JSON object per line:
 | `brand` | string | Known brand for the product |
 | `mpn` | string | Manufacturer part number |
 | `ground_truth` | `"approve"` \| `"reject"` | Operator ruling |
-| `reason` | enum | `overcorrection`, `meaning_change`, `casing_error`, `truncation_worse`, `ok` |
+| `reason` | enum | `overcorrection`, `meaning_change`, `casing_error`, `ok`; `truncation_worse` was retired at prompt v3 (issue #44) and appears only in pre-v3 rows |
 
 `reason` should be `ok` when `ground_truth` is `approve`, and one of the
 failure codes when it is `reject`.

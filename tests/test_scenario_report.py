@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from judge.prompts import PROMPT_VERSION
 from judge.schema import ReasonCode, Usage, Verdict, verdict_to_json_line
 from scenario_report import (
     _health_table,
@@ -142,6 +143,55 @@ def test_render_scenario_report_has_every_required_section():
     assert "## Reliability" in md
     # Health must surface the failing backend, not silently average it away.
     assert "ReadTimeout" in md
+
+
+def test_a_retired_reason_code_in_old_rows_is_labelled_as_retired():
+    # Issue #44. A run judged under v2 keeps its truncation_worse rows forever.
+    # Without the note there is no way to tell a code models DECLINED to use
+    # from one they were never offered, and a reader would compare its count
+    # against a v3 run as though both had the same menu.
+    by_model = {"a": votes("a", "p1", [("reject", "truncation_worse")] * 3)}
+    md = render_scenario_report(by_model, {})
+    assert "Retired code(s) present" in md
+    assert "`truncation_worse`" in md
+    assert "appeared in votes" in md
+
+
+def test_no_retirement_note_when_every_code_is_current():
+    by_model = {"a": votes("a", "p1", [("reject", "casing_error")] * 3)}
+    assert "Retired code" not in render_scenario_report(by_model, {})
+
+
+def test_the_retirement_note_holds_when_the_code_only_ever_appears_in_unsettled_votes():
+    # The note scans raw votes while the distribution table above it counts
+    # settled majorities, so a scattered retired vote is exactly the case the
+    # wording must survive: the code fired, the table shows nothing, and the
+    # reader must not be pointed at counts that were never rendered.
+    by_model = {
+        "a": votes("a", "p1", [("reject", "truncation_worse"), ("reject", "casing_error"), ("reject", "ok")])
+    }
+    md = render_scenario_report(by_model, {})
+    assert "Retired code(s) present" in md
+    assert "appeared in votes" in md
+
+
+def test_a_retired_code_on_a_current_version_row_is_flagged_as_a_contract_breach():
+    # v3 never offers the code, so a v3 row carrying it is not history — it is
+    # a model that ignored the menu (a parse-path JudgeResponseError should have
+    # refused it). The note must not claim these rows predate the retirement.
+    row = replace(make_verdict("p1", "reject", "truncation_worse"), prompt_version=PROMPT_VERSION)
+    md = render_scenario_report({"a": [row]}, {})
+    assert "still offered the code" not in md
+    assert "never offered" in md
+
+
+def test_historical_and_current_retired_rows_get_separate_paragraphs():
+    old = votes("a", "p1", [("reject", "truncation_worse")])
+    current = [replace(old[0], prompt_version=PROMPT_VERSION)]
+    md = render_scenario_report({"a": old + current}, {})
+    assert "still offered the code" in md
+    assert "never offered" in md
+    assert "different menus.\n\n**Retired code(s) on current-version" in md
 
 
 def test_reliability_is_reported_before_any_quality_table():

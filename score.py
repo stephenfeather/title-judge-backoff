@@ -16,7 +16,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from judge.schema import Pair, Verdict, pair_from_dict, verdict_from_json_line
+from judge.schema import RETIRED_REASON_CODES, Pair, Verdict, pair_from_dict, verdict_from_json_line
 from judge.stats import bootstrap_ci, intervals_overlap, mean_sd
 from judge.vote import tally_votes
 
@@ -365,6 +365,24 @@ def render_leaderboard(scores: list[ModelScore]) -> str:
     for s in sorted(scores, key=lambda s: s.kappa, reverse=True):
         lines.append(f"## Reason confusion: {s.model_id}")
         lines.append("")
+        retired = sorted(
+            {code for cell in s.reason_confusion for code in cell}
+            & {code.value for code in RETIRED_REASON_CODES}
+        )
+        if retired:
+            # Issue #44: a retired code on EITHER axis is not ordinary
+            # disagreement. On the ground-truth axis it is a pre-v3 ruling
+            # every current-rubric model must systematically miss; on the
+            # judged axis it is a pre-v3 verdict (or a contract breach) the
+            # current rubric never offers. Same shape as the scenario
+            # report's retired-code note.
+            lines.append(
+                f"Retired code(s) present ({', '.join(f'`{c}`' for c in retired)}), recorded"
+                " under a rubric that still offered them; the current rubric does not."
+                " Every cell in their retired rows/columns is a systematic miss against"
+                " current models, not ordinary disagreement."
+            )
+            lines.append("")
         lines.append("| Ground truth | Judged | Count |")
         lines.append("|---|---|---|")
         for (gt, judged), count in sorted(s.reason_confusion.items()):
