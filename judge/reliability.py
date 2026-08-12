@@ -39,6 +39,11 @@ TIMEOUT_SUFFIX = "Timeout"
 #: stays free of the httpx-bearing import chain, as scenario_report requires.
 CONTRACT_FAILURE = "JudgeResponseError"
 
+#: The exception judge.client raises for a 429 that means "this account cannot
+#: bill", as opposed to "slow down" (issue #52). Named here for the same reason
+#: as CONTRACT_FAILURE — this module stays free of the httpx import chain.
+QUOTA_FAILURE = "QuotaExhausted"
+
 #: At or above this many attempts per completed vote, a backend needs more calls
 #: than the set has votes. Not a tuned threshold — it is the point where the
 #: majority of calls fail, so every resume pass costs more than it recovers and
@@ -88,6 +93,14 @@ class Reliability:
         return self.error_kinds.get(CONTRACT_FAILURE, 0)
 
     @property
+    def quota_failures(self) -> int:
+        return self.error_kinds.get(QUOTA_FAILURE, 0)
+
+    @property
+    def could_not_bill(self) -> bool:
+        return self.quota_failures > 0
+
+    @property
     def failure_rate(self) -> float | None:
         if not self.attempted:
             return None
@@ -108,6 +121,13 @@ class Reliability:
         clear precisely the backends that died before they could report.
         """
         if self.scope == "none" or self.attempted is None:
+            return None
+        if self.quota_failures and self.quota_failures == self.failed:
+            # EVERY failure was a billing refusal, so this says nothing about
+            # the model (issue #52). Zero rows for want of credit and zero rows
+            # for want of throughput look identical and mean opposite things:
+            # one is "add credit", the other is "do not pick this judge".
+            # Reported under "could not bill" instead.
             return None
         if self.succeeded == 0:
             return True
@@ -186,9 +206,9 @@ def render_reliability_section(rows: list[Reliability]) -> list[str]:
         "agrees, because it never produces enough judgments to agree with. Read",
         "this table before the quality tables that follow (issue #43).",
         "",
-        "| Backend | Evidence | Attempted | OK | Failed | Timeouts | Contract | "
+        "| Backend | Evidence | Attempted | OK | Failed | Timeouts | Contract | Billing | "
         "Attempts/vote | p50 (s) | p95 (s) | Rows on disk |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         unknown = r.attempted is None
@@ -199,6 +219,7 @@ def render_reliability_section(rows: list[Reliability]) -> list[str]:
             f"{'unknown' if r.failed is None else r.failed} | "
             f"{'unknown' if unknown else r.timeouts} | "
             f"{'unknown' if unknown else r.contract_failures} | "
+            f"{'unknown' if unknown else r.quota_failures} | "
             f"{_num(r.attempts_per_vote)} | "
             f"{_num(r.latency_p50)} | {_num(r.latency_p95)} | {r.rows_on_disk} |"
         )
@@ -214,6 +235,27 @@ def render_reliability_section(rows: list[Reliability]) -> list[str]:
         "would produce a number describing no run that actually happened.",
         "",
     ]
+
+    unfunded = [r for r in rows if r.could_not_bill]
+    if unfunded:
+        lines += [
+            "### Could not bill",
+            "",
+            "These backends were refused for want of credit or quota, not for",
+            "anything they did. **This is an account state, not a finding about the",
+            "model** — a backend with zero rows here has not failed the bake-off, it",
+            "was never allowed to enter (issue #52).",
+            "",
+            "The host returns HTTP 429 for this, the same status it uses for",
+            "throttling, so it is easy to misread as a rate limit. It is not: no",
+            "amount of backing off fixes it, and it is charged to the backend rather",
+            "than to the host, so its neighbours on that endpoint are unaffected.",
+            "",
+        ]
+        for r in unfunded:
+            share = "" if r.failed is None else f" of {r.failed} failures"
+            lines.append(f"- **{r.backend}** — {r.quota_failures} billing refusals{share}.")
+        lines.append("")
 
     unusable = [r for r in rows if r.unusable_at_scale]
     if unusable:

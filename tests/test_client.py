@@ -15,9 +15,11 @@ from judge.client import (
     JudgeClient,
     LimiterRegistry,
     RateLimiter,
+    QuotaExhausted,
     config_digest,
     limiter_host,
     load_backends,
+    quota_failure_detail,
     rate_limit_penalty,
 )
 from judge.prompts import PROMPT_VERSION
@@ -228,6 +230,54 @@ def http_429(retry_after=None):
     headers = {"retry-after": retry_after} if retry_after is not None else {}
     response = httpx.Response(429, headers=headers, request=httpx.Request("POST", "https://x.test"))
     return httpx.HTTPStatusError("429", request=response.request, response=response)
+
+
+def quota_response(payload):
+    return httpx.Response(429, json=payload, request=httpx.Request("POST", "https://x.test"))
+
+
+def test_a_429_for_exhausted_credit_is_recognised_as_a_quota_failure():
+    # Issue #52, observed live on api.openai.com 2026-08-12. HTTP 429 with no
+    # Retry-After, and a body that is the ONLY thing distinguishing this from
+    # throttling.
+    detail = quota_failure_detail(
+        quota_response(
+            {
+                "error": {
+                    "message": "You have no credits remaining. Add credits to continue…",
+                    "type": "insufficient_quota",
+                    "code": "credit_balance_exhausted",
+                }
+            }
+        )
+    )
+    assert detail is not None
+    # The host's own words must survive into the message, because the run log is
+    # where an operator diagnoses this and it previously said only "429".
+    assert "no credits remaining" in detail
+    assert "insufficient_quota" in detail
+
+
+def test_an_ordinary_429_is_not_treated_as_a_quota_failure():
+    # Throttling must keep its existing backoff. Guessing "quota" from a plain
+    # 429 would disable the backoff that keeps a real rate limit from worsening.
+    assert quota_failure_detail(quota_response({"error": {"type": "rate_limit_error"}})) is None
+
+
+def test_a_429_with_no_usable_body_falls_back_to_throttling():
+    # Unknown means throttle, not quota: backing off an unfamiliar 429 is the
+    # conservative error, and never backing off is the expensive one.
+    plain = httpx.Response(429, request=httpx.Request("POST", "https://x.test"))
+    assert quota_failure_detail(plain) is None
+    assert quota_failure_detail(quota_response({"error": "just a string"})) is None
+
+
+def test_a_quota_failure_earns_no_host_penalty():
+    # THE fix. The penalty exists to slow a host that is overloaded; an account
+    # that cannot bill is not an overloaded host, and on api.deepinfra.com —
+    # where four backends share one bucket — penalising it would throttle three
+    # healthy backends for the whole run.
+    assert rate_limit_penalty(QuotaExhausted("no credits")) is None
 
 
 def test_rate_limit_penalty_ignores_errors_that_are_not_429():

@@ -110,6 +110,47 @@ def test_a_backend_that_fails_more_than_half_its_calls_is_marked_unusable():
     assert row.unusable_at_scale is True
 
 
+def test_quota_failures_are_counted_apart_from_everything_else():
+    m = {"cumulative": {"calls_ok": 465, "calls_failed": 135, "error_kinds": {
+        "QuotaExhausted": 135}}}
+    (row,) = reliability_rows({"a": rows(["p1"])}, {"a": m})
+    assert row.quota_failures == 135
+    assert row.timeouts == 0
+    assert row.contract_failures == 0
+
+
+def test_a_backend_that_could_not_bill_is_not_called_unusable_at_scale():
+    # Issue #52's fourth ask, and the sharpest one. A backend whose every call
+    # was refused for want of credit produces zero rows — the same shape as a
+    # model that cannot sustain the volume, and a completely different finding.
+    # One says "do not pick this judge"; the other says "add credit".
+    m = {"cumulative": {"calls_ok": 0, "calls_failed": 600, "error_kinds": {
+        "QuotaExhausted": 600}}}
+    (row,) = reliability_rows({"a": rows(["p1"])}, {"a": m})
+    assert row.could_not_bill is True
+    assert row.unusable_at_scale is None, "a billing state is not a verdict on the model"
+
+
+def test_a_backend_that_also_failed_for_other_reasons_is_still_judged():
+    # Only an ALL-quota failure set is exempt. A backend that timed out AND ran
+    # out of credit still has evidence about its throughput, and hiding behind
+    # the billing state would clear it on someone else's problem.
+    m = {"cumulative": {"calls_ok": 100, "calls_failed": 500, "error_kinds": {
+        "QuotaExhausted": 250, "ReadTimeout": 250}}}
+    (row,) = reliability_rows({"a": rows(["p1"])}, {"a": m})
+    assert row.could_not_bill is True
+    assert row.unusable_at_scale is True
+
+
+def test_the_section_separates_could_not_bill_from_unusable():
+    m = {"cumulative": {"calls_ok": 0, "calls_failed": 600, "error_kinds": {
+        "QuotaExhausted": 600}}}
+    text = "\n".join(render_reliability_section(reliability_rows({"broke": rows(["p1"])}, {"broke": m})))
+    assert "broke" in text
+    assert "could not bill" in text.lower()
+    assert "Unusable at scale" not in text
+
+
 def test_a_healthy_backend_is_not_marked_unusable():
     m = {"cumulative": {"calls_ok": 600, "calls_failed": 3, "error_kinds": {"ReadTimeout": 3}}}
     (row,) = reliability_rows({"a": rows(["p1"])}, {"a": m})

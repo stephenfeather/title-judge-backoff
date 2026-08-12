@@ -235,8 +235,76 @@ RETRY_AFTER_DEFAULT_S = 30.0
 MAX_BACKOFF_S = 300.0
 
 
+class QuotaExhausted(Exception):
+    """The account cannot make this call — a 429 that backing off will not fix.
+
+    Its own type, for the same reason JudgeResponseError has one (#41):
+    `RunHealth.record_failure` counts by `type(exc).__name__`, so this is what
+    puts "the account could not bill" in `error_kinds` instead of a
+    `HTTPStatusError` indistinguishable from throttling.
+
+    The distinction is operational, not cosmetic (#52). A throttling 429 means
+    "slow down" and a host penalty is the right answer. This one means "this
+    account cannot make this call at all", where a host penalty is actively
+    harmful: penalties apply to the HOST, and four of the slate's backends share
+    `api.deepinfra.com`, so one unfunded backend would throttle three healthy
+    ones for an entire run.
+
+    Deliberately NOT a hard stop for the backend. Observed 2026-08-12: credits
+    were added mid-sweep and the leg recovered on its own, 0 rows to 600, with
+    no operator action. Stopping would have thrown that away.
+    """
+
+
+#: Body markers that identify a 429 as a billing state rather than throttling.
+#: Matched against the error object's `type` and `code`, which is where the
+#: hosts put the machine-readable answer; the human message is captured for the
+#: log but never used to decide, since it is prose and changes without notice.
+QUOTA_MARKERS = (
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "billing_not_active",
+    "quota_exceeded",
+    "exceeded_current_quota",
+)
+
+
+def quota_failure_detail(response: httpx.Response) -> str | None:
+    """The host's own explanation if this response is a billing 429, else None.
+
+    Returns a STRING rather than a bool because the string is half the point.
+    Issue #52 was diagnosed only by probing the endpoint by hand: the run log
+    said `Client error '429 Too Many Requests'` and nothing else, while every
+    one of those responses carried `insufficient_quota` in a body the harness
+    read and discarded.
+
+    Unknown shapes return None — an unrecognised 429 is treated as throttling.
+    That is the conservative direction: backing off unnecessarily costs time,
+    while failing to back off a real rate limit makes it worse.
+    """
+    if response.status_code != 429:
+        return None
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(error, dict):
+        return None
+    kind = str(error.get("type") or "")
+    code = str(error.get("code") or "")
+    if not any(marker in kind or marker in code for marker in QUOTA_MARKERS):
+        return None
+    message = str(error.get("message") or "").strip()
+    label = "/".join(part for part in (kind, code) if part)
+    return f"{message} [{label}]" if message else label
+
+
 def rate_limit_penalty(exc: BaseException) -> float | None:
     """Seconds to hold the host back for, or None if `exc` is not a 429.
+
+    A QuotaExhausted is not an httpx.HTTPStatusError, so it falls out here
+    returning None — no host penalty. That is the intended path, not an
+    accident of typing.
 
     `Retry-After` is honored only when it is a finite, non-negative number of
     seconds, and is clamped to MAX_BACKOFF_S. Everything else falls back to the
@@ -469,6 +537,10 @@ class JudgeClient:
 
         path, body = build(self.backend, pair)
         response = self._http.post(path, json=body)
+        # Checked BEFORE raise_for_status, which discards the body and turns
+        # every 429 into the same opaque HTTPStatusError (issue #52).
+        if detail := quota_failure_detail(response):
+            raise QuotaExhausted(f"{self.backend.name} cannot bill for this call: {detail}")
         response.raise_for_status()
         payload = response.json()
         if resolved := payload.get("model"):
