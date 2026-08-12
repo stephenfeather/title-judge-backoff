@@ -144,6 +144,22 @@ def test_render_scenario_report_has_every_required_section():
     assert "ReadTimeout" in md
 
 
+def test_a_retired_reason_code_in_old_rows_is_labelled_as_retired():
+    # Issue #44. A run judged under v2 keeps its truncation_worse rows forever.
+    # Without the note there is no way to tell a code models DECLINED to use
+    # from one they were never offered, and a reader would compare its count
+    # against a v3 run as though both had the same menu.
+    by_model = {"a": votes("a", "p1", [("reject", "truncation_worse")] * 3)}
+    md = render_scenario_report(by_model, {})
+    assert "Retired code(s) present" in md
+    assert "`truncation_worse`" in md
+
+
+def test_no_retirement_note_when_every_code_is_current():
+    by_model = {"a": votes("a", "p1", [("reject", "casing_error")] * 3)}
+    assert "Retired code" not in render_scenario_report(by_model, {})
+
+
 def test_reliability_is_reported_before_any_quality_table():
     # Issue #43. Reliability can disqualify a backend outright, so a reader who
     # meets kappa or flip rates first has already formed a view of a judge that

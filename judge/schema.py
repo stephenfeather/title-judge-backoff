@@ -13,8 +13,31 @@ class ReasonCode(str, Enum):
     OVERCORRECTION = "overcorrection"
     MEANING_CHANGE = "meaning_change"
     CASING_ERROR = "casing_error"
-    TRUNCATION_WORSE = "truncation_worse"
+    TRUNCATION_WORSE = "truncation_worse"  # RETIRED — see RETIRED_REASON_CODES
     OK = "ok"
+
+
+#: Codes withdrawn from the rubric but kept in the enum, because verdict rows
+#: on disk still carry them and `verdict_from_json_line` would refuse to read a
+#: historical run without the member (issue #44).
+#:
+#: `truncation_worse` was retired at PROMPT_VERSION v3. It fired 4 times in
+#: ~13,800 votes, 3 of them from the degenerate floor model, and an audit of the
+#: 200-pair calibration set found no genuine truncation to fire on: exactly 3
+#: pairs drop an original token that abbreviation expansion cannot account for,
+#: and all 3 are expansions the tokenizer split ("W/SHEATH" -> "with Sheath",
+#: "B/C" -> "Birchwood Casey"). No dropped token anywhere in the corpus contains
+#: a digit, so no caliber, capacity, barrel length or model number is ever lost.
+#:
+#: Retired for THIS corpus, not judged wrong in general. A vendor feed that
+#: hard-truncates at ingestion would produce real cases; they are absent from
+#: these 200 rows.
+RETIRED_REASON_CODES = frozenset({ReasonCode.TRUNCATION_WORSE})
+
+#: The codes the rubric currently offers. Everything that presents a choice to a
+#: model or an operator derives from this, so a retirement cannot be honoured in
+#: one place and forgotten in another.
+ACTIVE_REASON_CODES = tuple(code for code in ReasonCode if code not in RETIRED_REASON_CODES)
 
 
 def _check_verdict(value: str) -> str:

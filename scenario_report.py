@@ -42,7 +42,7 @@ from judge.reliability import (
     render_coverage_bias_caveat,
     render_reliability_section,
 )
-from judge.schema import Verdict, verdict_from_json_line
+from judge.schema import RETIRED_REASON_CODES, Verdict, verdict_from_json_line
 from judge.vote import tally_votes
 
 
@@ -444,6 +444,34 @@ def _host_concentration_caveat(
     return lines
 
 
+def _retired_code_note(by_model: dict[str, list[Verdict]]) -> list[str]:
+    """Name any reason code in this run that the rubric no longer offers.
+
+    A run judged under an older PROMPT_VERSION keeps its rows, so a retired code
+    goes on appearing in the distribution above forever. Without this the reader
+    has no way to tell a code the models declined to use from one they were never
+    offered, and would compare its count against a current run as though the two
+    had the same menu (issue #44).
+    """
+    present = sorted(
+        {
+            v.reason.value
+            for verdicts in by_model.values()
+            for v in verdicts
+            if v.reason in RETIRED_REASON_CODES
+        }
+    )
+    if not present:
+        return []
+    return [
+        "",
+        f"**Retired code(s) present: {', '.join(f'`{c}`' for c in present)}.** These rows were",
+        "judged under an earlier prompt version that still offered the code; the",
+        "current rubric does not. Do not compare their counts against a run judged",
+        "under the current prompt — the two were offered different menus.",
+    ]
+
+
 def render_scenario_report(
     by_model: dict[str, list[Verdict]],
     manifests: dict[str, dict],
@@ -507,6 +535,7 @@ def render_scenario_report(
         dist = reason_distribution(verdicts)
         rendered = ", ".join(f"{k}={v}" for k, v in sorted(dist.items(), key=lambda kv: -kv[1]))
         lines.append(f"| {model} | {rendered} |")
+    lines += _retired_code_note(by_model)
 
     cross_tabs = _reason_cross_tab_sections(by_model)
     if cross_tabs:

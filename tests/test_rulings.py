@@ -10,7 +10,7 @@ import json
 import pytest
 
 from judge import rulings
-from judge.schema import ReasonCode
+from judge.schema import ACTIVE_REASON_CODES, RETIRED_REASON_CODES, ReasonCode
 
 
 def template_row(pair_id: str, cohort: str = "casing") -> dict:
@@ -29,9 +29,20 @@ def template_row(pair_id: str, cohort: str = "casing") -> dict:
 # --- reason keymap ------------------------------------------------------------
 
 
-def test_reason_keymap_covers_every_schema_code():
+def test_reason_keymap_covers_every_active_schema_code():
     keymap = rulings.reason_keymap()
-    assert set(keymap.values()) == set(ReasonCode)
+    assert set(keymap.values()) == set(ACTIVE_REASON_CODES)
+
+
+def test_reason_keymap_never_offers_a_retired_code():
+    # Issue #44's third question. A code the operator can still press but no
+    # model was ever offered turns every such ruling into a systematic miss
+    # attributed to the model — the asymmetric failure, and the expensive one,
+    # because it only shows up after 200 rows have been ruled.
+    offered = set(rulings.reason_keymap().values()) | set(
+        rulings.reject_reason_keymap().values()
+    )
+    assert not (offered & RETIRED_REASON_CODES)
 
 
 def test_reason_keymap_uses_single_keystrokes():
@@ -69,7 +80,9 @@ def test_key_pool_avoids_the_verdict_action_keys():
 def test_reject_keymap_excludes_ok():
     """`ok` is not a rejection rationale — it must not be offered on reject."""
     assert ReasonCode.OK not in rulings.reject_reason_keymap().values()
-    assert set(rulings.reject_reason_keymap().values()) == set(ReasonCode) - {ReasonCode.OK}
+    assert set(rulings.reject_reason_keymap().values()) == set(ACTIVE_REASON_CODES) - {
+        ReasonCode.OK
+    }
 
 
 # --- record builders ----------------------------------------------------------
