@@ -479,6 +479,8 @@ def _retired_code_note(by_model: dict[str, list[Verdict]]) -> list[str]:
             "different menus.",
         ]
     if current:
+        if historical:
+            lines.append("")
         lines += [
             f"**Retired code(s) on current-version ({PROMPT_VERSION}) rows: "
             f"{', '.join(f'`{c}`' for c in current)}.** {PROMPT_VERSION} never offered",

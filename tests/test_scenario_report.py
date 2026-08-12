@@ -185,6 +185,15 @@ def test_a_retired_code_on_a_current_version_row_is_flagged_as_a_contract_breach
     assert "never offered" in md
 
 
+def test_historical_and_current_retired_rows_get_separate_paragraphs():
+    old = votes("a", "p1", [("reject", "truncation_worse")])
+    current = [replace(old[0], prompt_version=PROMPT_VERSION)]
+    md = render_scenario_report({"a": old + current}, {})
+    assert "still offered the code" in md
+    assert "never offered" in md
+    assert "different menus.\n\n**Retired code(s) on current-version" in md
+
+
 def test_reliability_is_reported_before_any_quality_table():
     # Issue #43. Reliability can disqualify a backend outright, so a reader who
     # meets kappa or flip rates first has already formed a view of a judge that
