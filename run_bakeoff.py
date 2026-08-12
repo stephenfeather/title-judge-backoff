@@ -392,6 +392,22 @@ def accumulate_launches(
     return launches, cumulative
 
 
+def _nearest_rank(ordered: list[float], percentile: int) -> float | None:
+    """The nearest-rank percentile of an already-sorted list, or None if empty.
+
+    Nearest-rank rather than interpolation: every value returned is a latency
+    that was actually observed. An interpolated p95 is a number no call ever
+    took, which is a poor thing to quote when deciding whether a backend can
+    finish a 50k-product run.
+    """
+    if not ordered:
+        return None
+    # Ceiling division without importing math, then clamped: at n < 20 the 95th
+    # percentile rank exceeds the sample and the max is the honest answer.
+    rank = -(-percentile * len(ordered) // 100)
+    return ordered[min(rank, len(ordered)) - 1]
+
+
 def _health_summary(
     latencies: list[float], errors: list[str], failed_latencies: list[float] | None = None
 ) -> dict:
@@ -413,6 +429,12 @@ def _health_summary(
         "calls_failed": len(errors),
         "latency_min": ordered[0] if ordered else None,
         "latency_median": statistics.median(ordered) if ordered else None,
+        # The median says whether a backend is usable; the TAIL says whether it
+        # finishes (issue #43). Max is one call and can be a single fluke, so it
+        # cannot carry that on its own — nemotron's max is 5x its median off one
+        # sample. p95 is the slow-but-recurring case that sets wall clock at
+        # pack scale.
+        "latency_p95": _nearest_rank(ordered, 95),
         "latency_max": ordered[-1] if ordered else None,
         "failed_latency_median": statistics.median(failed) if failed else None,
         "failed_latency_max": failed[-1] if failed else None,

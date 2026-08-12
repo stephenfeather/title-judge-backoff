@@ -11,6 +11,10 @@ not computable. Everything here is what IS measurable without ground truth:
     separately, because effort was measured to move the reason while leaving
     the binary verdict alone;
   * cross-model agreement — where the candidate judges actually diverge;
+  * reliability — attempts, failures by kind and latency tail per backend,
+    reported as a selection criterion rather than left to be inferred from a
+    coverage percentage, since a judge that cannot sustain the call volume is
+    disqualified however well it agrees;
   * operational health — latency distribution and error kinds per backend;
   * a ruling queue — items ranked by how contested they are, which is the
     handoff to the operator's ruling session. Contested items are where the
@@ -32,6 +36,12 @@ from pathlib import Path
 from judge.agreement import agreement_matrix, reason_cross_tab, reason_distribution
 from judge.cache_collapse import cache_findings, render_cache_warning
 from judge.deadlocks import backend_deadlocks, deadlock_records, render_deadlock_section
+from judge.reliability import (
+    coverage_shapes,
+    reliability_rows,
+    render_coverage_bias_caveat,
+    render_reliability_section,
+)
 from judge.schema import Verdict, verdict_from_json_line
 from judge.vote import tally_votes
 
@@ -462,6 +472,16 @@ def render_scenario_report(
         # majority. Deliberately quieter than the card's UNDECIDED marker,
         # which means the whole slate deadlocked (issue #23).
         *render_deadlock_section(backend_deadlocks(by_model, leg=leg)),
+        # Reliability sits ABOVE every quality table, for the same reason the
+        # cache warning does: it can disqualify a backend outright, and a reader
+        # who meets kappa first has already formed a view of a judge that cannot
+        # produce enough judgments to hold one (issue #43).
+        *render_reliability_section(reliability_rows(by_model, manifests)),
+        # And immediately before the quality tables, not in the caveats at the
+        # bottom — "say so at the point its quality numbers are shown". A caveat
+        # printed afterwards arrives once the reader has already believed the
+        # table.
+        *render_coverage_bias_caveat(coverage_shapes(by_model)),
         "## Stability (within-model, across repeated votes)",
         "",
         "Verdict and reason flips are tracked separately: a model can be perfectly",
@@ -507,7 +527,9 @@ def render_scenario_report(
         "## Operational health",
         "",
         "Per-LAUNCH figures, not cumulative — see Caveats below before reading",
-        "these as completion.",
+        "these as completion. The Reliability section above is the cumulative",
+        "view; this one adds the per-launch detail it deliberately omits (min/max,",
+        "failed-call latency, observed model snapshots).",
         "",
         *(_health_table(manifests) if manifests else ["_No manifests found._"]),
         "",
