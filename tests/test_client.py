@@ -21,7 +21,7 @@ from judge.client import (
     rate_limit_penalty,
 )
 from judge.prompts import PROMPT_VERSION
-from judge.schema import Pair, ReasonCode
+from judge.schema import ACTIVE_REASON_CODES, Pair, ReasonCode
 
 BACKENDS_TOML = """\
 [[backends]]
@@ -630,13 +630,11 @@ def test_structured_output_sends_strict_json_schema_enum(monkeypatch):
     assert schema["strict"] is True
     props = schema["schema"]["properties"]
     assert props["verdict"]["enum"] == ["approve", "reject"]
-    assert set(props["reason"]["enum"]) == {
-        "overcorrection",
-        "meaning_change",
-        "casing_error",
-        "truncation_worse",
-        "ok",
-    }
+    # The ACTIVE set, not the full enum: strict mode masks logits to
+    # schema-legal tokens, so a retired code listed here would stay sampleable
+    # while the prompt no longer describes it — half a retirement (issue #44).
+    # Derived rather than pinned so a future retirement cannot re-open the gap.
+    assert set(props["reason"]["enum"]) == {c.value for c in ACTIVE_REASON_CODES}
     assert schema["schema"]["additionalProperties"] is False
 
 

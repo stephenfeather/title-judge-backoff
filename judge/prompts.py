@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import re
 
-from judge.schema import ReasonCode, _check_verdict
+from judge.schema import ACTIVE_REASON_CODES, ReasonCode, _check_verdict
 
 PROMPT_VERSION = "v3"
 
@@ -159,9 +159,14 @@ def parse_judge_response(text: str) -> tuple[str, ReasonCode]:
     Tolerates surrounding prose and markdown code fences; raises
     JudgeResponseError if no well-formed verdict object can be found.
 
-    All four failure shapes — no JSON, malformed JSON, a non-verdict in the
-    verdict field, an unknown reason code — raise the SAME type. They are one
-    finding: the model did not honour the contract. Splitting them across
+    All five failure shapes — no JSON, malformed JSON, a non-verdict in the
+    verdict field, an unknown reason code, a RETIRED reason code — raise the
+    SAME type. They are one finding: the model did not honour the contract it
+    was given. The prompt does not offer retired codes, so a reply carrying
+    one is not a historical row to preserve (those never pass through here) —
+    it is a live contract breach, and must count with the others in
+    error_kinds rather than enter the v3 reason distribution as a code the
+    model was never offered (issue #44). Splitting any of these across
     different exception names would scatter one compliance rate across several
     rows of error_kinds.
     """
@@ -175,6 +180,8 @@ def parse_judge_response(text: str) -> tuple[str, ReasonCode]:
     try:
         verdict = _check_verdict(record.get("verdict"))
         reason = ReasonCode(record.get("reason"))
+        if reason not in ACTIVE_REASON_CODES:
+            raise ValueError(f"reason code {reason.value!r} is retired and not offered")
     except ValueError as exc:
         # _check_verdict and ReasonCode() both raise plain ValueError. Re-raise
         # under this type so the count lands with the other contract failures.

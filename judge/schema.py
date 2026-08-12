@@ -25,9 +25,10 @@ class ReasonCode(str, Enum):
 #: ~13,800 votes, 3 of them from the degenerate floor model, and an audit of the
 #: 200-pair calibration set found no genuine truncation to fire on: exactly 3
 #: pairs drop an original token that abbreviation expansion cannot account for,
-#: and all 3 are expansions the tokenizer split ("W/SHEATH" -> "with Sheath",
-#: "B/C" -> "Birchwood Casey"). No dropped token anywhere in the corpus contains
-#: a digit, so no caliber, capacity, barrel length or model number is ever lost.
+#: and all 3 are expansions the audit tokenizer split on "/" (two "/sheath"
+#: forms and one brand initialism). No dropped token anywhere in the corpus
+#: contains a digit, so no caliber, capacity, barrel length or model number is
+#: ever lost.
 #:
 #: Retired for THIS corpus, not judged wrong in general. A vendor feed that
 #: hard-truncates at ingestion would produce real cases; they are absent from

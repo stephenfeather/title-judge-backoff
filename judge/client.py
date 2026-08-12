@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 import httpx
 
 from judge.prompts import PROMPT_VERSION, build_messages, parse_judge_response
-from judge.schema import VALID_VERDICTS, Pair, ReasonCode, Verdict, usage_from_payload
+from judge.schema import ACTIVE_REASON_CODES, VALID_VERDICTS, Pair, Verdict, usage_from_payload
 
 MAX_TOKENS = 256  # a verdict object is tiny; Anthropic requires the field
 ANTHROPIC_VERSION = "2023-06-01"
@@ -336,7 +336,12 @@ VERDICT_JSON_SCHEMA = {
         "type": "object",
         "properties": {
             "verdict": {"type": "string", "enum": list(VALID_VERDICTS)},
-            "reason": {"type": "string", "enum": [rc.value for rc in ReasonCode]},
+            # ACTIVE codes, not the full enum: in strict mode the schema masks
+            # logits to these tokens, so listing a retired code would keep it
+            # sampleable while the prompt no longer describes it — the
+            # retirement would be honoured everywhere except the one channel
+            # that enforces it (issue #44).
+            "reason": {"type": "string", "enum": [rc.value for rc in ACTIVE_REASON_CODES]},
         },
         "required": ["verdict", "reason"],
         "additionalProperties": False,

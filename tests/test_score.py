@@ -260,6 +260,25 @@ def test_render_leaderboard_sorted_by_kappa():
     assert "kappa" in md.lower()
 
 
+def test_reason_confusion_labels_a_retired_code_on_either_axis():
+    # Issue #44. A pre-v3 ruling journal can carry truncation_worse on the
+    # ground-truth axis, and a pre-v3 run carries it on the judged axis; either
+    # makes every cell in its row/column a systematic miss against a rubric
+    # that no longer offers the code. Without the label a reader cannot tell
+    # those misses from genuine disagreement.
+    pairs = PAIRS + [make_pair("p5", "reject", "truncation_worse")]
+    verdicts = [make_verdict(p.id, p.ground_truth, p.reason.value) for p in pairs]
+    md = render_leaderboard([score_model(pairs, verdicts)])
+    assert "truncation_worse" in md
+    assert "retired" in md
+
+
+def test_reason_confusion_has_no_retired_label_when_no_retired_code_is_present():
+    verdicts = [make_verdict(p.id, p.ground_truth, p.reason.value) for p in PAIRS]
+    md = render_leaderboard([score_model(PAIRS, verdicts)])
+    assert "retired" not in md
+
+
 # --- majority voting, spread, and flip rates -------------------------------
 
 

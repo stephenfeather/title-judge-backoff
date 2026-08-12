@@ -42,6 +42,7 @@ from judge.reliability import (
     render_coverage_bias_caveat,
     render_reliability_section,
 )
+from judge.prompts import PROMPT_VERSION
 from judge.schema import RETIRED_REASON_CODES, Verdict, verdict_from_json_line
 from judge.vote import tally_votes
 
@@ -452,24 +453,40 @@ def _retired_code_note(by_model: dict[str, list[Verdict]]) -> list[str]:
     has no way to tell a code the models declined to use from one they were never
     offered, and would compare its count against a current run as though the two
     had the same menu (issue #44).
+
+    The scan is over raw VOTES, while the distribution table above counts
+    settled majorities — a code that fired only in scattered minority votes is
+    still named here, which is why the note says "appeared in votes" rather
+    than pointing at counts the table may not render. Rows are split on the
+    prompt version actually recorded on them rather than assumed: a retired
+    code on a CURRENT-version row is not history, it is a model that emitted
+    a code it was never offered, and the note must not claim otherwise.
     """
-    present = sorted(
-        {
-            v.reason.value
-            for verdicts in by_model.values()
-            for v in verdicts
-            if v.reason in RETIRED_REASON_CODES
-        }
-    )
-    if not present:
-        return []
-    return [
-        "",
-        f"**Retired code(s) present: {', '.join(f'`{c}`' for c in present)}.** These rows were",
-        "judged under an earlier prompt version that still offered the code; the",
-        "current rubric does not. Do not compare their counts against a run judged",
-        "under the current prompt — the two were offered different menus.",
+    rows = [
+        v for verdicts in by_model.values() for v in verdicts if v.reason in RETIRED_REASON_CODES
     ]
+    if not rows:
+        return []
+    historical = sorted({v.reason.value for v in rows if v.prompt_version != PROMPT_VERSION})
+    current = sorted({v.reason.value for v in rows if v.prompt_version == PROMPT_VERSION})
+    lines = [""]
+    if historical:
+        lines += [
+            f"**Retired code(s) present: {', '.join(f'`{c}`' for c in historical)}.** These rows",
+            "were judged under an earlier prompt version that still offered the code; the",
+            "current rubric does not. The code appeared in votes, so do not compare its",
+            "counts against a run judged under the current prompt — the two were offered",
+            "different menus.",
+        ]
+    if current:
+        lines += [
+            f"**Retired code(s) on current-version ({PROMPT_VERSION}) rows: "
+            f"{', '.join(f'`{c}`' for c in current)}.** {PROMPT_VERSION} never offered",
+            "these codes, so each such row is a model emitting a code it was never",
+            "offered — the contract breach the parse path exists to refuse — not",
+            "evidence the code describes something in this corpus.",
+        ]
+    return lines
 
 
 def render_scenario_report(
