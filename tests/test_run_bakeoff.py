@@ -388,6 +388,31 @@ def test_a_stopped_backend_spends_nothing(tmp_path):
     assert client.calls == [], "a stopped run must not spend a single call"
 
 
+def test_a_stop_arriving_during_the_rate_limit_wait_is_still_honoured(tmp_path):
+    # The window the first stop check cannot cover: the worker passed it, then
+    # blocked in limiter.wait(). That wait is not brief — the sleep is held
+    # under the shared host lock, so every worker on the host queues behind it
+    # one interval apart, and a 429 penalty extends it further. Admitting a
+    # worker must not commit it to spending.
+    stop = threading.Event()
+    client = FakeClient(concurrency_backend())
+    # Fires on the second call, once the limiter has a _last to space from:
+    # the operator's Ctrl-C landing while this worker sits in wait().
+    limiters = LimiterRegistry(sleep=lambda _: stop.set())
+    run_backend(
+        concurrency_backend(rpm=60),
+        [make_pair(f"p{i}") for i in range(5)],
+        tmp_path,
+        votes=1,
+        limiters=limiters,
+        stop=stop,
+        client_factory=lambda b: client,
+    )
+    assert len(client.calls) == 1, (
+        f"the worker spent a call it was admitted for after the stop: {len(client.calls)}"
+    )
+
+
 def test_an_interrupt_stops_the_backends_that_are_already_running(tmp_path):
     # Issue #42. cancel_futures alone only drops backends that have not STARTED;
     # at --concurrency 8 eight are already inside their own pools and would keep

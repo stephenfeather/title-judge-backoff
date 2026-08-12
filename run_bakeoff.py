@@ -812,6 +812,17 @@ def run_backend(
             raise WriterGone(f"results writer died: {writer.failure!r}")
         i = health.claim_attempt()
         limiter.wait()
+        # Checked AGAIN, because admission is not brief and not instant. The
+        # limiter sleeps while holding the shared host lock, so workers queue
+        # one interval apart — five of this slate's backends share
+        # api.deepinfra.com — and a 429 penalty holds every one of them back
+        # further still. A worker can therefore enter wait() before the
+        # interrupt and be admitted well after it. Being admitted is permission
+        # to send, not an obligation: the money is spent on the next line.
+        #
+        # The limiter is untouched. Its lock is already released here.
+        if stop is not None and stop.is_set():
+            return
         started = time.monotonic()
         try:
             verdict = client.judge(pair, run_index=run_index)
