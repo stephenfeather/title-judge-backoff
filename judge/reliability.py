@@ -274,16 +274,36 @@ class CoverageShape:
         return self.distinct_pairs >= self.total_pairs
 
     @property
+    def stopped_early(self) -> bool:
+        """Whether the backend's furthest pair falls short of the end of the file.
+
+        This is what separates a prefix from a set of holes, and the first
+        version of `is_prefix` missed it. Gap COUNT cannot tell them apart: a
+        backend that stopped at pair 100 having missed one, and a backend that
+        ran all 200 having missed one, have identical gap counts and opposite
+        meanings.
+        """
+        return self.span < self.total_pairs
+
+    @property
     def is_prefix(self) -> bool:
         """Whether the completed rows form a contiguous run from the start.
 
         Measured, not assumed. A partial backend whose rows are genuinely spread
         across the file IS closer to a sample, and calling that a prefix would be
         a claim the data refutes.
+
+        Two conditions, and the first is the one that was missing. The 2026-08-12
+        v3 sweep produced backends at 197/200 whose furthest pair was position
+        200 — they finished the file and dropped a few pairs to transient errors.
+        The slack test alone passed them (197 x 1.1 = 216, above the whole
+        200-pair set), so ANY backend past ~91% coverage was labelled a prefix
+        regardless of shape, and the report claimed cohort skew that was not
+        there.
         """
         if self.complete:
             return False
-        return self.span <= self.distinct_pairs * PREFIX_SLACK
+        return self.stopped_early and self.span <= self.distinct_pairs * PREFIX_SLACK
 
 
 def _reconstructed_order(by_model: dict[str, list]) -> list[str]:
@@ -377,24 +397,39 @@ def render_coverage_bias_caveat(shapes: list[CoverageShape]) -> list[str]:
     if not partial:
         return []
     lines = [
-        "### Partial backends are measured on a biased subset, not a sample",
+        "### Partial backends are measured on less than the full set",
         "",
-        "Votes are attempted in pairs-file order, so a backend that degrades",
-        "partway through completes a contiguous **prefix** of the file. The",
-        "calibration set is ordered by cohort — most-changed first, then",
-        "quarantined-brand, then representative, then unchanged — so a prefix is a",
-        "cohort skew, not a random sample.",
+        "Every quality number below for these backends is computed over a subset,",
+        "so comparing it against a complete backend's full-set figures is not",
+        "quite like-for-like. **How much that matters depends on the shape**, which",
+        "is why the shape is measured rather than assumed:",
         "",
-        "Every quality number below for these backends is computed over that",
-        "subset. Comparing it against a complete backend's full-set figures is not",
-        "like-for-like, and the direction of the bias depends on which cohorts the",
-        "prefix happened to reach.",
+        "- **contiguous prefix** — the backend stopped partway through. Votes are",
+        "  attempted in pairs-file order and the calibration set is ordered by",
+        "  cohort (most-changed, quarantined-brand, representative, unchanged), so",
+        "  a prefix is a **cohort skew**, not a random sample. This is the case",
+        "  that can move a number materially, and the direction depends on which",
+        "  cohorts it reached.",
+        "- **spread, stopped early** — stopped short, but with holes throughout.",
+        "  Weaker cohort skew than a clean prefix.",
+        "- **scattered gaps, ran to the end** — the backend covered the whole file",
+        "  and lost individual calls along the way. There is no cohort story here;",
+        "  read it as a handful of failed calls, and check the reliability table",
+        "  above for why they failed.",
         "",
         "| Backend | Pairs judged | Of | Reaches position | Shape |",
         "|---|---|---|---|---|",
     ]
     for s in partial:
-        shape = "contiguous prefix" if s.is_prefix else "spread across the set"
+        if s.is_prefix:
+            shape = "contiguous prefix"
+        elif s.stopped_early:
+            shape = "spread, stopped early"
+        else:
+            # Ran the whole file and lost a few calls on the way. Neither of the
+            # other two labels fits, and both imply a sampling story where the
+            # honest answer is "some calls failed".
+            shape = "scattered gaps, ran to the end"
         lines.append(
             f"| {s.backend} | {s.distinct_pairs} | {s.total_pairs} | {s.span} | {shape} |"
         )
