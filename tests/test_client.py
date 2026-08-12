@@ -630,12 +630,11 @@ def test_structured_output_sends_strict_json_schema_enum(monkeypatch):
     assert schema["strict"] is True
     props = schema["schema"]["properties"]
     assert props["verdict"]["enum"] == ["approve", "reject"]
-    # ACTIVE codes only (issue #44). Strict mode masks logits to schema-legal
-    # tokens, so listing a retired code here does not merely permit it — it
-    # instructs the model that the code is available, in direct contradiction of
-    # the prompt and the ruling UI.
+    # The ACTIVE set, not the full enum: strict mode masks logits to
+    # schema-legal tokens, so a retired code listed here would stay sampleable
+    # while the prompt no longer describes it — half a retirement (issue #44).
+    # Derived rather than pinned so a future retirement cannot re-open the gap.
     assert set(props["reason"]["enum"]) == {c.value for c in ACTIVE_REASON_CODES}
-    assert "truncation_worse" not in props["reason"]["enum"]
     assert schema["schema"]["additionalProperties"] is False
 
 
