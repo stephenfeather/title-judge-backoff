@@ -94,6 +94,20 @@ def load_results(results_dir: Path) -> dict[str, list[Verdict]]:
     }
 
 
+def load_pair_order(pairs_path: Path) -> list[str]:
+    """Pair ids in calibration-file order — the authoritative sequence.
+
+    Reads only `id`, deliberately: this loads a file of vendor-derived titles
+    purely to learn their ORDER, and nothing else about them needs to be in
+    memory or in a report.
+    """
+    return [
+        json.loads(line)["id"]
+        for line in pairs_path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
 def load_manifests(results_dir: Path) -> dict[str, dict]:
     return {
         path.name.removesuffix(".manifest.json"): json.loads(path.read_text())
@@ -450,9 +464,21 @@ def render_scenario_report(
     *,
     queue_size: int = 40,
     leg: str = "",
+    pair_order: list[str] | None = None,
 ) -> str:
     ranking = contention_ranking(by_model)
     contested = [r for r in ranking if r.contention > 0]
+    shapes = coverage_shapes(
+        by_model,
+        pair_order=pair_order,
+        # Every manifest records the pair count it was launched against. Taking
+        # the largest guards the case where the only backend that reached the
+        # tail of the set is the one that wrote no manifest.
+        total_pairs=max(
+            (m["n_pairs"] for m in manifests.values() if isinstance(m.get("n_pairs"), int)),
+            default=None,
+        ),
+    )
 
     lines = [
         "# Scenario report",
@@ -481,7 +507,7 @@ def render_scenario_report(
         # bottom — "say so at the point its quality numbers are shown". A caveat
         # printed afterwards arrives once the reader has already believed the
         # table.
-        *render_coverage_bias_caveat(coverage_shapes(by_model)),
+        *render_coverage_bias_caveat(shapes),
         "## Stability (within-model, across repeated votes)",
         "",
         "Verdict and reason flips are tracked separately: a model can be perfectly",
@@ -569,18 +595,36 @@ def main() -> None:
     parser.add_argument("--results", type=Path, required=True, help="directory of verdict .jsonl files")
     parser.add_argument("--out", type=Path, default=Path("scenario-report.md"))
     parser.add_argument("--queue-size", type=int, default=40, help="rows in the ruling queue")
+    parser.add_argument(
+        "--pairs",
+        type=Path,
+        help=(
+            "the calibration pairs .jsonl this run judged. Optional but "
+            "recommended: it is the only authoritative source of pairs-file "
+            "order and set size, both of which the coverage-bias caveat needs. "
+            "Without it they are reconstructed from results order, which a "
+            "concurrent run scrambles, and the report says so."
+        ),
+    )
     args = parser.parse_args()
 
     by_model = load_results(args.results)
     if not by_model:
         parser.error(f"no verdict files found in {args.results}")
     manifests = load_manifests(args.results)
+    pair_order = load_pair_order(args.pairs) if args.pairs else None
     # The leg is the results directory: scenario_report is invoked once per leg,
     # and the same backend runs in s1 and in each s2-* leg. Recording it keeps
     # those four populations apart in the audit trail (issue #23).
     leg = args.results.resolve().name
     args.out.write_text(
-        render_scenario_report(by_model, manifests, queue_size=args.queue_size, leg=leg)
+        render_scenario_report(
+            by_model,
+            manifests,
+            queue_size=args.queue_size,
+            leg=leg,
+            pair_order=pair_order,
+        )
     )
     print(f"wrote {args.out} ({len(by_model)} backends)")
 

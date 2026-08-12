@@ -220,3 +220,74 @@ def test_reference_order_is_the_most_complete_backend():
 
 def test_coverage_shapes_is_empty_without_verdicts():
     assert coverage_shapes({}) == []
+
+
+# --- the pairs file is authoritative when it is available ---------------------
+
+
+def test_the_pairs_file_order_wins_over_arrival_order():
+    # Rows are appended when their HTTP call RETURNS, so at --concurrency > 1 a
+    # results file records completion order, not pairs-file order. Reconstructing
+    # from it can shuffle a genuine cohort prefix past the slack and report it as
+    # "spread across the set", suppressing the very warning this exists to raise.
+    order = [f"p{i}" for i in range(10)]
+    scrambled = ["p3", "p0", "p2", "p1"]  # what a concurrent run actually wrote
+    shapes = coverage_shapes(
+        {"full": rows(order), "partial": rows(scrambled)}, pair_order=order
+    )
+    partial = next(s for s in shapes if s.backend == "partial")
+    assert partial.span == 4, "ranks must come from the pairs file, not arrival"
+    assert partial.is_prefix is True
+    assert partial.order_source == "pairs-file"
+
+
+def test_the_pairs_file_also_supplies_the_universe():
+    order = [f"p{i}" for i in range(10)]
+    shapes = coverage_shapes({"a": rows(order[:3])}, pair_order=order)
+    assert shapes[0].total_pairs == 10
+    assert shapes[0].complete is False
+
+
+def test_order_is_marked_reconstructed_when_no_pairs_file_is_given():
+    # Absent, not wrong — but the reader must be able to tell.
+    shapes = coverage_shapes({"a": rows(["p0", "p1"])})
+    assert shapes[0].order_source == "reconstructed"
+
+
+# --- the observed union is not the universe -----------------------------------
+
+
+def test_the_manifest_pair_count_supplies_the_universe_when_all_backends_died():
+    # The failure that hides itself: if EVERY backend stopped at the same point,
+    # the observed union is a prefix of the real set, so the most-complete
+    # backend looks complete and no bias caveat renders at all — precisely when
+    # every backend's numbers are skewed.
+    shapes = coverage_shapes(
+        {"a": rows(["p0", "p1"]), "b": rows(["p0"])},
+        total_pairs=200,
+    )
+    a = next(s for s in shapes if s.backend == "a")
+    assert a.total_pairs == 200
+    assert a.complete is False
+    assert a.universe_source == "manifest"
+
+
+def test_the_observed_union_is_labelled_as_such_when_nothing_better_exists():
+    shapes = coverage_shapes({"a": rows(["p0", "p1"])})
+    assert shapes[0].universe_source == "observed"
+    assert shapes[0].total_pairs == 2
+
+
+def test_a_stale_manifest_count_never_shrinks_the_observed_universe():
+    # More rows than the manifest claims means the manifest is stale, not that
+    # the extra pairs are imaginary. Taking the smaller number would report a
+    # backend as complete while hiding rows it actually judged.
+    shapes = coverage_shapes({"a": rows(["p0", "p1", "p2"])}, total_pairs=2)
+    assert shapes[0].total_pairs == 3
+
+
+def test_the_bias_caveat_states_where_the_order_and_universe_came_from():
+    shapes = coverage_shapes({"a": rows(["p0"])}, total_pairs=10)
+    text = "\n".join(render_coverage_bias_caveat(shapes))
+    assert "reconstructed" in text
+    assert "manifest" in text

@@ -262,6 +262,12 @@ class CoverageShape:
     #: Equal to `distinct_pairs` for a contiguous prefix; equal to `total_pairs`
     #: for rows spread across the whole set.
     span: int
+    #: "pairs-file" when ranks came from the calibration file, "reconstructed"
+    #: when they were inferred from results order. Reported because the two are
+    #: not equally trustworthy — see `coverage_shapes`.
+    order_source: str = "reconstructed"
+    #: Where `total_pairs` came from: "pairs-file", "manifest", or "observed".
+    universe_source: str = "observed"
 
     @property
     def complete(self) -> bool:
@@ -280,16 +286,14 @@ class CoverageShape:
         return self.span <= self.distinct_pairs * PREFIX_SLACK
 
 
-def coverage_shapes(by_model: dict[str, list]) -> list[CoverageShape]:
-    """How each backend's rows are positioned within the pairs file.
+def _reconstructed_order(by_model: dict[str, list]) -> list[str]:
+    """Pairs-file order inferred from results, best effort.
 
-    The file order is recovered from the results themselves: rows are appended
-    as they are judged, and votes are submitted in pairs-file order, so the
-    backend that saw the most pairs reveals that order. Ranking against a less
-    complete backend would mislabel a prefix.
+    Rows are appended when their call RETURNS, so at --concurrency > 1 a results
+    file records completion order rather than submission order. The backend that
+    saw the most pairs is used as the reference, and every pair only other
+    backends saw is appended after it — unrankable, but still real.
     """
-    if not by_model:
-        return []
     reference_name = max(sorted(by_model), key=lambda n: len({v.pair_id for v in by_model[n]}))
     order: list[str] = []
     seen: set[str] = set()
@@ -297,13 +301,57 @@ def coverage_shapes(by_model: dict[str, list]) -> list[CoverageShape]:
         if v.pair_id not in seen:
             seen.add(v.pair_id)
             order.append(v.pair_id)
-    # Pairs no backend in the reference saw still exist and still count toward
-    # the total; they simply cannot be ranked, so they go last.
     for name in sorted(by_model):
         for pair_id in sorted({v.pair_id for v in by_model[name]} - seen):
             seen.add(pair_id)
             order.append(pair_id)
+    return order
+
+
+def coverage_shapes(
+    by_model: dict[str, list],
+    *,
+    pair_order: list[str] | None = None,
+    total_pairs: int | None = None,
+) -> list[CoverageShape]:
+    """How each backend's rows are positioned within the pairs file.
+
+    `pair_order` — the calibration file's ids, in file order — is authoritative
+    and should be passed whenever it is available. Without it the order is
+    reconstructed from the results, which is only an approximation: rows are
+    appended when their HTTP call returns, so at --concurrency > 1 a file records
+    COMPLETION order. A genuine cohort prefix can be shuffled past `PREFIX_SLACK`
+    that way and reported as "spread across the set", suppressing the warning.
+
+    `total_pairs` — the manifests' `n_pairs` — is the universe when no pairs file
+    is given. Without it the observed union stands in, and that is wrong in the
+    case that matters most: if EVERY backend stopped at the same point, the union
+    is itself a prefix, the most-complete backend measures as complete, and no
+    bias caveat renders at all. The observed count is still a floor, since a
+    stale manifest must never shrink a set below the rows actually on disk.
+    """
+    if not by_model:
+        return []
+    if pair_order:
+        order = list(pair_order)
+        order_source, universe_source = "pairs-file", "pairs-file"
+    else:
+        order = _reconstructed_order(by_model)
+        order_source = "reconstructed"
+        universe_source = "manifest" if total_pairs else "observed"
     rank = {pair_id: i for i, pair_id in enumerate(order)}
+
+    # Anything judged but absent from the reference (a pairs file that has moved
+    # on, say) still happened. Rank it after everything known rather than drop it.
+    for name in sorted(by_model):
+        for pair_id in sorted({v.pair_id for v in by_model[name]} - set(rank)):
+            rank[pair_id] = len(rank)
+
+    universe = max(len(order), len(rank), total_pairs or 0)
+    if universe > len(rank):
+        # The manifest knows about pairs nobody reached. They are unrankable but
+        # they are in the denominator, which is the entire point.
+        universe_source = "manifest" if pair_order is None else "pairs-file"
 
     shapes = []
     for name in sorted(by_model):
@@ -314,8 +362,10 @@ def coverage_shapes(by_model: dict[str, list]) -> list[CoverageShape]:
             CoverageShape(
                 backend=name,
                 distinct_pairs=len(ids),
-                total_pairs=len(order),
+                total_pairs=universe,
                 span=max(rank[p] for p in ids) + 1,
+                order_source=order_source,
+                universe_source=universe_source,
             )
         )
     return shapes
@@ -354,7 +404,26 @@ def render_coverage_bias_caveat(shapes: list[CoverageShape]) -> list[str]:
         "sits. Equal to the pairs judged means a clean prefix; close to the total",
         "means the rows are spread out and the cohort skew is weaker.",
         "",
-        "File order is recovered from the backend that judged the most pairs.",
-        "",
     ]
+    order_source = partial[0].order_source
+    universe_source = partial[0].universe_source
+    if order_source == "pairs-file":
+        lines.append("Positions are ranked against the calibration file itself.")
+    else:
+        lines += [
+            "Positions are **reconstructed** from results order, not read from the",
+            "calibration file: rows are appended when their call returns, so a",
+            "concurrent run records completion order. Treat `Shape` as indicative.",
+            "Pass `--pairs` to rank against the file itself.",
+        ]
+    if universe_source == "observed":
+        lines += [
+            "",
+            "The total is the **observed** union of judged pairs, not a known set size.",
+            "If every backend stopped at the same point, that union is itself a prefix",
+            "and this table understates how much of the set is missing.",
+        ]
+    elif universe_source == "manifest":
+        lines.append("The total comes from the manifests' recorded pair count.")
+    lines.append("")
     return lines
