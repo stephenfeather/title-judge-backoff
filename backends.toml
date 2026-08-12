@@ -90,16 +90,27 @@ eval_only = false
 role = "contender"
 api_key_env = "DEEPINFRA_API_KEY"
 
-# Rescues a model NVIDIA never let this account invoke (404 entitlement gap,
-# five days unfixed). DeepInfra serves it, so the capability arrives here.
-[[backends]]
-name = "deepinfra-kimi-k2.6"
-base_url = "https://api.deepinfra.com/v1/openai"
-model_id = "moonshotai/Kimi-K2.6"
-rpm = 60
-eval_only = false
-role = "contender"
-api_key_env = "DEEPINFRA_API_KEY"
+# DROPPED FROM THE SLATE (2026-08-11): moonshotai/Kimi-K2.6 is entitled,
+# reachable, and too slow to use. Removed after the v2 sweep, on measurement
+# rather than impression.
+#
+# It reached ~255 of 600 votes and did not converge under repeated resume: a
+# full resume pass recovered a handful of rows against several hundred owed. Its
+# median latency on REAL corpus pairs was 108.5s against a 180s ceiling, versus
+# 0.47s for deepseek-v4-flash and 12.05s for nemotron on the same host. That is
+# not a queueing artefact — it timed out just the same when it was the only
+# backend with pairs left, and again on a serial pass.
+#
+# Its 97 settled verdicts are NOT salvageable as a sample. Votes are attempted
+# in pairs-file order and the corpus is cohort-ordered (most-changed,
+# quarantined-brand, representative, unchanged), so what it completed is a
+# contiguous PREFIX — the scenario report measures it at 99 pairs reaching
+# position 101 of 200. Quality numbers over that subset cannot be compared
+# against a complete backend's.
+#
+# Kimi is being written up as frontier-class. On this workload, for this
+# account, it is not. Re-add only if a measured p50 on real corpus input lands
+# in the same order as the rest of the slate.
 
 # NOT IN THE SLATE (2026-08-11): moonshotai/Kimi-K3 on DeepInfra is RATE
 # LIMITED for this account, not broken. Measured on 8 real corpus pairs, one at
