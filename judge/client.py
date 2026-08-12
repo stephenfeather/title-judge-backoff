@@ -336,11 +336,11 @@ VERDICT_JSON_SCHEMA = {
         "type": "object",
         "properties": {
             "verdict": {"type": "string", "enum": list(VALID_VERDICTS)},
-            # ACTIVE codes, not the full enum: in strict mode the schema masks
-            # logits to these tokens, so listing a retired code would keep it
-            # sampleable while the prompt no longer describes it — the
-            # retirement would be honoured everywhere except the one channel
-            # that enforces it (issue #44).
+            # ACTIVE codes, not the whole enum. Strict mode masks logits to
+            # schema-legal tokens, so a retired code listed here is not merely
+            # permitted — the model is TOLD it is available, contradicting the
+            # prompt and the ruling UI in the same request (issue #44). The full
+            # enum survives only for reading historical rows off disk.
             "reason": {"type": "string", "enum": [rc.value for rc in ACTIVE_REASON_CODES]},
         },
         "required": ["verdict", "reason"],

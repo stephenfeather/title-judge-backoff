@@ -181,18 +181,16 @@ def test_parse_judge_response_rejects_garbage():
         parse_judge_response("I approve of this title.")
 
 
+def test_parse_judge_response_rejects_a_retired_reason_code():
+    # The other half of the retirement (issue #44). A v3 model returning
+    # truncation_worse returned a code it was never offered — a contract
+    # violation, not a verdict. Accepting it would write a v3 row carrying a
+    # retired code, which corrupts the reason distribution AND makes the
+    # report's retirement note misattribute the row to an earlier prompt.
+    with pytest.raises(JudgeResponseError):
+        parse_judge_response('{"verdict": "reject", "reason": "truncation_worse"}')
+
+
 def test_parse_judge_response_rejects_unknown_reason():
     with pytest.raises(ValueError):
         parse_judge_response('{"verdict": "approve", "reason": "vibes"}')
-
-
-def test_parse_judge_response_refuses_a_retired_reason_code():
-    # Issue #44. A retired code is still a valid ENUM member — verdict rows on
-    # disk carry it and must keep loading — but the v3 prompt does not offer
-    # it, so a live reply carrying it did not honour the contract it was
-    # given. That is the same finding as any other unknown reason, and must
-    # count with them in error_kinds rather than enter the v3 reason
-    # distribution as a code the model was never offered.
-    for code in RETIRED_REASON_CODES:
-        with pytest.raises(JudgeResponseError):
-            parse_judge_response(f'{{"verdict": "reject", "reason": "{code.value}"}}')
