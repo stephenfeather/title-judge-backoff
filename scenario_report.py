@@ -11,6 +11,10 @@ not computable. Everything here is what IS measurable without ground truth:
     separately, because effort was measured to move the reason while leaving
     the binary verdict alone;
   * cross-model agreement — where the candidate judges actually diverge;
+  * reliability — attempts, failures by kind and latency tail per backend,
+    reported as a selection criterion rather than left to be inferred from a
+    coverage percentage, since a judge that cannot sustain the call volume is
+    disqualified however well it agrees;
   * operational health — latency distribution and error kinds per backend;
   * a ruling queue — items ranked by how contested they are, which is the
     handoff to the operator's ruling session. Contested items are where the
@@ -32,6 +36,12 @@ from pathlib import Path
 from judge.agreement import agreement_matrix, reason_cross_tab, reason_distribution
 from judge.cache_collapse import cache_findings, render_cache_warning
 from judge.deadlocks import backend_deadlocks, deadlock_records, render_deadlock_section
+from judge.reliability import (
+    coverage_shapes,
+    reliability_rows,
+    render_coverage_bias_caveat,
+    render_reliability_section,
+)
 from judge.schema import Verdict, verdict_from_json_line
 from judge.vote import tally_votes
 
@@ -82,6 +92,20 @@ def load_results(results_dir: Path) -> dict[str, list[Verdict]]:
         ]
         for path in sorted(results_dir.glob("*.jsonl"))
     }
+
+
+def load_pair_order(pairs_path: Path) -> list[str]:
+    """Pair ids in calibration-file order — the authoritative sequence.
+
+    Reads only `id`, deliberately: this loads a file of vendor-derived titles
+    purely to learn their ORDER, and nothing else about them needs to be in
+    memory or in a report.
+    """
+    return [
+        json.loads(line)["id"]
+        for line in pairs_path.read_text().splitlines()
+        if line.strip()
+    ]
 
 
 def load_manifests(results_dir: Path) -> dict[str, dict]:
@@ -440,9 +464,21 @@ def render_scenario_report(
     *,
     queue_size: int = 40,
     leg: str = "",
+    pair_order: list[str] | None = None,
 ) -> str:
     ranking = contention_ranking(by_model)
     contested = [r for r in ranking if r.contention > 0]
+    shapes = coverage_shapes(
+        by_model,
+        pair_order=pair_order,
+        # Every manifest records the pair count it was launched against. Taking
+        # the largest guards the case where the only backend that reached the
+        # tail of the set is the one that wrote no manifest.
+        total_pairs=max(
+            (m["n_pairs"] for m in manifests.values() if isinstance(m.get("n_pairs"), int)),
+            default=None,
+        ),
+    )
 
     lines = [
         "# Scenario report",
@@ -462,6 +498,16 @@ def render_scenario_report(
         # majority. Deliberately quieter than the card's UNDECIDED marker,
         # which means the whole slate deadlocked (issue #23).
         *render_deadlock_section(backend_deadlocks(by_model, leg=leg)),
+        # Reliability sits ABOVE every quality table, for the same reason the
+        # cache warning does: it can disqualify a backend outright, and a reader
+        # who meets kappa first has already formed a view of a judge that cannot
+        # produce enough judgments to hold one (issue #43).
+        *render_reliability_section(reliability_rows(by_model, manifests)),
+        # And immediately before the quality tables, not in the caveats at the
+        # bottom — "say so at the point its quality numbers are shown". A caveat
+        # printed afterwards arrives once the reader has already believed the
+        # table.
+        *render_coverage_bias_caveat(shapes),
         "## Stability (within-model, across repeated votes)",
         "",
         "Verdict and reason flips are tracked separately: a model can be perfectly",
@@ -507,7 +553,9 @@ def render_scenario_report(
         "## Operational health",
         "",
         "Per-LAUNCH figures, not cumulative — see Caveats below before reading",
-        "these as completion.",
+        "these as completion. The Reliability section above is the cumulative",
+        "view; this one adds the per-launch detail it deliberately omits (min/max,",
+        "failed-call latency, observed model snapshots).",
         "",
         *(_health_table(manifests) if manifests else ["_No manifests found._"]),
         "",
@@ -547,18 +595,36 @@ def main() -> None:
     parser.add_argument("--results", type=Path, required=True, help="directory of verdict .jsonl files")
     parser.add_argument("--out", type=Path, default=Path("scenario-report.md"))
     parser.add_argument("--queue-size", type=int, default=40, help="rows in the ruling queue")
+    parser.add_argument(
+        "--pairs",
+        type=Path,
+        help=(
+            "the calibration pairs .jsonl this run judged. Optional but "
+            "recommended: it is the only authoritative source of pairs-file "
+            "order and set size, both of which the coverage-bias caveat needs. "
+            "Without it they are reconstructed from results order, which a "
+            "concurrent run scrambles, and the report says so."
+        ),
+    )
     args = parser.parse_args()
 
     by_model = load_results(args.results)
     if not by_model:
         parser.error(f"no verdict files found in {args.results}")
     manifests = load_manifests(args.results)
+    pair_order = load_pair_order(args.pairs) if args.pairs else None
     # The leg is the results directory: scenario_report is invoked once per leg,
     # and the same backend runs in s1 and in each s2-* leg. Recording it keeps
     # those four populations apart in the audit trail (issue #23).
     leg = args.results.resolve().name
     args.out.write_text(
-        render_scenario_report(by_model, manifests, queue_size=args.queue_size, leg=leg)
+        render_scenario_report(
+            by_model,
+            manifests,
+            queue_size=args.queue_size,
+            leg=leg,
+            pair_order=pair_order,
+        )
     )
     print(f"wrote {args.out} ({len(by_model)} backends)")
 

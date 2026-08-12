@@ -139,8 +139,33 @@ def test_render_scenario_report_has_every_required_section():
     assert "agreement" in md.lower()
     assert "health" in md.lower()
     assert "ruling queue" in md.lower()
+    assert "## Reliability" in md
     # Health must surface the failing backend, not silently average it away.
     assert "ReadTimeout" in md
+
+
+def test_reliability_is_reported_before_any_quality_table():
+    # Issue #43. Reliability can disqualify a backend outright, so a reader who
+    # meets kappa or flip rates first has already formed a view of a judge that
+    # cannot produce enough judgments to hold one. Order is the whole point of
+    # the section — the same reasoning that put the cache warning up top (#15).
+    by_model = {"a": votes("a", "p1", [("approve", "ok")] * 3)}
+    md = render_scenario_report(by_model, {"a": {"health": {"calls_ok": 3, "calls_failed": 0}}})
+    assert md.index("## Reliability") < md.index("## Stability")
+    assert md.index("## Reliability") < md.index("## Cross-model verdict agreement")
+
+
+def test_a_partial_backend_is_flagged_before_its_quality_numbers_are_shown():
+    # "Say so at the point its quality numbers are shown" — a caveat printed
+    # after the tables arrives once the reader has already believed them.
+    by_model = {
+        "full": votes("full", "p1", [("approve", "ok")] * 3)
+        + votes("full", "p2", [("approve", "ok")] * 3),
+        "partial": votes("partial", "p1", [("approve", "ok")] * 3),
+    }
+    md = render_scenario_report(by_model, {})
+    assert "biased subset" in md
+    assert md.index("biased subset") < md.index("## Stability")
 
 
 def cached_votes(model_id, pair_id, rulings, cached=90):

@@ -635,6 +635,56 @@ def test_skip_warning_names_the_backends_and_the_env_prefix():
     assert health["latency_max"] == 100.0
     assert health["latency_median"] == pytest.approx(2.5)
     assert health["error_kinds"] == {"timeout": 2, "500": 1}
+    # p95, not just min/median/max (issue #43). The median says a backend is
+    # usable; the tail says whether it finishes. This distribution's max is 40x
+    # its median, and only the tail shows that.
+    assert health["latency_p95"] == 100.0
+
+
+def test_health_reports_a_p95_by_nearest_rank():
+    # 20 samples: the 95th percentile is the 19th, and the single 100.0 outlier
+    # must NOT drag it — p95 exists to be the tail without being the worst case.
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=3,
+        prompt_version="v1",
+        n_pairs=200,
+        sample_payload={},
+        observed_models=set(),
+        latencies=[float(i) for i in range(1, 20)] + [100.0],
+        errors=[],
+    )
+    assert manifest["health"]["latency_p95"] == 19.0
+
+
+def test_health_reports_no_p95_when_nothing_succeeded():
+    backend = Backend(
+        name="nv",
+        base_url="https://example.test/v1",
+        model_id="m",
+        rpm=40,
+        eval_only=True,
+        api_key_env="NVIDIA_API_KEY",
+    )
+    manifest = run_manifest(
+        backend,
+        votes=3,
+        prompt_version="v1",
+        n_pairs=200,
+        sample_payload={},
+        observed_models=set(),
+        latencies=[],
+        errors=["timeout"],
+    )
+    assert manifest["health"]["latency_p95"] is None
 
 
 def test_health_reports_failure_latencies_separately_from_success():
