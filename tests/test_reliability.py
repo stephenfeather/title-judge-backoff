@@ -179,6 +179,37 @@ def test_a_partial_backend_that_occupies_a_contiguous_prefix_is_identified():
     assert partial.is_prefix is True
 
 
+def test_a_backend_that_ran_to_the_end_with_gaps_is_not_a_prefix():
+    # From the 2026-08-12 v3 sweep, which is where this was caught: deepseek
+    # judged 197 of 200 and its furthest pair was position 200. It did not stop
+    # early — it finished the file and dropped three pairs to transient errors
+    # along the way. Calling that a "contiguous prefix" tells the reader there
+    # is cohort skew where there is none.
+    order = [f"p{i}" for i in range(200)]
+    judged = [p for p in order if p not in {"p40", "p111", "p160"}]
+    shapes = coverage_shapes({"gappy": rows(judged)}, pair_order=order)
+    assert shapes[0].span == 200
+    assert shapes[0].is_prefix is False
+
+
+def test_stopping_early_is_what_makes_a_prefix_not_the_gap_count():
+    # The distinction the first version missed. These two have the SAME number
+    # of unjudged positions below their furthest pair; only one stopped early.
+    order = [f"p{i}" for i in range(200)]
+
+    stopped = [p for p in order[:100] if p != "p40"]  # 99 pairs, furthest 99
+    finished = [p for p in order if p != "p40"]  # 199 pairs, furthest 199
+
+    by_name = {
+        s.backend: s
+        for s in coverage_shapes(
+            {"stopped": rows(stopped), "finished": rows(finished)}, pair_order=order
+        )
+    }
+    assert by_name["stopped"].is_prefix is True
+    assert by_name["finished"].is_prefix is False
+
+
 def test_a_partial_backend_spread_across_the_set_is_not_called_a_prefix():
     # An honest distinction: rows scattered over the whole file ARE closer to a
     # sample, and saying "prefix" there would be a claim the data refutes.
@@ -284,6 +315,18 @@ def test_a_stale_manifest_count_never_shrinks_the_observed_universe():
     # backend as complete while hiding rows it actually judged.
     shapes = coverage_shapes({"a": rows(["p0", "p1", "p2"])}, total_pairs=2)
     assert shapes[0].total_pairs == 3
+
+
+def test_the_caveat_distinguishes_scattered_gaps_from_a_prefix():
+    # "spread across the set" is as wrong as "contiguous prefix" for a backend
+    # that ran the whole file and lost three pairs to transient errors — it
+    # implies a sampling story where the honest answer is "a few calls failed".
+    order = [f"p{i}" for i in range(200)]
+    judged = [p for p in order if p not in {"p40", "p111", "p160"}]
+    lines = render_coverage_bias_caveat(coverage_shapes({"gappy": rows(judged)}, pair_order=order))
+    (row,) = [line for line in lines if line.startswith("| gappy")]
+    assert "scattered gaps, ran to the end" in row
+    assert "prefix" not in row
 
 
 def test_the_bias_caveat_states_where_the_order_and_universe_came_from():

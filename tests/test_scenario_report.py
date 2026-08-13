@@ -214,8 +214,9 @@ def test_a_partial_backend_is_flagged_before_its_quality_numbers_are_shown():
         "partial": votes("partial", "p1", [("approve", "ok")] * 3),
     }
     md = render_scenario_report(by_model, {})
-    assert "biased subset" in md
-    assert md.index("biased subset") < md.index("## Stability")
+    heading = "### Partial backends are measured on less than the full set"
+    assert heading in md
+    assert md.index(heading) < md.index("## Stability")
 
 
 def cached_votes(model_id, pair_id, rulings, cached=90):
