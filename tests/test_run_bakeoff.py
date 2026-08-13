@@ -8,7 +8,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from judge.client import RETRY_AFTER_DEFAULT_S, Backend, LimiterRegistry
+from judge.client import RETRY_AFTER_DEFAULT_S, Backend, LimiterRegistry, QuotaExhausted
 from judge.prompts import PROMPT_VERSION, prompt_variant_counts
 from judge.schema import Pair, ReasonCode, Usage, Verdict, verdict_to_json_line
 from run_bakeoff import (
@@ -1310,6 +1310,106 @@ def test_a_429_from_one_worker_holds_back_the_whole_host(tmp_path):
         client_factory=lambda b: RateLimitedClient(b),
     )
     assert penalties == [RETRY_AFTER_DEFAULT_S], "the shared host bucket was never penalized"
+
+
+class UnfundedClient(FakeClient):
+    """429s the way an account with no credit does — same status, different cause."""
+
+    def judge(self, pair, run_index=0):
+        request = httpx.Request("POST", f"{self.backend.base_url}/chat/completions")
+        response = httpx.Response(
+            429,
+            request=request,
+            json={
+                "error": {
+                    "message": "You have no credits remaining.",
+                    "type": "insufficient_quota",
+                    "code": "credit_balance_exhausted",
+                }
+            },
+        )
+        raise QuotaExhausted(f"{self.backend.name} cannot bill for this call: {response.text}")
+
+
+def test_an_unfunded_backend_does_not_hold_back_the_host(tmp_path):
+    # Issue #52, and the reason it matters beyond one backend. A penalty applies
+    # to the HOST, and four of the slate's backends share api.deepinfra.com — so
+    # penalising an account that cannot bill would throttle three healthy
+    # backends for the whole run, for a condition no backoff can fix.
+    penalties = []
+    backend = concurrency_backend()
+    registry = no_sleep_limiters()
+    registry.for_backend(backend).penalize = lambda s: penalties.append(s)  # type: ignore[method-assign]
+    run_backend(
+        backend,
+        [make_pair(f"p{i}") for i in range(3)],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=registry,
+        client_factory=lambda b: UnfundedClient(b),
+        quota_sleep=lambda _: None,
+    )
+    assert penalties == [], "an unfunded account is not an overloaded host"
+
+
+def test_a_throttling_429_still_holds_back_the_host(tmp_path):
+    # The other half: telling the two apart must not disable the backoff that
+    # keeps a real rate limit from getting worse.
+    penalties = []
+    backend = concurrency_backend()
+    registry = no_sleep_limiters()
+    registry.for_backend(backend).penalize = lambda s: penalties.append(s)  # type: ignore[method-assign]
+    run_backend(
+        backend,
+        [make_pair("p0")],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=registry,
+        client_factory=lambda b: RateLimitedClient(b),
+    )
+    assert penalties == [RETRY_AFTER_DEFAULT_S]
+
+
+def test_an_unfunded_backend_is_named_in_its_own_error_kind(tmp_path):
+    # Without this the manifest records HTTPStatusError, which is what made the
+    # 2026-08-12 run unreadable: 135 failures and nothing saying they were a
+    # billing state rather than the network.
+    backend = concurrency_backend()
+    run_backend(
+        backend,
+        [make_pair(f"p{i}") for i in range(3)],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: UnfundedClient(b),
+        quota_sleep=lambda _: None,
+    )
+    manifest = json.loads((tmp_path / f"{backend.name}.manifest.json").read_text())
+    assert manifest["health"]["error_kinds"] == {"QuotaExhausted": 3}
+
+
+def test_an_unfunded_backend_holds_ITSELF_back(tmp_path):
+    # It must not sprint through its whole work list turning 120,000 pairs into
+    # failures in a few minutes. Holding the backend (not the host) keeps the
+    # leg alive so it recovers on its own if credits arrive mid-run — which is
+    # exactly what happened on 2026-08-12.
+    holds = []
+    backend = concurrency_backend()
+    run_backend(
+        backend,
+        [make_pair(f"p{i}") for i in range(3)],
+        tmp_path,
+        votes=1,
+        concurrency=1,
+        limiters=no_sleep_limiters(),
+        client_factory=lambda b: UnfundedClient(b),
+        quota_sleep=lambda s: holds.append(s),
+    )
+    assert holds, "an unfunded backend spent no time held back at all"
+    assert all(s > 0 for s in holds)
 
 
 def test_a_non_429_failure_does_not_hold_back_the_host(tmp_path):

@@ -34,6 +34,7 @@ from judge.client import (
     Backend,
     JudgeClient,
     LimiterRegistry,
+    QuotaExhausted,
     RateLimiter,
     config_digest,
     limiter_host,
@@ -648,6 +649,54 @@ class ResultWriter:
                 item[1].set()
 
 
+#: How long an unfunded backend waits before trying again. Long enough that a
+#: dead leg is not spinning through its work list turning 120,000 pairs into
+#: failures, short enough that it recovers promptly when credit arrives — which
+#: is not hypothetical: on 2026-08-12 credits were added mid-sweep and the leg
+#: went from 0 rows to 600 with no operator action (issue #52).
+QUOTA_HOLD_S = 60.0
+
+
+class BackendHold:
+    """A backoff belonging to ONE backend rather than to its host.
+
+    The host limiter is the wrong instrument for a billing failure. Its penalty
+    applies to every backend on the endpoint — deliberately, because that is
+    what stops N-1 workers hammering an overloaded host — but an account that
+    cannot bill is not an overloaded host. Four of the slate's backends share
+    api.deepinfra.com, so charging them for one unfunded neighbour would cost
+    three healthy backends an entire run.
+
+    So the hold lives here, per backend, and is waited on BEFORE host admission:
+    a held backend stops competing for the shared bucket altogether rather than
+    taking a slot to fail in.
+    """
+
+    def __init__(
+        self,
+        sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._sleep = sleep
+        self._now = now
+        self._until: float | None = None
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            remaining = None if self._until is None else self._until - self._now()
+        # Slept OUTSIDE the lock, unlike RateLimiter. There the sleep IS the
+        # rate limit and must serialize; here every held worker is waiting on
+        # the same deadline and should resume together when it passes.
+        if remaining and remaining > 0:
+            self._sleep(remaining)
+
+    def hold(self, seconds: float) -> None:
+        deadline = self._now() + seconds
+        with self._lock:
+            self._until = deadline if self._until is None else max(self._until, deadline)
+
+
 class RunHealth:
     """Per-call timings and errors, collected across worker threads.
 
@@ -692,14 +741,34 @@ def _handle_call_failure(
     *,
     pair_id: str,
     run_index: int,
+    quota_hold: BackendHold | None = None,
 ) -> None:
-    """Report one failed vote, and slow the host if it was a 429.
+    """Report one failed vote, and slow whatever the failure says to slow.
 
-    A 429 is the host saying the bucket is too generous, so the penalty lands
-    on the HOST — every worker on it, and every other backend sharing it — not
-    only the worker that happened to catch it. The call itself is not retried
-    in-run; resume picks it up next launch, like any other failed vote.
+    A throttling 429 is the host saying the bucket is too generous, so the
+    penalty lands on the HOST — every worker on it, and every other backend
+    sharing it — not only the worker that happened to catch it.
+
+    A QUOTA 429 says the opposite (issue #52): this account cannot make this
+    call, and every other backend on the host is fine. Penalising the host there
+    would throttle three healthy DeepInfra backends because a fourth ran out of
+    credit, for a condition no backoff can fix. It gets a backend-local hold
+    instead — which also keeps the leg alive rather than stopping it, so credit
+    added mid-run is picked up without an operator noticing.
+
+    The call itself is not retried in-run; resume picks it up next launch, like
+    any other failed vote.
     """
+    if isinstance(exc, QuotaExhausted):
+        if quota_hold is not None:
+            quota_hold.hold(QUOTA_HOLD_S)
+        print(
+            f"[{backend.name}] CANNOT BILL — holding this backend (not the host) "
+            f"back {QUOTA_HOLD_S:g}s. No backoff fixes this; add credit and the "
+            f"run recovers on its own. {exc}",
+            file=sys.stderr,
+        )
+        return
     penalty = rate_limit_penalty(exc)
     if penalty is not None:
         limiter.penalize(penalty)
@@ -767,6 +836,7 @@ def run_backend(
     code_version: str | None = None,
     allow_unknown_provenance: bool = False,
     stop: threading.Event | None = None,
+    quota_sleep: Callable[[float], None] = time.sleep,
     judge_client: Callable[..., JudgeClient] = JudgeClient,
     client_factory: Callable[[Backend], JudgeClient] | None = None,
     writer_factory: Callable[[Path], ResultWriter] = ResultWriter,
@@ -810,6 +880,8 @@ def run_backend(
     # provenance wiring intact.
     client = client_factory(backend) if client_factory else judge_client(backend, code_version=code_version)
     limiter = (limiters or LimiterRegistry()).for_backend(backend)
+    # Per backend, not per host — see BackendHold.
+    quota_hold = BackendHold(sleep=quota_sleep)
     health = RunHealth()
 
     def judge_one(item: tuple[Pair, int], writer: ResultWriter) -> None:
@@ -833,6 +905,9 @@ def run_backend(
         if writer.failure is not None:
             raise WriterGone(f"results writer died: {writer.failure!r}")
         i = health.claim_attempt()
+        # Ahead of host admission, so a backend that cannot bill stops competing
+        # for the shared bucket entirely rather than taking a slot to fail in.
+        quota_hold.wait()
         limiter.wait()
         # Checked AGAIN, because admission is not brief and not instant. The
         # limiter sleeps while holding the shared host lock, so workers queue
@@ -850,7 +925,10 @@ def run_backend(
             verdict = client.judge(pair, run_index=run_index)
         except Exception as exc:  # noqa: BLE001 - keep going, resume covers gaps
             health.record_failure(time.monotonic() - started, exc)
-            _handle_call_failure(backend, limiter, exc, pair_id=pair.id, run_index=run_index)
+            _handle_call_failure(
+                backend, limiter, exc,
+                pair_id=pair.id, run_index=run_index, quota_hold=quota_hold,
+            )
             return
         health.record_ok(time.monotonic() - started, verdict.usage)
         writer.write(verdict_to_json_line(verdict))
