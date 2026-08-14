@@ -1,0 +1,117 @@
+root_span_id: 55c8b179-a3ee-41ca-a4f4-30bc4c479c2e
+turn_span_id: 
+session_id: 55c8b179-a3ee-41ca-a4f4-30bc4c479c2e
+---
+session: main
+session_uuid: 55c8b179-a3ee-41ca-a4f4-30bc4c479c2e
+date: 2026-08-14
+status: partial
+outcome: PARTIAL_PLUS
+---
+
+goal: >
+  Shipped 8 PRs (#42 #43 #44 #48-#54), dropped kimi from the slate, and produced
+  the project's FIRST complete baseline — 4,800/4,800 votes, 8 backends, prompt
+  v3 — in results/2026-08-12-v3/
+now: >
+  Run the operator ruling pass — `uv run rule.py`. It needs human judgement and
+  is the blocker to kappa/accuracy; score.py cannot produce the per-reason
+  confusion matrix until rulings exist.
+test: uv run pytest -q   # 557 passing on main @ 8d0316e
+
+done_this_session:
+  - task: "#42 Ctrl-C stops a concurrent slate — cooperative threading.Event, checked before the call is spent AND again after rate-limit admission"
+    files: [run_bakeoff.py, tests/test_run_bakeoff.py]
+  - task: "#43 reliability as a reported metric — new judge/reliability.py, section placed ABOVE all quality tables, plus latency_p95 in the health summary"
+    files: [judge/reliability.py, tests/test_reliability.py, scenario_report.py, run_bakeoff.py]
+  - task: "#44 retired truncation_worse; PROMPT_VERSION v2 -> v3; ACTIVE_REASON_CODES drives prompt, ruling TUI, strict json_schema and parse_judge_response"
+    files: [judge/schema.py, judge/prompts.py, judge/rulings.py, judge/client.py, scenario_report.py]
+  - task: "#51 dropped deepinfra-kimi-k2.6 from the slate on measurement; slate 9 -> 8"
+    files: [backends.toml]
+  - task: "Ran the v3 sweep + resume pass to 4,800/4,800 — first genuinely complete baseline"
+    files: [results/2026-08-12-v3/]
+  - task: "#52 filed AND fixed — a 429 for exhausted credit is not a rate limit (QuotaExhausted, quota_failure_detail, BackendHold)"
+    files: [judge/client.py, run_bakeoff.py, judge/reliability.py]
+  - task: "#53 fixed a defect in my own #49 code, caught by first real-data use: is_prefix mislabelled any backend past ~91% coverage"
+    files: [judge/reliability.py, tests/test_reliability.py]
+  - task: "#55 MERGED — untracked venv/, closed the .gitignore gap (.venv/ did not match venv/); 0 tracked files under venv/ on main @ 8d0316e"
+    files: [.gitignore]
+
+blockers: []
+
+questions:
+  - "Purge the venv blobs from history? PR #55 only untracks them; 44331b3 and dc86792 still carry 437k lines. Rewriting main is the user's call. Content is bulk (pytest/httpx/pygments), NOT secrets."
+  - "How should Copilot be invoked? `@copilot+<model> review` licenses it to PUSH, not just comment. It collided twice this session."
+
+decisions:
+  - truncation_worse_retired_not_deleted: >
+      The ReasonCode enum member STAYS; only the rubric loses it. Four verdict
+      rows on disk carry it and verdict_from_json_line would raise, breaking
+      every historical run including the S1 baseline. ACTIVE_REASON_CODES is
+      what everything user-facing derives from.
+  - unfunded_backend_is_held_not_stopped: >
+      #52 originally proposed stopping a backend that cannot bill. The live run
+      REFUTED that — credits were added mid-sweep and the leg recovered 0 -> 600
+      rows unattended. Stopping would have discarded it. 60s BackendHold keeps
+      self-healing, drops only the shared-host collateral.
+  - quota_failure_is_not_a_verdict_on_the_model: >
+      unusable_at_scale returns None (not True) when every failure was billing.
+      Zero rows for want of credit and zero rows for want of throughput look
+      identical and mean opposite things.
+  - latency_never_merged_across_launches: >
+      A median cannot be merged with another median without raw samples, so
+      p50/p95 report the LATEST launch only. Consequence worth knowing: after a
+      resume, the latency column describes the resume, not the run.
+
+findings:
+  - complete_v3_baseline: >
+      results/2026-08-12-v3/ — 8 backends x 200 pairs x 3 votes = 4,800/4,800.
+      Stability (verdict flip / reason flip / unstable pairs):
+      haiku 0.025/0.033/20; llama31-floor 0.030/0.217/118; gemini 0.048/0.067/36;
+      nemotron 0.057/0.078/40; openai 0.062/0.072/39; inkling 0.063/0.077/46;
+      deepseek 0.117/0.168/81.
+  - haiku_is_the_most_stable_judge: "0.025 verdict flip, 4.7x better than deepseek on the same 200 pairs."
+  - deepseek_is_fast_but_noisy: "Lowest p50 on the slate AND the highest flip rates — 81 unstable pairs, double gemini's. Exactly the trade the bake-off exists to expose."
+  - p95_earns_its_place: "inkling's tail is 6.5x its median (5.9s -> 48.1s), nemotron's 5.4x. min/median/max showed this only as an unrepresentative max."
+  - kimi_k2.6_unusable: "108.5s p50 on real corpus pairs vs 0.47s deepseek / 12.05s nemotron. Not queueing — timed out alone and on a serial pass. Its 97 settled verdicts were a cohort-skewed PREFIX (99 pairs reaching position 101 of 200), not a sample."
+  - corpus_has_no_truncation: "Of 200 pairs, exactly 3 drop an original token that abbreviation expansion cannot explain, and all 3 ARE expansions split on '/'. ZERO dropped tokens anywhere contain a digit."
+  - openai_429_was_billing_not_throttling: "rpm=60 on a dedicated host cannot self-throttle. Body said insufficient_quota / credit_balance_exhausted. Diagnosis required probing OUTSIDE the harness — the body was read and discarded."
+
+worked:
+  - "Ctrl-C did not stop a concurrent slate → cancel_futures alone was insufficient (it only drops UNSTARTED backends; at --concurrency 8 all eight are already inside their own pools and KeyboardInterrupt reaches only the main thread). Cooperative threading.Event checked inside judge_one."
+  - "Workers admitted by the limiter still spent after a stop → recheck the stop AFTER limiter.wait(); admission is not instant (sleep held under the shared host lock, 429 penalties extend it) and being admitted is permission to send, not an obligation."
+  - "A quota 429 throttled healthy neighbours → BackendHold, per backend, waited on BEFORE host admission so a dead backend stops competing for the shared bucket entirely."
+  - "Prefix claim was asserted, not measured → recover pairs-file order from results (or --pairs) and compare each backend's furthest position against its own row count."
+
+failed:
+  - "is_prefix tested only `span <= distinct * 1.1` → at 197 pairs the threshold is 216, ABOVE the 200-pair universe, so any backend past ~91% coverage was labelled a contiguous prefix. Gap COUNT cannot distinguish a prefix from holes; `stopped_early` (span < total_pairs) is the property that can."
+  - "Committed a review fix without fetching → Copilot had already fixed it 10 min earlier on the same branch; github-agent-commit soft-resets to origin, so my stale tree overwrote its (better) work. ALWAYS `git fetch` + check `git log origin/<branch>` before committing a review fix."
+  - "Two new tests took the real time.sleep default for a 60s quota hold → suite hung. Inject quota_sleep, mirroring the existing no_sleep_limiters() convention."
+  - "Compound Bash commands (`git switch -c X && sed ...`) → hooks reject the ENTIRE call, so the switch silently never ran and work landed on main. One command per Bash call."
+
+next:
+  - "Decide whether to purge the venv blobs from git history. #55 only untracked them; dc86792 and 44331b3 still carry 437k lines. Rewriting main is the user's call; content is bulk (pytest/httpx/pygments), NOT secrets."
+  - "Run the operator ruling pass: uv run rule.py — this is the blocker to kappa/accuracy and needs human judgement, not agent time."
+  - "After rulings exist, run score.py for the per-reason confusion matrix. Note truncation_worse is retired, so v3 has a 4-code matrix."
+  - "Consider re-running the S1-vs-v3 reason-distribution comparison now that a COMPLETE baseline exists (previous attempts compared partial data)."
+
+files:
+  created:
+    - judge/reliability.py
+    - tests/test_reliability.py
+    - results/2026-08-12-v3/   # 8 x 600 verdicts + manifests, gitignored
+  modified:
+    - run_bakeoff.py
+    - judge/client.py
+    - judge/prompts.py
+    - judge/schema.py
+    - judge/rulings.py
+    - scenario_report.py
+    - backends.toml
+    - .gitignore
+    - tests/test_run_bakeoff.py
+    - tests/test_client.py
+    - tests/test_prompts.py
+    - tests/test_schema.py
+    - tests/test_rulings.py
+    - tests/test_scenario_report.py
