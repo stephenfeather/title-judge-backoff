@@ -11,6 +11,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+# Without the dot too. `.venv/` alone did not match a plain `venv/`, and 1,192
+# files of virtualenv reached main through that gap (dc86792).
+venv/
 *.egg-info/
 
 # Secrets — keys are env-only, never committed
